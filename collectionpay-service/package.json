@@ -1,12 +1,18 @@
-﻿{
+{
   "name": "collectionpay-service",
   "version": "1.0.0",
-  "private": true,
+  "description": "RiderCMS - M-PESA Collection Payment Service (sandbox-preconfigured)",
   "main": "app.js",
-  "scripts": { "start": "node app.js" },
-  "dependencies": {
-    "express": "^4.18.2",
-    "body-parser": "^1.20.2"
+  "type": "module",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "nodemon app.js"
   },
-  "engines": { "node": "18.x" }
+  "dependencies": {
+    "axios": "^1.6.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.0.0",
+    "express": "^4.18.2",
+    "firebase-admin": "^11.9.0"
+  }
 }

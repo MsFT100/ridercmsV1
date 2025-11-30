@@ -1,5 +1,0 @@
-﻿steps:
-- name: 'gcr.io/cloud-builders/docker'
-  args: [ 'build', '-t', 'gcr.io/\/ridercms-express-service:\', '.' ]
-images:
-- 'gcr.io/\/ridercms-express-service:\'
