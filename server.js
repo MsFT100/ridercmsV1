@@ -49,7 +49,8 @@ app.use((req, res, next) => {
 
 // ✅ Smarter CORS setup
 const allowedOrigins = [
-  'https://bucoride-admin.vercel.app',
+  'https://ridercms-ced94.web.app',
+  'https://ridercms-ced94.firebaseapp.com',
   '*',
   'http://localhost:3001', // Explicitly add the 'www' subdomain for production
 ];
