@@ -1,6 +1,6 @@
 const { Router } = require('express');
 const logger = require('../utils/logger');
-const pool = require('../db');
+const poolPromise = require('../db');
 const { verifyFirebaseToken } = require('../middleware/auth');
 const verifyApiKey = require('../middleware/verifyApiKey');
 const mpesaApi = require('../utils/mpesa'); // Import your M-Pesa utility
@@ -20,6 +20,7 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (req, res) => {
     return res.status(400).json({ error: 'boothUid is required.' });
   }
 
+  const pool = await poolPromise;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -81,6 +82,7 @@ router.post('/confirm-deposit', verifyApiKey, async (req, res) => {
     return res.status(400).json({ error: 'boothUid, slotIdentifier, batteryUid, and chargeLevel are required.' });
   }
 
+  const pool = await poolPromise;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -141,6 +143,7 @@ router.post('/confirm-deposit', verifyApiKey, async (req, res) => {
 router.get('/my-battery-status', verifyFirebaseToken, async (req, res) => {
   const { uid: firebaseUid } = req.user;
 
+  const pool = await poolPromise;
   const client = await pool.connect();
   try {
     const query = `
@@ -177,6 +180,7 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
   const { uid: firebaseUid, phone_number: userPhone } = req.user;
   const MIN_CHARGE_LEVEL = 95;
 
+  const pool = await poolPromise;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -269,6 +273,7 @@ router.get('/withdrawal-status/:checkoutRequestId', verifyFirebaseToken, async (
   const { checkoutRequestId } = req.params;
   const { uid: firebaseUid } = req.user;
 
+  const pool = await poolPromise;
   const client = await pool.connect();
   try {
     // Find the session and check its status.
@@ -305,6 +310,7 @@ router.post('/open-for-collection', verifyFirebaseToken, async (req, res) => {
   const { checkoutRequestId } = req.body;
   const { uid: firebaseUid } = req.user;
 
+  const pool = await poolPromise;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -350,6 +356,7 @@ router.post('/confirm-withdrawal', verifyApiKey, async (req, res) => {
     return res.status(400).json({ error: 'boothUid and slotIdentifier are required.' });
   }
 
+  const pool = await poolPromise;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -394,6 +401,7 @@ router.post('/confirm-withdrawal', verifyApiKey, async (req, res) => {
 router.get('/history', verifyFirebaseToken, async (req, res) => {
   const { uid: firebaseUid } = req.user;
 
+  const pool = await poolPromise;
   const client = await pool.connect();
   try {
     const query = `
@@ -447,6 +455,7 @@ router.post('/report-problem', verifyFirebaseToken, async (req, res) => {
     return res.status(400).json({ error: 'If reporting a booth issue, slotIdentifier is required.' });
   }
 
+  const pool = await poolPromise;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');

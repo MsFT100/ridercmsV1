@@ -1,7 +1,7 @@
 const { Router } = require('express');
 const { admin } = require('../utils/firebase'); // Use the initialized admin instance
 const logger = require('../utils/logger');
-const pool = require('../db'); // Import the PostgreSQL connection pool
+const poolPromise = require('../db'); // Import the PostgreSQL connection pool
 const { verifyFirebaseToken } = require('../middleware/auth'); // We will create this new middleware
 const uploadToGcsMiddleware = require('../middleware/upload');
 const axios = require('axios'); // For making HTTP requests to Google's reCAPTCHA service
@@ -63,6 +63,7 @@ router.post('/register', async (req, res) => {
     await admin.auth().setCustomUserClaims(userRecord.uid, { role: defaultRole });
 
     // 3. Insert user record into PostgreSQL
+    const pool = await poolPromise;
     const pgClient = await pool.connect();
     try {
       await pgClient.query(
@@ -130,6 +131,7 @@ router.post('/verify-phone', async (req, res) => {
     }
 
     // 2. Update the user's status in PostgreSQL
+    const pool = await poolPromise;
     const pgClient = await pool.connect();
     try {
       await pgClient.query("UPDATE users SET phone_verified = true, updated_at = NOW() WHERE user_id = $1", [uid]);
@@ -156,6 +158,7 @@ router.get('/profile', verifyFirebaseToken, async (req, res) => {
   // and attached the user's decoded token to req.user.
   const { uid } = req.user;
 
+  const pool = await poolPromise;
   const pgClient = await pool.connect();
   try {
     // Fetch the user's full profile from PostgreSQL
@@ -218,6 +221,7 @@ router.post(
     }
 
     const imageUrl = req.file.gcsUrl;
+    const pool = await poolPromise;
     const client = await pool.connect();
     try {
       // Update the user's record in PostgreSQL with the new image URL

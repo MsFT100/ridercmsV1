@@ -1,8 +1,9 @@
-const pool = require('./index.js');
+const poolPromise = require('./index.js');
 const logger = require('../utils/logger');
 
 //postgres
 const initializeDatabase = async () => {
+  const pool = await poolPromise;
   const client = await pool.connect();
   try {
     logger.info('Initializing database schema...');

@@ -2,7 +2,7 @@ const { Router } = require('express');
 const { admin } = require('../utils/firebase');
 const logger = require('../utils/logger');
 const { verifyFirebaseToken, isAdmin } = require('../middleware/auth');
-const pool = require('../db');
+const poolPromise = require('../db');
 
 const router = Router();
 
@@ -90,6 +90,7 @@ router.post('/users/set-status', [verifyFirebaseToken, isAdmin], async (req, res
   // 'inactive' or 'suspended' in our DB means 'disabled' in Firebase Auth.
   const isDisabled = status !== 'active';
 
+  const pool = await poolPromise;
   const pgClient = await pool.connect();
   try {
     await pgClient.query('BEGIN');
@@ -122,6 +123,7 @@ router.post('/users/set-status', [verifyFirebaseToken, isAdmin], async (req, res
  * Protected route: Only accessible by users with the 'admin' role.
  */
 router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const pool = await poolPromise;
   const client = await pool.connect();
   try {
     const query = `
@@ -193,6 +195,7 @@ router.get('/problem-reports', [verifyFirebaseToken, isAdmin], async (req, res) 
   const limit = parseInt(req.query.limit, 10) || 50;
   const offset = parseInt(req.query.offset, 10) || 0;
 
+  const pool = await poolPromise;
   const client = await pool.connect();
   try {
     let query = `
@@ -246,6 +249,7 @@ router.post('/problem-reports/:reportId/status', [verifyFirebaseToken, isAdmin],
     return res.status(400).json({ error: `Invalid status. Must be one of: ${validStatuses.join(', ')}` });
   }
 
+  const pool = await poolPromise;
   const client = await pool.connect();
   try {
     const query = `
@@ -285,6 +289,7 @@ router.get('/transactions', [verifyFirebaseToken, isAdmin], async (req, res) => 
   const limit = parseInt(req.query.limit, 10) || 50;
   const offset = parseInt(req.query.offset, 10) || 0;
 
+  const pool = await poolPromise;
   const client = await pool.connect();
   try {
     const query = `
@@ -333,6 +338,7 @@ router.get('/transactions', [verifyFirebaseToken, isAdmin], async (req, res) => 
  * Protected route: Only accessible by users with the 'admin' role.
  */
 router.get('/settings', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const pool = await poolPromise;
   const client = await pool.connect();
   try {
     const { rows } = await client.query('SELECT key, value FROM app_settings');
@@ -364,6 +370,7 @@ router.post('/settings', [verifyFirebaseToken, isAdmin], async (req, res) => {
     return res.status(400).json({ error: 'No settings provided to update.' });
   }
 
+  const pool = await poolPromise;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
