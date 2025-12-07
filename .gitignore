@@ -2,3 +2,6 @@ node_modules
 .env
 */.env
 .DS_Store
+config/ridercms-ced94-firebase-adminsdk-fbsvc-3d27aedd19.json
+logs/error-2025-12-07.log
+logs/*

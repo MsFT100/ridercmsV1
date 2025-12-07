@@ -1,6 +1,0 @@
-*
-!.gcloudignore
-!package.json
-!package-lock.json
-!lib
-!lib/**

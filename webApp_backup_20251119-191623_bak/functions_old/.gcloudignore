@@ -1,9 +1,0 @@
-node_modules/
-src/
-lib/**/*.map
-**/*.log
-.DS_Store
-.git/
-.firebase/
-coverage/
-.nyc_output/

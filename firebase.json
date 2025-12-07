@@ -1,6 +1,6 @@
 {
   "hosting": {
-    "site": "ridercms-ced94",  // ← must match your Firebase Hosting site ID
+    "site": "ridercms-ced94", 
     "public": "public",
     "ignore": [
       "firebase.json",
