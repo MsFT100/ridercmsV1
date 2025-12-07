@@ -11,31 +11,31 @@ function initializeFirebase() {
 
   // IMPORTANT: Ensure your service account key JSON file is correctly referenced.
   // Using an environment variable is the most secure and flexible method.
-  const credentials = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+  const credentialsPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+  const isProduction = process.env.NODE_ENV === 'production';
 
   try {
-    let serviceAccount;
-    if (credentials) {
-      if (credentials.trim().startsWith('{')) {
-        // If the variable content looks like a JSON object, parse it directly.
-        serviceAccount = JSON.parse(credentials);
-      } else {
-        // Otherwise, treat it as a file path.
-        serviceAccount = require(path.resolve(credentials));
-      }
+    if (credentialsPath) {
+      // Method 1: Use explicit credentials file (for local dev or non-GCP environments).
+      logger.info(`Initializing Firebase with credentials from path: ${credentialsPath}`);
+      const serviceAccount = require(path.resolve(credentialsPath));
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+      });
+    } else if (isProduction) {
+      // Method 2: Use Application Default Credentials (for Cloud Run, App Engine, etc.).
+      logger.info('GOOGLE_APPLICATION_CREDENTIALS not set. Initializing Firebase using Application Default Credentials.');
+      admin.initializeApp(); // No arguments needed, it will auto-detect the environment.
     } else {
-      // Fallback for local development if the environment variable is not set.
-      const fallbackPath = path.resolve(__dirname, '../config/ridercms-ced94-firebase-adminsdk-fbsvc-3d27aedd19.json');
-      serviceAccount = require(fallbackPath);
+      // Error: Not in production and no credentials file provided.
+      logger.error('CRITICAL: GOOGLE_APPLICATION_CREDENTIALS is not set. This is required for local development.');
+      process.exit(1);
     }
 
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-    });
     isInitialized = true;
     logger.info('Firebase Admin SDK initialized successfully.');
   } catch (error) {
-    logger.error('CRITICAL: Failed to initialize Firebase Admin SDK. Check service account path and file integrity.', { error: error.message });
+    logger.error('CRITICAL: Failed to initialize Firebase Admin SDK. Check service account permissions or file integrity.', { error: error.message });
     process.exit(1);
   }
 }
