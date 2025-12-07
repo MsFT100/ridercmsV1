@@ -21,6 +21,7 @@ const initializeDatabase = async () => {
         phone_verified BOOLEAN DEFAULT false,
         balance DECIMAL(10, 2) DEFAULT 0.00 NOT NULL,
         email VARCHAR(255) UNIQUE NOT NULL,
+        profile_image_url TEXT, -- URL for the user's profile picture
         fcm_token TEXT, -- For sending push notifications
         status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active', 'inactive', 'suspended')),
         role VARCHAR(20) DEFAULT 'user' CHECK (role IN ('user', 'admin')),

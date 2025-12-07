@@ -1,0 +1,62 @@
+# This file defines the automated build and deployment process for Google Cloud Build.
+# When triggered (e.g., by a push to your main branch), Cloud Build will execute these steps.
+
+steps:
+  # --- Step 1: Build and Push the Docker Image ---
+  # This step uses the Docker builder to build the image defined in your Dockerfile.
+  # The image is then tagged with the Artifact Registry location and the short commit SHA for versioning.
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'Build Docker Image'
+    args:
+      - 'build'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REGISTRY_REPO}/${_SERVICE_NAME}:${SHORT_SHA}'
+      - '.'
+
+  # --- Step 2: Push the Docker Image to Artifact Registry ---
+  # This step pushes the tagged image to Google Artifact Registry, where it can be securely stored and accessed by Cloud Run.
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'Push to Artifact Registry'
+    args:
+      - 'push'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REGISTRY_REPO}/${_SERVICE_NAME}:${SHORT_SHA}'
+
+  # --- Step 3: Deploy to Cloud Run ---
+  # This step uses the gcloud SDK to deploy the newly built image to your Cloud Run service.
+  # It configures the service with environment variables, secrets, and a database connection.
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'Deploy to Cloud Run'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - '${_SERVICE_NAME}' # The name of your Cloud Run service.
+      - '--image=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REGISTRY_REPO}/${_SERVICE_NAME}:${SHORT_SHA}'
+      - '--region=${_REGION}'
+      - '--platform=managed'
+      - '--allow-unauthenticated' # Use this if your API is public. Remove for internal services.
+      # --- Connect to Cloud SQL Database ---
+      # This securely connects your Cloud Run service to your PostgreSQL instance.
+      - '--add-cloudsql-instances=${_DB_INSTANCE_CONNECTION_NAME}'
+      # --- Link Secrets from Secret Manager ---
+      # This securely mounts secrets as environment variables in your Cloud Run service.
+      # Format: --update-secrets=[ENV_VAR_NAME]=[SECRET_ID]:[VERSION],...
+      - '--update-secrets=DB_USER=DB_USER:latest,DB_PASSWORD=DB_PASSWORD:latest,DB_NAME=DB_NAME:latest,GOOGLE_APPLICATION_CREDENTIALS=GOOGLE_APPLICATION_CREDENTIALS:latest,MPESA_CONSUMER_KEY=MPESA_CONSUMER_KEY:latest,MPESA_CONSUMER_SECRET=MPESA_CONSUMER_SECRET:latest,GCS_BUCKET_NAME=GCS_BUCKET_NAME:latest,JWT_SECRET=JWT_SECRET:latest'
+      # --- Set Non-Secret Environment Variables ---
+      # These are for configuration that is not sensitive.
+      - '--set-env-vars=NODE_ENV=production,DB_INSTANCE_CONNECTION_NAME=${_DB_INSTANCE_CONNECTION_NAME}'
+
+# This tells Cloud Build where to store the final image.
+images:
+  - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REGISTRY_REPO}/${_SERVICE_NAME}:${SHORT_SHA}'
+
+# --- Configuration for Substitution Variables ---
+# These are placeholders that you will configure in your Cloud Build Trigger settings.
+substitutions:
+  _SERVICE_NAME: 'ridercms-api' # A default name for your service
+  _REGION: 'us-central1' # A default region
+  _ARTIFACT_REGISTRY_REPO: 'ridercms-repo' # The name of your repository in Artifact Registry
+  _DB_INSTANCE_CONNECTION_NAME: '' # IMPORTANT: You must set this in your trigger!
+
+options:
+  logging: CLOUD_LOGGING_ONLY # Ensures logs are sent to Google Cloud's operations suite.

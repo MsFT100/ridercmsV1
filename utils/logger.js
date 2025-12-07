@@ -3,66 +3,49 @@ const path = require('path');
 const streamTransport = require('./logStreamTransport');
 require('winston-daily-rotate-file');
 
-const { createLogger, format, transports } = winston;
-const { combine, timestamp, printf, colorize, errors } = format;
+const isProduction = process.env.NODE_ENV === 'production';
 
-// Custom format for log messages
-const logFormat = printf(({ level, message, timestamp, stack }) => {
-  return `${timestamp} ${level}: ${stack || message}`;
-});
+const logLevels = {
+  console: {
+    format: winston.format.combine(
+      winston.format.colorize(),
+      winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+      winston.format.printf(info => `${info.timestamp} ${info.level}: ${info.message}`)
+    ),
+  },
+};
 
-const logger = createLogger({
-  level: process.env.LOG_LEVEL || 'info',
-  format: combine(
-    timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
-    errors({ stack: true }), // This will automatically log the stack trace on errors
-    logFormat
-  ),
-  transports: [
-    // Console transport with its own colorized format.
-    new transports.Console({
-      format: combine(
-        colorize(),
-        logFormat
-      )
-    }),
-    // Also send logs to our live stream transport for the admin viewer
-    streamTransport,
-  ],
-  exitOnError: false, // Do not exit on handled exceptions
-});
+const transports = [];
 
-// --- Environment-Specific Transports ---
-// Only add File transports if we are NOT in a production environment.
-if (process.env.NODE_ENV !== 'production') {
-  const logsDir = path.join(__dirname, '../logs');
-  const fs = require('fs');
-
-  // Create logs directory synchronously if it doesn't exist (for local dev)
-  if (!fs.existsSync(logsDir)) {
-    fs.mkdirSync(logsDir);
-  }
-
-  // Error log rotation
-  logger.add(new transports.DailyRotateFile({
-    level: 'error',
-    filename: path.join(logsDir, 'error-%DATE%.log'),
-    datePattern: 'YYYY-MM-DD',
-    zippedArchive: true, // Zip the archived log files to save space
-    maxSize: '20m',      // Rotate if file size exceeds 20MB
-    maxFiles: '14d'      // Keep logs for 14 days, then delete the oldest ones
+if (isProduction) {
+  // In production, log to the console. Cloud providers like Google Cloud Run
+  // automatically capture stdout/stderr and send it to their logging service.
+  transports.push(new winston.transports.Console({
+    format: winston.format.combine(
+      winston.format.timestamp(),
+      winston.format.json() // Use JSON format for structured logging
+    ),
   }));
-
-  // Combined log rotation
-  logger.add(new transports.DailyRotateFile({
-    filename: path.join(logsDir, 'combined-%DATE%.log'),
+  console.log('Production logging enabled (console).'); // Use console.log for initial setup info
+} else {
+  // In development, log to both the console (with colors) and a rotating file.
+  transports.push(new winston.transports.Console(logLevels.console));
+  transports.push(new winston.transports.DailyRotateFile({
+    filename: path.join(__dirname, '../logs/application-%DATE%.log'),
     datePattern: 'YYYY-MM-DD',
     zippedArchive: true,
     maxSize: '20m',
-    maxFiles: '14d'
+    maxFiles: '14d',
+    format: winston.format.combine(winston.format.timestamp(), winston.format.json()),
   }));
-  logger.info('Daily rotating file logging enabled for non-production environment.');
+  console.log('Development logging enabled (console + daily rotating file).');
 }
+
+const logger = winston.createLogger({
+  level: isProduction ? 'info' : 'debug', // Be more verbose in development
+  transports,
+  exitOnError: false, // Do not exit on handled exceptions
+});
 
 // Create a stream object with a 'write' function that will be used by `morgan`
 logger.stream = {

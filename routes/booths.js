@@ -211,9 +211,19 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
     }
 
     // 3. Calculate the cost
+    const settingsRes = await client.query("SELECT value FROM app_settings WHERE key = 'pricing'");
+    if (settingsRes.rows.length === 0) {
+      throw new Error('Pricing settings are not configured in the database.');
+    }
+    const pricing = settingsRes.rows[0].value;
+    const { base_swap_fee, cost_per_charge_percent } = pricing;
+
+    if (base_swap_fee === undefined || cost_per_charge_percent === undefined) {
+      throw new Error('Incomplete pricing settings. `base_swap_fee` and `cost_per_charge_percent` are required.');
+    }
+
     const chargeAdded = Math.max(0, chargeLevel - initialCharge);
-    const costPerPercent = 10; // Example: 10 KES per percentage point
-    const totalCost = chargeAdded * costPerPercent;
+    const totalCost = parseFloat(base_swap_fee) + (chargeAdded * parseFloat(cost_per_charge_percent));
 
     // 4. Create a withdrawal session record first to get a unique session ID
     const sessionRes = await client.query(

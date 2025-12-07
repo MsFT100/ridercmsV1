@@ -3,6 +3,7 @@ const { admin } = require('../utils/firebase'); // Use the initialized admin ins
 const logger = require('../utils/logger');
 const pool = require('../db'); // Import the PostgreSQL connection pool
 const { verifyFirebaseToken } = require('../middleware/auth'); // We will create this new middleware
+const uploadToGcsMiddleware = require('../middleware/upload');
 const axios = require('axios'); // For making HTTP requests to Google's reCAPTCHA service
 const router = Router();
 
@@ -158,7 +159,7 @@ router.get('/profile', verifyFirebaseToken, async (req, res) => {
   const pgClient = await pool.connect();
   try {
     // Fetch the user's full profile from PostgreSQL
-    const userRes = await pgClient.query(
+    let userRes = await pgClient.query(
       'SELECT user_id as "id", email, name, phone as "phoneNumber", role, status, phone_verified as "phoneVerified", balance FROM users WHERE user_id = $1',
       [uid]
     );
@@ -197,5 +198,43 @@ router.get('/profile', verifyFirebaseToken, async (req, res) => {
     pgClient.release();
   }
 });
+
+/**
+ * POST /api/auth/profile/picture
+ * Updates the current user's profile picture.
+ * Expects a multipart/form-data request with a single file field named 'profileImage'.
+ */
+router.post(
+  '/profile/picture',
+  [
+    verifyFirebaseToken,
+    uploadToGcsMiddleware('profileImage', 'profile-pictures'),
+  ],
+  async (req, res) => {
+    const { uid } = req.user;
+
+    if (!req.file || !req.file.gcsUrl) {
+      return res.status(400).json({ error: 'No image file was uploaded.' });
+    }
+
+    const imageUrl = req.file.gcsUrl;
+    const client = await pool.connect();
+    try {
+      // Update the user's record in PostgreSQL with the new image URL
+      await client.query('UPDATE users SET profile_image_url = $1 WHERE user_id = $2', [imageUrl, uid]);
+
+      // Optionally, update the user's photoURL in Firebase Auth as well
+      await admin.auth().updateUser(uid, { photoURL: imageUrl });
+
+      logger.info(`User ${uid} updated their profile picture. New URL: ${imageUrl}`);
+      res.status(200).json({ message: 'Profile picture updated successfully.', imageUrl });
+    } catch (error) {
+      logger.error(`Failed to update profile picture for user ${uid}:`, error);
+      res.status(500).json({ error: 'Failed to update profile picture.', details: error.message });
+    } finally {
+      client.release();
+    }
+  }
+);
 
 module.exports = router;
