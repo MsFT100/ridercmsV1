@@ -1,4 +1,9 @@
 {
+  "name": "ridercms-api",
+  "version": "1.0.0",
+  "description": "Backend API for the RiderCMS battery swapping service.",
+  "main": "server.js",
+  "license": "ISC",
   "dependencies": {
     "@google-cloud/cloud-sql-connector": "^1.8.4",
     "@google-cloud/secret-manager": "^6.1.1",
@@ -11,6 +16,8 @@
     "morgan": "^1.10.1",
     "multer": "^2.0.2",
     "pg": "^8.16.3",
+    "swagger-jsdoc": "^6.2.8",
+    "swagger-ui-express": "^5.0.1",
     "winston": "^3.18.3",
     "winston-daily-rotate-file": "^5.0.0"
   }

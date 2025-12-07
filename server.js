@@ -11,6 +11,9 @@ const logger = require('./utils/logger'); // Corrected path
 const poolPromise = require('./db/index.js'); // Corrected path
 const { initializeDatabase } = require('./db/init'); // Corrected path
 const { initializeFirebase } = require('./utils/firebase');
+const swaggerUi = require('swagger-ui-express');
+const swaggerSpec = require('./utils/swaggerConfig');
+
 
 // Import routes
 const authRoutes = require('./routes/auth');
@@ -20,7 +23,7 @@ const mpesaRoutes = require('./routes/mpesa');
 
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 8080;
 
 // --- Initialize Firebase Admin SDK ---
 initializeFirebase();
@@ -103,6 +106,19 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // Use morgan for HTTP request logging, piped through our winston logger
 app.use(morgan('combined', { stream: logger.stream }));
+
+// --- API Documentation (Swagger) ---
+app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+
+// --- Root Endpoint ---
+// A simple endpoint to confirm the API is running when accessed via a browser.
+app.get('/', (req, res) => {
+  res.status(200).json({
+    status: 'online',
+    message: 'Welcome to the RiderCMS API!',
+    healthCheck: '/api/health'
+  });
+});
 
 // --- Admin Pages ---
 // A simple, un-authenticated route to serve the log viewer page.

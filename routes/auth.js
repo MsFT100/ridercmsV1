@@ -38,6 +38,48 @@ async function verifyRecaptcha(token) {
 }
 
 // --- 1. User Registration Endpoint ---
+/**
+ * @swagger
+ * /api/auth/register:
+ *   post:
+ *     summary: Register a new user
+ *     tags: [Authentication]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - email
+ *               - password
+ *               - name
+ *               - recaptchaToken
+ *             properties:
+ *               email:
+ *                 type: string
+ *                 format: email
+ *                 description: User's email address.
+ *               password:
+ *                 type: string
+ *                 format: password
+ *                 description: User's password (min 6 characters).
+ *               name:
+ *                 type: string
+ *                 description: User's full name.
+ *               recaptchaToken:
+ *                 type: string
+ *                 description: Google reCAPTCHA v3 token for verification.
+ *     responses:
+ *       201:
+ *         description: User registered successfully.
+ *       400:
+ *         description: Bad request (e.g., reCAPTCHA failed, invalid input).
+ *       409:
+ *         description: Conflict (e.g., email already exists).
+ *       500:
+ *         description: Internal server error.
+ */
 router.post('/register', async (req, res) => {
   const { email, password, name, phoneNumber, recaptchaToken } = req.body;
   const defaultRole = 'user';
@@ -151,7 +193,23 @@ router.post('/verify-phone', async (req, res) => {
 /**
  * GET /api/auth/profile
  * This endpoint is protected by the verifyFirebaseToken middleware. If the token
- * is valid, it fetches the user's profile from the database and returns it.
+ * is valid, it fetches the user's full profile from the database and returns it.
+ * @swagger
+ * /api/auth/profile:
+ *   get:
+ *     summary: Get the current user's profile
+ *     tags: [Authentication]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: The user's profile data.
+ *       401:
+ *         description: Unauthorized, token is missing or invalid.
+ *       404:
+ *         description: User profile not found in the database.
+ *       500:
+ *         description: Internal server error.
  */
 router.get('/profile', verifyFirebaseToken, async (req, res) => {
   // The verifyFirebaseToken middleware has already validated the token

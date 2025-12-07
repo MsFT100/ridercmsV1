@@ -8,8 +8,39 @@ const router = Router();
 
 /**
  * POST /api/admin/users/set-role
- * Sets a custom role for a specified user.
- * Protected route: Only accessible by users with the 'admin' role.
+ * @summary Set a custom role for a user
+ * @description Sets a custom role for a specified user in Firebase Authentication custom claims. This is a protected route only accessible by users with the 'admin' role.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @requestBody
+ *   required: true
+ *   content:
+ *     application/json:
+ *       schema:
+ *         type: object
+ *         required:
+ *           - uid
+ *           - newRole
+ *         properties:
+ *           uid:
+ *             type: string
+ *             description: The Firebase UID of the target user.
+ *           newRole:
+ *             type: string
+ *             description: The new role to assign.
+ *             enum: [admin, customer, driver]
+ * @responses
+ *   200:
+ *     description: Role updated successfully.
+ *   400:
+ *     description: Bad request (e.g., missing parameters, invalid role).
+ *   401:
+ *     description: Unauthorized (token missing or invalid).
+ *   403:
+ *     description: Forbidden (user is not an admin).
+ *   500:
+ *     description: Internal server error.
  */
 router.post('/users/set-role', [verifyFirebaseToken, isAdmin], async (req, res) => {
   const { uid, newRole } = req.body;
@@ -37,10 +68,37 @@ router.post('/users/set-role', [verifyFirebaseToken, isAdmin], async (req, res) 
 
 /**
  * GET /api/admin/users
- * Retrieves a paginated list of all users.
- * Protected route: Only accessible by users with the 'admin' role.
- * @query {number} [pageSize=100] - The number of users to fetch per page (max 1000).
- * @query {string} [pageToken] - The token for fetching the next page of results.
+ * @summary List all users
+ * @description Retrieves a paginated list of all users from Firebase Authentication. This is a protected route only accessible by users with the 'admin' role.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @parameters
+ *   - in: query
+ *     name: pageSize
+ *     schema:
+ *       type: integer
+ *       default: 100
+ *     description: The number of users to fetch per page (max 1000).
+ *   - in: query
+ *     name: pageToken
+ *     schema:
+ *       type: string
+ *     description: The token for fetching the next page of results, obtained from a previous request.
+ * @responses
+ *   200:
+ *     description: A list of users.
+ *     content:
+ *       application/json:
+ *         schema:
+ *           type: object
+ *           properties:
+ *             users:
+ *               type: array
+ *               items:
+ *                 type: object
+ *             nextPageToken:
+ *               type: string
  */
 router.get('/users', [verifyFirebaseToken, isAdmin], async (req, res) => {
   const pageSize = Math.min(parseInt(req.query.pageSize, 10) || 100, 1000);
@@ -72,8 +130,33 @@ router.get('/users', [verifyFirebaseToken, isAdmin], async (req, res) => {
 
 /**
  * POST /api/admin/users/set-status
- * Activates or deactivates a user, blocking them from logging in.
- * Protected route: Only accessible by users with the 'admin' role.
+ * @summary Activate, deactivate, or suspend a user
+ * @description Activates or deactivates a user in both Firebase Authentication (enabling/disabling their login) and the local PostgreSQL database. This is a protected route only accessible by users with the 'admin' role.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @requestBody
+ *   required: true
+ *   content:
+ *     application/json:
+ *       schema:
+ *         type: object
+ *         required:
+ *           - uid
+ *           - status
+ *         properties:
+ *           uid:
+ *             type: string
+ *             description: The Firebase UID of the target user.
+ *           status:
+ *             type: string
+ *             description: The new status for the user. 'inactive' or 'suspended' will disable the user.
+ *             enum: [active, inactive, suspended]
+ * @responses
+ *   200:
+ *     description: User status updated successfully.
+ *   400:
+ *     description: Bad request (e.g., missing parameters, invalid status).
  */
 router.post('/users/set-status', [verifyFirebaseToken, isAdmin], async (req, res) => {
   const { uid, status } = req.body;
@@ -119,8 +202,16 @@ router.post('/users/set-status', [verifyFirebaseToken, isAdmin], async (req, res
 
 /**
  * GET /api/admin/booths/status
- * Retrieves a comprehensive status of all booths, their slots, and the batteries within them.
- * Protected route: Only accessible by users with the 'admin' role.
+ * @summary Get status of all booths and slots
+ * @description Retrieves a comprehensive, nested status of all booths, their slots, and any batteries currently within those slots. This is a protected route only accessible by users with the 'admin' role.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @responses
+ *   200:
+ *     description: A structured list of all booths and their current status.
+ *   500:
+ *     description: Internal server error.
  */
 router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) => {
   const pool = await poolPromise;
@@ -184,11 +275,33 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
 
 /**
  * GET /api/admin/problem-reports
- * Retrieves a list of problem reports submitted by users.
- * Protected route: Only accessible by users with the 'admin' role.
- * @query {string} [status] - Filter reports by status (e.g., 'open', 'investigating', 'resolved').
- * @query {number} [limit=50] - Number of reports to return.
- * @query {number} [offset=0] - Number of reports to skip for pagination.
+ * @summary Retrieve user-submitted problem reports
+ * @description Retrieves a paginated list of problem reports submitted by users. Can be filtered by status. This is a protected route only accessible by users with the 'admin' role.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @parameters
+ *   - in: query
+ *     name: status
+ *     schema:
+ *       type: string
+ *       enum: [open, investigating, resolved, wont_fix]
+ *     description: Filter reports by a specific status.
+ *   - in: query
+ *     name: limit
+ *     schema:
+ *       type: integer
+ *       default: 50
+ *     description: The number of reports to return.
+ *   - in: query
+ *     name: offset
+ *     schema:
+ *       type: integer
+ *       default: 0
+ *     description: The number of reports to skip for pagination.
+ * @responses
+ *   200:
+ *     description: A list of problem reports.
  */
 router.get('/problem-reports', [verifyFirebaseToken, isAdmin], async (req, res) => {
   const status = req.query.status;
@@ -237,8 +350,32 @@ router.get('/problem-reports', [verifyFirebaseToken, isAdmin], async (req, res) 
 
 /**
  * POST /api/admin/problem-reports/:reportId/status
- * Updates the status of a specific problem report.
- * Protected route: Only accessible by users with the 'admin' role.
+ * @summary Update a problem report's status
+ * @description Updates the status of a specific problem report. This is a protected route only accessible by users with the 'admin' role.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @parameters
+ *   - in: path
+ *     name: reportId
+ *     required: true
+ *     schema:
+ *       type: integer
+ *     description: The ID of the problem report to update.
+ * @requestBody
+ *   required: true
+ *   content:
+ *     application/json:
+ *       schema:
+ *         type: object
+ *         required: [status]
+ *         properties:
+ *           status:
+ *             type: string
+ *             enum: [open, investigating, resolved, wont_fix]
+ * @responses
+ *   200:
+ *     description: Report status updated successfully.
  */
 router.post('/problem-reports/:reportId/status', [verifyFirebaseToken, isAdmin], async (req, res) => {
   const { reportId } = req.params;
@@ -280,10 +417,27 @@ router.post('/problem-reports/:reportId/status', [verifyFirebaseToken, isAdmin],
 
 /**
  * GET /api/admin/transactions
- * Retrieves a paginated list of all transactions (deposits and withdrawals).
- * Protected route: Only accessible by users with the 'admin' role.
- * @query {number} [limit=50] - Number of transactions to return.
- * @query {number} [offset=0] - Number of transactions to skip for pagination.
+ * @summary Get all transactions
+ * @description Retrieves a paginated list of all transactions (deposits and withdrawals) across the entire system. This is a protected route only accessible by users with the 'admin' role.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @parameters
+ *   - in: query
+ *     name: limit
+ *     schema:
+ *       type: integer
+ *       default: 50
+ *     description: The number of transactions to return.
+ *   - in: query
+ *     name: offset
+ *     schema:
+ *       type: integer
+ *       default: 0
+ *     description: The number of transactions to skip for pagination.
+ * @responses
+ *   200:
+ *     description: A paginated list of transactions.
  */
 router.get('/transactions', [verifyFirebaseToken, isAdmin], async (req, res) => {
   const limit = parseInt(req.query.limit, 10) || 50;
@@ -334,8 +488,14 @@ router.get('/transactions', [verifyFirebaseToken, isAdmin], async (req, res) => 
 
 /**
  * GET /api/admin/settings
- * Retrieves all application settings.
- * Protected route: Only accessible by users with the 'admin' role.
+ * @summary Retrieve all application settings
+ * @description Retrieves all key-value application settings from the database. This is a protected route only accessible by users with the 'admin' role.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @responses
+ *   200:
+ *     description: An object containing all application settings.
  */
 router.get('/settings', [verifyFirebaseToken, isAdmin], async (req, res) => {
   const pool = await poolPromise;
@@ -360,8 +520,23 @@ router.get('/settings', [verifyFirebaseToken, isAdmin], async (req, res) => {
 
 /**
  * POST /api/admin/settings
- * Updates one or more application settings.
- * Protected route: Only accessible by users with the 'admin' role.
+ * @summary Update application settings
+ * @description Updates one or more application settings. The request body should be an object where keys are the setting keys and values are the new setting values. This is a protected route only accessible by users with the 'admin' role.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @requestBody
+ *   description: An object containing the settings to update.
+ *   required: true
+ *   content:
+ *     application/json:
+ *       schema:
+ *         type: object
+ *         example:
+ *           pricing: { "base_swap_fee": 6.50, "cost_per_charge_percent": 12.00 }
+ * @responses
+ *   200:
+ *     description: Settings updated successfully.
  */
 router.post('/settings', [verifyFirebaseToken, isAdmin], async (req, res) => {
   const newSettings = req.body; // e.g., { "pricing": { "base_swap_fee": 6 }, "withdrawal_rules": { "min_charge_level": 90 } }
