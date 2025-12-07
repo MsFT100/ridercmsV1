@@ -5,11 +5,13 @@ FROM node:22-alpine AS builder
 # Set the working directory inside the container
 WORKDIR /usr/src/app
 
-# Copy package.json and package-lock.json to leverage Docker cache
-COPY package*.json ./
+# Copy package.json and the yarn.lock file to leverage Docker cache
+COPY package.json yarn.lock ./
 
-# Install production dependencies
-RUN npm ci --only=production
+# Install production dependencies using yarn.
+# --production skips devDependencies.
+# --frozen-lockfile ensures we use the exact versions from yarn.lock.
+RUN yarn install --production --frozen-lockfile
 
 # --- Stage 2: Create the final, lean image ---
 FROM node:22-alpine
