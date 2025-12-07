@@ -1,6 +1,7 @@
 {
   "dependencies": {
     "@google-cloud/cloud-sql-connector": "^1.8.4",
+    "@google-cloud/secret-manager": "^6.1.1",
     "axios": "^1.13.2",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",

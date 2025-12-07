@@ -8,8 +8,8 @@ const cors = require('cors');
 const cookieParser = require('cookie-parser');
 const morgan = require('morgan');
 const logger = require('./utils/logger'); // Corrected path
-const pool = require('./db/index.js'); // Corrected path
-const { initializeDatabase, initializeDatabaseMysql } = require('./db/init'); // Corrected path
+const poolPromise = require('./db/index.js'); // Corrected path
+const { initializeDatabase } = require('./db/init'); // Corrected path
 const { initializeFirebase } = require('./utils/firebase');
 
 // Import routes
@@ -29,28 +29,6 @@ initializeFirebase();
 if (!process.env.JWT_SECRET && process.env.NODE_ENV === 'production') {
   logger.error('FATAL ERROR: JWT_SECRET is not defined.');
   process.exit(1);
-}
-
-// --- Cloudinary Environment Variable Check ---
-if (process.env.NODE_ENV === 'production') {
-  const requiredCloudinaryVars = ['CLOUDINARY_CLOUD_NAME', 'CLOUDINARY_API_KEY', 'CLOUDINARY_API_SECRET'];
-  const missingCloudinaryVars = requiredCloudinaryVars.filter(v => !process.env[v]);
-  if (missingCloudinaryVars.length > 0) {
-    logger.error(`FATAL ERROR: Missing Cloudinary environment variables: ${missingCloudinaryVars.join(', ')}`);
-    process.exit(1);
-  }
-
-  // --- Admin Environment Variable Check ---
-  const requiredAdminVars = ['ADMIN_EMAIL', 'ADMIN_PASSWORD'];
-  const missingAdminVars = requiredAdminVars.filter(v => !process.env[v]);
-  if (missingAdminVars.length > 0) {
-    logger.error(`FATAL ERROR: Missing Admin environment variables: ${missingAdminVars.join(', ')}`);
-    process.exit(1);
-  }
-
-  if (process.env.IS_VPS === 'true'){
-    // This block can be used for VPS-specific logic in the future.
-  }
 }
 
 // 🔧 Normalize paths (double slashes + trailing slashes)
@@ -120,9 +98,6 @@ app.use(cookieParser());
 app.use(express.urlencoded({ extended: true }));
 
 // --- Serve Static Files ---
-// Make the 'uploads' directory publicly accessible
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
-
 // Serve static files (like the logs.html page) from the 'public' directory
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -145,6 +120,7 @@ app.use('/api/mpesa', mpesaRoutes);
 // Health check
 app.get('/api/health', async (req, res) => {
   try {
+    const pool = await poolPromise;
     // 1. Check Database Connection by running a simple, fast query.
     const dbResult = await pool.query('SELECT NOW() as now');
     const dbTime = dbResult.rows[0].now;
@@ -173,6 +149,7 @@ app.get('/api/health', async (req, res) => {
 
 // Graceful shutdown
 process.on('SIGINT', async () => {
+  const pool = await poolPromise;
   logger.info('Shutting down server...');
   await pool.end();
   process.exit(0);
@@ -191,14 +168,8 @@ if (process.env.DB_DIALECT === 'postgres') {
     logger.error('Failed to initialize PostgreSQL database. Server not started.', err);
     process.exit(1);
   });
-} else if (process.env.DB_DIALECT === 'mysql') {
-  logger.info("DB_DIALECT is 'mysql'. Initializing database...");
-  initializeDatabaseMysql().then(startServer).catch(err => {
-    logger.error('Failed to initialize MySQL database. Server not started.', err);
-    process.exit(1);
-  });
 } else {
-  logger.warn(`DB_DIALECT is not set or unsupported. Starting server without database initialization.`);
+  logger.warn(`DB_DIALECT is not set to 'postgres'. Starting server without database initialization.`);
   startServer();
 }
 
