@@ -54,6 +54,7 @@ const initializeDatabase = async () => {
       CREATE TABLE IF NOT EXISTS booths (
         id SERIAL PRIMARY KEY,
         booth_uid VARCHAR(100) UNIQUE NOT NULL, -- e.g., 'booth-001'
+        name VARCHAR(255),
         location_address TEXT,
         latitude DECIMAL(9, 6),
         longitude DECIMAL(9, 6),
@@ -213,4 +214,5 @@ const initializeDatabase = async () => {
   }
 };
 
+module.exports = { initializeDatabase };
 module.exports = { initializeDatabase };

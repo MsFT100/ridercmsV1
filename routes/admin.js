@@ -2,7 +2,9 @@ const { Router } = require('express');
 const { admin } = require('../utils/firebase');
 const logger = require('../utils/logger');
 const { verifyFirebaseToken, isAdmin } = require('../middleware/auth');
+const { getDatabase } = require('firebase-admin/database');
 const poolPromise = require('../db');
+const { v4: uuidv4 } = require('uuid'); // Import the UUID library
 
 const router = Router();
 
@@ -201,6 +203,76 @@ router.post('/users/set-status', [verifyFirebaseToken, isAdmin], async (req, res
 });
 
 /**
+ * GET /api/admin/booths
+ * @summary Get a list of all booths
+ * @description Retrieves a paginated list of all registered booths in the system. This is a protected route only accessible by users with the 'admin' role.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @parameters
+ *   - in: query
+ *     name: limit
+ *     schema:
+ *       type: integer
+ *       default: 25
+ *     description: The number of booths to return per page.
+ *   - in: query
+ *     name: offset
+ *     schema:
+ *       type: integer
+ *       default: 0
+ *     description: The number of booths to skip for pagination.
+ * @responses
+ *   200:
+ *     description: A paginated list of booths.
+ *     content:
+ *       application/json:
+ *         schema:
+ *           type: object
+ *           properties:
+ *             booths:
+ *               type: array
+ *               items:
+ *                 type: object
+ *             total:
+ *               type: integer
+ *   500:
+ *     description: Internal server error.
+ */
+router.get('/booths', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const limit = parseInt(req.query.limit, 10) || 25;
+  const offset = parseInt(req.query.offset, 10) || 0;
+
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    const listQuery = `
+      SELECT booth_uid, name, location_address, status, created_at, updated_at
+      FROM booths
+      ORDER BY created_at DESC
+      LIMIT $1 OFFSET $2;
+    `;
+    const countQuery = 'SELECT COUNT(*) FROM booths;';
+
+    // Execute both queries in parallel for efficiency
+    const [boothsResult, totalCountResult] = await Promise.all([
+      client.query(listQuery, [limit, offset]),
+      client.query(countQuery),
+    ]);
+
+    res.status(200).json({
+      booths: boothsResult.rows,
+      total: parseInt(totalCountResult.rows[0].count, 10),
+    });
+  } catch (error) {
+    logger.error('Failed to get list of booths for admin:', error);
+    res.status(500).json({ error: 'Failed to retrieve booths list.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
  * GET /api/admin/booths/status
  * @summary Get status of all booths and slots
  * @description Retrieves a comprehensive, nested status of all booths, their slots, and any batteries currently within those slots. This is a protected route only accessible by users with the 'admin' role.
@@ -220,6 +292,7 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
     const query = `
       SELECT
         bo.booth_uid,
+        bo.name,
         bo.location_address,
         bo.status as booth_status,
         bs.slot_identifier,
@@ -243,6 +316,7 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
       if (!booth) {
         booth = {
           boothUid: row.booth_uid,
+          name: row.name,
           location: row.location_address,
           status: row.booth_status,
           slots: []
@@ -272,6 +346,318 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
     client.release();
   }
 });
+
+/**
+ * Generates the initial data structure for 15 slots in a new booth.
+ * @returns {object} An object containing 15 slots with default values.
+ */
+function initializeFirebaseSlots() {
+  const slots = {};
+  const defaultSlotData = {
+    battery: false,
+    command: {
+      ack: "",
+      forceLock: false,
+      forceUnlock: false,
+      lastScannedSerial: "",
+      openDoorId: "",
+      openForCollection: false,
+      openForDeposit: false,
+      startCharging: false,
+      stopCharging: false
+    },
+    devicePresent: false,
+    doorClosed: true,
+    doorLocked: true,
+    events: {},
+    initial_soc: 0,
+    initial_voltage: 0,
+    pendingCmd: false,
+    rejection: {},
+    relay: "OFF",
+    soc: 0,
+    status: "booting", // Or 'available'
+    telemetry: {
+      batteryInserted: false,
+      doorClosed: true,
+      doorLocked: true,
+      plugConnected: false,
+      qr: "",
+      relayOn: false,
+      soc: 0,
+      temperature: 0,
+      temperatureC: 0,
+      timestamp: 0,
+      voltage: 0
+    }
+  };
+
+  for (let i = 1; i <= 15; i++) {
+    const slotIdentifier = `slot${String(i).padStart(3, '0')}`; // e.g., slot001
+    slots[slotIdentifier] = { ...defaultSlotData };
+  }
+  return slots;
+}
+
+/**
+ * POST /api/admin/booths
+ * @summary Create a new booth
+ * @description Creates a new booth in both PostgreSQL and Firebase Realtime Database. This is a protected route only accessible by users with the 'admin' role.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @requestBody
+ *   required: true
+ *   content:
+ *     application/json:
+ *       schema:
+ *         type: object
+ *         required: [name, locationAddress]
+ *         properties:
+ *           name:
+ *             type: string
+ *             description: A descriptive name for the booth (e.g., "Mall Entrance Booth").
+ *           locationAddress:
+ *             type: string
+ *             description: The physical address or location of the booth.
+ * @responses
+ *   201:
+ *     description: Booth created successfully. Returns the new booth's UID.
+ *   400:
+ *     description: Bad request (e.g., missing parameters).
+ *   500:
+ *     description: Internal server error.
+ */
+router.post('/booths', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const { name, locationAddress } = req.body;
+
+  if (!name || !locationAddress) {
+    return res.status(400).json({ error: 'Booth name and locationAddress are required.' });
+  }
+
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    // 1. Generate a new UUID for the booth.
+    const boothUid = uuidv4();
+
+    // 2. Insert the new booth into PostgreSQL with the generated UID.
+    const boothRes = await client.query(
+      "INSERT INTO booths (booth_uid, name, location_address, status) VALUES ($1, $2, $3, 'online') RETURNING booth_uid",
+      [boothUid, name, locationAddress]
+    );
+
+    // 2. Create the corresponding structure in Firebase Realtime Database
+    const db = getDatabase();
+    const newBoothRef = db.ref(`booths/${boothUid}`);
+    await newBoothRef.set({ slots: initializeFirebaseSlots() });
+
+    logger.info(`Admin (UID: ${req.user.uid}) created new booth '${name}' with UID '${boothUid}'.`);
+    res.status(201).json({ message: 'Booth created successfully.', boothUid: boothUid });
+  } catch (error) {
+    logger.error(`Failed to create new booth:`, error);
+    res.status(500).json({ error: 'Failed to create booth.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * PATCH /api/admin/booths/:boothUid
+ * @summary Update a booth's details
+ * @description Updates a booth's name and/or location address. This is a protected route only accessible by users with the 'admin' role.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @parameters
+ *   - in: path
+ *     name: boothUid
+ *     required: true
+ *     schema:
+ *       type: string
+ *     description: The UID of the booth to update.
+ * @requestBody
+ *   required: true
+ *   content:
+ *     application/json:
+ *       schema:
+ *         type: object
+ *         properties:
+ *           name:
+ *             type: string
+ *             description: The new descriptive name for the booth.
+ *           locationAddress:
+ *             type: string
+ *             description: The new physical address or location of the booth.
+ * @responses
+ *   200:
+ *     description: Booth updated successfully.
+ *   400:
+ *     description: Bad request (e.g., no fields to update).
+ *   404:
+ *     description: Booth not found.
+ *   500:
+ *     description: Internal server error.
+ */
+router.patch('/booths/:boothUid', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const { boothUid } = req.params;
+  const { name, locationAddress } = req.body;
+
+  if (!name && !locationAddress) {
+    return res.status(400).json({ error: 'At least one field (name or locationAddress) must be provided to update.' });
+  }
+
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    const setClauses = [];
+    const queryParams = [];
+    let paramIndex = 1;
+
+    if (name) {
+      setClauses.push(`name = $${paramIndex++}`);
+      queryParams.push(name);
+    }
+    if (locationAddress) {
+      setClauses.push(`location_address = $${paramIndex++}`);
+      queryParams.push(locationAddress);
+    }
+
+    const updateQuery = `UPDATE booths SET ${setClauses.join(', ')}, updated_at = NOW() WHERE booth_uid = $${paramIndex} RETURNING *`;
+    queryParams.push(boothUid);
+
+    const result = await client.query(updateQuery, queryParams);
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: `Booth with UID ${boothUid} not found.` });
+    }
+
+    logger.info(`Admin (UID: ${req.user.uid}) updated details for booth '${boothUid}'.`);
+    res.status(200).json({ message: 'Booth updated successfully.', booth: result.rows[0] });
+  } catch (error) {
+    logger.error(`Failed to update booth ${boothUid}:`, error);
+    res.status(500).json({ error: 'Failed to update booth.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * POST /api/admin/booths/:boothUid/status
+ * @summary Update a booth's status
+ * @description Updates the operational status of a specific booth (e.g., to take it offline for maintenance). This is a protected route only accessible by users with the 'admin' role.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @parameters
+ *   - in: path
+ *     name: boothUid
+ *     required: true
+ *     schema:
+ *       type: string
+ *     description: The UID of the booth to update.
+ * @requestBody
+ *   required: true
+ *   content:
+ *     application/json:
+ *       schema:
+ *         type: object
+ *         required: [status]
+ *         properties:
+ *           status:
+ *             type: string
+ *             description: The new operational status for the booth.
+ *             enum: [online, maintenance, offline]
+ * @responses
+ *   200:
+ *     description: Booth status updated successfully.
+ *   400:
+ *     description: Bad request (e.g., invalid status).
+ *   404:
+ *     description: Booth not found.
+ *   500:
+ *     description: Internal server error.
+ */
+router.post('/booths/:boothUid/status', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const { boothUid } = req.params;
+  const { status } = req.body;
+  const validStatuses = ['online', 'maintenance', 'offline'];
+
+  if (!status || !validStatuses.includes(status)) {
+    return res.status(400).json({ error: `Invalid status. Must be one of: ${validStatuses.join(', ')}` });
+  }
+
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    const updateQuery = `UPDATE booths SET status = $1, updated_at = NOW() WHERE booth_uid = $2 RETURNING *`;
+    const result = await client.query(updateQuery, [status, boothUid]);
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: `Booth with UID ${boothUid} not found.` });
+    }
+
+    logger.info(`Admin (UID: ${req.user.uid}) updated status for booth '${boothUid}' to '${status}'.`);
+    res.status(200).json({ message: 'Booth status updated successfully.', booth: result.rows[0] });
+  } catch (error) {
+    logger.error(`Failed to update status for booth ${boothUid}:`, error);
+    res.status(500).json({ error: 'Failed to update booth status.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/admin/booths/:boothUid
+ * @summary Get details of a single booth by UID
+ * @description Retrieves details of a specific booth using its UID. This is a protected route only accessible by users with the 'admin' role.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @parameters
+ *   - in: path
+ *     name: boothUid
+ *     required: true
+ *     schema:
+ *       type: string
+ *     description: The UID of the booth to retrieve.
+ * @responses
+ *   200:
+ *     description: Details of the booth.
+ *   404:
+ *     description: Booth not found.
+ *   500:
+ *     description: Internal server error.
+ */
+router.get('/booths/:boothUid', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const { boothUid } = req.params;
+
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    const query = `
+      SELECT booth_uid, name, location_address, status, created_at, updated_at
+      FROM booths
+      WHERE booth_uid = $1;
+    `;
+
+    const { rows } = await client.query(query, [boothUid]);
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: `Booth with UID ${boothUid} not found.` });
+    }
+
+    res.status(200).json(rows[0]);
+  } catch (error) {
+    logger.error(`Failed to get booth ${boothUid} for admin:`, error);
+    res.status(500).json({ error: 'Failed to retrieve booth.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+
+
 
 /**
  * GET /api/admin/problem-reports

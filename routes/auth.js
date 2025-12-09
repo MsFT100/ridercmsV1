@@ -152,6 +152,77 @@ router.post('/register', async (req, res) => {
 });
 
 /**
+ * @swagger
+ * /api/auth/user-by-phone:
+ *   post:
+ *     summary: Get user's email by their phone number
+ *     tags: [Authentication]
+ *     description: Used during the login process to allow users to sign in with their phone number instead of email. This is a public endpoint.
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - phoneNumber
+ *             properties:
+ *               phoneNumber:
+ *                 type: string
+ *                 description: The user's phone number in E.164 format.
+ *     responses:
+ *       200:
+ *         description: The user's email was found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 email:
+ *                   type: string
+ *                   format: email
+ *       404:
+ *         description: No user found with the provided phone number.
+ *       500:
+ *         description: Internal server error.
+ */
+router.post('/user-by-phone', async (req, res) => {
+  const { phoneNumber } = req.body;
+
+  if (!phoneNumber) {
+    return res.status(400).json({ error: 'Phone number is required.' });
+  }
+
+  // This endpoint is public for the login flow, so no token verification is needed.
+  // It simply acts as a lookup service.
+  const pool = await poolPromise;
+  const pgClient = await pool.connect();
+  try {
+    // Query the database for a user with the given phone number
+    const userRes = await pgClient.query(
+      'SELECT email FROM users WHERE phone = $1',
+      [phoneNumber]
+    );
+
+    if (userRes.rows.length === 0) {
+      // No user found with that phone number
+      logger.warn(`Phone-to-email lookup failed: No user found for phone number ${phoneNumber}`);
+      return res.status(404).json({ error: 'No user found with that phone number.' });
+    }
+
+    // User found, return their email
+    const user = userRes.rows[0];
+    logger.info(`Phone-to-email lookup successful for phone number ${phoneNumber}`);
+    res.status(200).json({ email: user.email });
+  } catch (error) {
+    logger.error(`Error during phone-to-email lookup for ${phoneNumber}:`, error);
+    res.status(500).json({ error: 'Internal server error.' });
+  } finally {
+    pgClient.release(); // Make sure to release the client back to the pool
+  }
+});
+
+/**
  * POST /api/auth/verify-phone
  * Consumes an ID token from a successful client-side phone OTP verification.
  * Verifies the token and marks the user's phone as verified in the database.
