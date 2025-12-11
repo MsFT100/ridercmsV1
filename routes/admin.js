@@ -246,22 +246,61 @@ router.get('/booths', [verifyFirebaseToken, isAdmin], async (req, res) => {
   const pool = await poolPromise;
   const client = await pool.connect();
   try {
+    // This query now joins with booth_slots and batteries to get all necessary info.
+    // It uses a window function to get the total count of booths efficiently.
     const listQuery = `
-      SELECT booth_uid, name, location_address, status, created_at, updated_at
-      FROM booths
-      ORDER BY created_at DESC
-      LIMIT $1 OFFSET $2;
+      SELECT
+        b.booth_uid, b.name, b.location_address, b.status, b.created_at, b.updated_at,
+        s.slot_identifier, s.status as slot_status, s.door_status, s.charge_level_percent as slot_charge_level,
+        bat.battery_uid,
+        COUNT(*) OVER() as total_booths
+      FROM (
+        SELECT * FROM booths ORDER BY created_at DESC LIMIT $1 OFFSET $2
+      ) b
+      LEFT JOIN booth_slots s ON b.id = s.booth_id
+      LEFT JOIN batteries bat ON s.current_battery_id = bat.id
+      ORDER BY b.created_at DESC, s.slot_identifier;
     `;
+
     const countQuery = 'SELECT COUNT(*) FROM booths;';
 
-    // Execute both queries in parallel for efficiency
     const [boothsResult, totalCountResult] = await Promise.all([
       client.query(listQuery, [limit, offset]),
-      client.query(countQuery),
+      client.query(countQuery)
     ]);
 
+    // Process the flat list of rows into a structured, nested object.
+    const booths = boothsResult.rows.reduce((acc, row) => {
+      let booth = acc.find(b => b.booth_uid === row.booth_uid);
+      if (!booth) {
+        booth = {
+          booth_uid: row.booth_uid,
+          name: row.name,
+          location_address: row.location_address,
+          status: row.status,
+          created_at: row.created_at,
+          updated_at: row.updated_at,
+          slots: [],
+          slotCount: 0
+        };
+        acc.push(booth);
+      }
+
+      if (row.slot_identifier) {
+        booth.slots.push({
+          identifier: row.slot_identifier,
+          status: row.slot_status,
+          doorStatus: row.door_status,
+          chargeLevel: row.slot_charge_level,
+          batteryUid: row.battery_uid
+        });
+        booth.slotCount++;
+      }
+      return acc;
+    }, []);
+
     res.status(200).json({
-      booths: boothsResult.rows,
+      booths: booths,
       total: parseInt(totalCountResult.rows[0].count, 10),
     });
   } catch (error) {
@@ -295,8 +334,12 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
         bo.name,
         bo.location_address,
         bo.status as booth_status,
+        bo.updated_at as last_heartbeat_at,
         bs.slot_identifier,
+        bs.door_status,
         bs.status as slot_status,
+        bs.is_charging as slot_is_charging,
+        bs.telemetry,
         bat.battery_uid,
         bat.charge_level_percent,
         u.email as battery_owner_email
@@ -319,21 +362,26 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
           name: row.name,
           location: row.location_address,
           status: row.booth_status,
+          lastHeartbeatAt: row.last_heartbeat_at,
           slots: []
         };
         acc.push(booth);
       }
 
-      // Add the slot information to the current booth
-      booth.slots.push({
-        slotIdentifier: row.slot_identifier,
-        status: row.slot_status,
-        battery: row.battery_uid ? {
-          batteryUid: row.battery_uid,
-          chargeLevel: row.charge_level_percent,
-          ownerEmail: row.battery_owner_email
-        } : null
-      });
+      // Only add slot information if a slot identifier exists (i.e., it's not a booth without slots)
+      if (row.slot_identifier) {
+        booth.slots.push({
+          slotIdentifier: row.slot_identifier,
+          doorStatus: row.door_status,
+          status: row.slot_status,
+          telemetry: row.telemetry,
+          battery: row.battery_uid ? {
+            batteryUid: row.battery_uid,
+            chargeLevel: row.charge_level_percent,
+            ownerEmail: row.battery_owner_email
+          } : null
+        });
+      }
 
       return acc;
     }, []);
@@ -438,25 +486,103 @@ router.post('/booths', [verifyFirebaseToken, isAdmin], async (req, res) => {
   const pool = await poolPromise;
   const client = await pool.connect();
   try {
+    // Start a transaction to ensure both DBs are updated or neither are.
+    await client.query('BEGIN');
+
     // 1. Generate a new UUID for the booth.
     const boothUid = uuidv4();
 
     // 2. Insert the new booth into PostgreSQL with the generated UID.
-    const boothRes = await client.query(
-      "INSERT INTO booths (booth_uid, name, location_address, status) VALUES ($1, $2, $3, 'online') RETURNING booth_uid",
+    const boothInsertResult = await client.query(
+      "INSERT INTO booths (booth_uid, name, location_address, status) VALUES ($1, $2, $3, 'online') RETURNING id",
       [boothUid, name, locationAddress]
     );
+    const newBoothId = boothInsertResult.rows[0].id;
 
-    // 2. Create the corresponding structure in Firebase Realtime Database
+    // 3. Create the corresponding slots in the PostgreSQL `booth_slots` table.
+    const firebaseSlots = initializeFirebaseSlots();
+    const slotInsertQuery = 'INSERT INTO booth_slots (booth_id, slot_identifier, status, door_status) VALUES ($1, $2, $3, $4)';
+
+    // Use Promise.all to run inserts in parallel for efficiency.
+    const slotInsertPromises = Object.keys(firebaseSlots).map(slotIdentifier => {
+      // The default status in the DB is 'available', and door is 'closed'.
+      // This matches the initial state from Firebase.
+      return client.query(slotInsertQuery, [newBoothId, slotIdentifier, 'available', 'closed']);
+    });
+    await Promise.all(slotInsertPromises);
+
+    // 4. Create the corresponding structure in Firebase Realtime Database.
     const db = getDatabase();
     const newBoothRef = db.ref(`booths/${boothUid}`);
-    await newBoothRef.set({ slots: initializeFirebaseSlots() });
+    await newBoothRef.set({ slots: firebaseSlots });
+
+    // 5. If all operations succeed, commit the transaction.
+    await client.query('COMMIT');
 
     logger.info(`Admin (UID: ${req.user.uid}) created new booth '${name}' with UID '${boothUid}'.`);
     res.status(201).json({ message: 'Booth created successfully.', boothUid: boothUid });
   } catch (error) {
+    await client.query('ROLLBACK'); // Rollback the transaction on any error.
     logger.error(`Failed to create new booth:`, error);
-    res.status(500).json({ error: 'Failed to create booth.', details: error.message });
+    res.status(500).json({ error: 'Failed to create new booth. The operation was rolled back.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * DELETE /api/admin/booths/:boothUid
+ * @summary Delete a booth
+ * @description Deletes a booth from both PostgreSQL and Firebase Realtime Database. This is a protected route only accessible by users with the 'admin' role.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @parameters
+ *   - in: path
+ *     name: boothUid
+ *     required: true
+ *     schema:
+ *       type: string
+ *     description: The UID of the booth to delete.
+ * @responses
+ *   200:
+ *     description: Booth deleted successfully.
+ *   404:
+ *     description: Booth not found.
+ *   500:
+ *     description: Internal server error.
+ */
+router.delete('/booths/:boothUid', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const { boothUid } = req.params;
+
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Delete from PostgreSQL. The ON DELETE CASCADE will handle related booth_slots.
+    const deleteResult = await client.query('DELETE FROM booths WHERE booth_uid = $1 RETURNING name', [boothUid]);
+
+    if (deleteResult.rowCount === 0) {
+      // If no rows are deleted, the booth doesn't exist. No need to proceed.
+      return res.status(404).json({ error: `Booth with UID ${boothUid} not found.` });
+    }
+    const boothName = deleteResult.rows[0].name;
+
+    // 2. Delete from Firebase Realtime Database.
+    const db = getDatabase();
+    const boothRef = db.ref(`booths/${boothUid}`);
+    await boothRef.remove();
+
+    // 3. If both succeed, commit the transaction.
+    await client.query('COMMIT');
+
+    logger.info(`Admin (UID: ${req.user.uid}) deleted booth '${boothName}' (UID: ${boothUid}).`);
+    res.status(200).json({ message: `Booth ${boothUid} deleted successfully.` });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    logger.error(`Failed to delete booth ${boothUid}:`, error);
+    res.status(500).json({ error: 'Failed to delete booth. The operation was rolled back.', details: error.message });
   } finally {
     client.release();
   }
@@ -510,6 +636,8 @@ router.patch('/booths/:boothUid', [verifyFirebaseToken, isAdmin], async (req, re
   const pool = await poolPromise;
   const client = await pool.connect();
   try {
+    await client.query('BEGIN');
+
     const setClauses = [];
     const queryParams = [];
     let paramIndex = 1;
@@ -532,9 +660,12 @@ router.patch('/booths/:boothUid', [verifyFirebaseToken, isAdmin], async (req, re
       return res.status(404).json({ error: `Booth with UID ${boothUid} not found.` });
     }
 
+    await client.query('COMMIT');
+
     logger.info(`Admin (UID: ${req.user.uid}) updated details for booth '${boothUid}'.`);
     res.status(200).json({ message: 'Booth updated successfully.', booth: result.rows[0] });
   } catch (error) {
+    await client.query('ROLLBACK');
     logger.error(`Failed to update booth ${boothUid}:`, error);
     res.status(500).json({ error: 'Failed to update booth.', details: error.message });
   } finally {
@@ -608,6 +739,101 @@ router.post('/booths/:boothUid/status', [verifyFirebaseToken, isAdmin], async (r
 });
 
 /**
+ * POST /api/admin/booths/:boothUid/slots/:slotIdentifier/command
+ * @summary Send a command to a specific booth slot
+ * @description Sends a command to a specific slot (e.g., force unlock, start charging) by updating its command object in Firebase. This is a protected route only accessible by users with the 'admin' role.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @parameters
+ *   - in: path
+ *     name: boothUid
+ *     required: true
+ *     schema:
+ *       type: string
+ *     description: The UID of the target booth.
+ *   - in: path
+ *     name: slotIdentifier
+ *     required: true
+ *     schema:
+ *       type: string
+ *     description: The identifier of the target slot (e.g., slot001).
+ * @requestBody
+ *   required: true
+ *   content:
+ *     application/json:
+ *       schema:
+ *         type: object
+ *         description: An object containing the command(s) to execute. Only valid command keys are accepted.
+ *         example:
+ *           forceUnlock: true
+ * @responses
+ *   200:
+ *     description: Command sent successfully.
+ *   400:
+ *     description: Bad request (e.g., invalid command key).
+ *   500:
+ *     description: Internal server error.
+ */
+router.post('/booths/:boothUid/slots/:slotIdentifier/command', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const { boothUid, slotIdentifier } = req.params;
+  const commandsToUpdate = req.body;
+
+  // A whitelist of mutable properties within the 'command' object.
+  const validCommands = [
+    'forceLock',
+    'forceUnlock',
+    'openForCollection',
+    'openForDeposit',
+    'startCharging',
+    'stopCharging',
+    'openDoorId' // Often used to trigger an open action with a unique ID
+  ];
+
+  let updates = {};
+  for (const [key, value] of Object.entries(commandsToUpdate)) {
+    if (!validCommands.includes(key)) {
+      return res.status(400).json({ error: `Invalid command key: '${key}'.` });
+    }
+    updates[key] = value;
+  }
+
+  // --- Mutual Exclusivity Logic ---
+  // Ensure that lock and unlock commands are not simultaneously true.
+  if (updates.forceLock === true) {
+    updates.forceUnlock = false;
+  }
+  if (updates.forceUnlock === true) {
+    updates.forceLock = false;
+  }
+
+  // Ensure that start and stop charging commands are not simultaneously true.
+  if (updates.startCharging === true) {
+    updates.stopCharging = false;
+  }
+  if (updates.stopCharging === true) {
+    updates.startCharging = false;
+  }
+  // --- End of Logic ---
+
+  if (Object.keys(updates).length === 0) {
+    return res.status(400).json({ error: 'No valid commands provided to execute.' });
+  }
+
+  try {
+    const db = getDatabase();
+    const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
+    await commandRef.update(updates);
+
+    logger.info(`Admin (UID: ${req.user.uid}) sent command(s) to ${boothUid}/${slotIdentifier}: ${JSON.stringify(updates)}`);
+    res.status(200).json({ message: 'Command sent successfully.', commands: updates });
+  } catch (error) {
+    logger.error(`Failed to send command to ${boothUid}/${slotIdentifier}:`, error);
+    res.status(500).json({ error: 'Failed to send command to slot.', details: error.message });
+  }
+});
+
+/**
  * GET /api/admin/booths/:boothUid
  * @summary Get details of a single booth by UID
  * @description Retrieves details of a specific booth using its UID. This is a protected route only accessible by users with the 'admin' role.
@@ -636,7 +862,13 @@ router.get('/booths/:boothUid', [verifyFirebaseToken, isAdmin], async (req, res)
   const client = await pool.connect();
   try {
     const query = `
-      SELECT booth_uid, name, location_address, status, created_at, updated_at
+      SELECT
+        booth_uid,
+        name,
+        location_address,
+        status,
+        created_at,
+        updated_at
       FROM booths
       WHERE booth_uid = $1;
     `;
@@ -647,7 +879,16 @@ router.get('/booths/:boothUid', [verifyFirebaseToken, isAdmin], async (req, res)
       return res.status(404).json({ error: `Booth with UID ${boothUid} not found.` });
     }
 
-    res.status(200).json(rows[0]);
+    // Explicitly construct the response to ensure all fields are included.
+    const boothDetails = rows[0];
+    res.status(200).json({
+      booth_uid: boothDetails.booth_uid,
+      name: boothDetails.name,
+      location_address: boothDetails.location_address,
+      status: boothDetails.status,
+      created_at: boothDetails.created_at,
+      updated_at: boothDetails.updated_at,
+    });
   } catch (error) {
     logger.error(`Failed to get booth ${boothUid} for admin:`, error);
     res.status(500).json({ error: 'Failed to retrieve booth.', details: error.message });
@@ -953,6 +1194,158 @@ router.post('/settings', [verifyFirebaseToken, isAdmin], async (req, res) => {
     await client.query('ROLLBACK');
     logger.error('Failed to update app settings:', error);
     res.status(500).json({ error: 'Failed to update application settings.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * @swagger
+ * tags:
+ *   name: Simulation
+ *   description: Endpoints for simulating hardware and external service events (for development/testing).
+ */
+
+/**
+ * POST /api/admin/simulate/confirm-deposit
+ * @summary (Dev Tool) Simulate a hardware confirmation of a battery deposit.
+ * @description Manually triggers the logic that would normally be called by the booth hardware after a user deposits a battery. This is for testing and development.
+ * @tags [Admin, Simulation]
+ * @security
+ *   - bearerAuth: []
+ * @requestBody
+ *   required: true
+ *   content:
+ *     application/json:
+ *       schema:
+ *         type: object
+ *         required: [boothUid, slotIdentifier, batteryUid, chargeLevel]
+ *         properties:
+ *           boothUid:
+ *             type: string
+ *           slotIdentifier:
+ *             type: string
+ *           batteryUid:
+ *             type: string
+ *           chargeLevel:
+ *             type: integer
+ * @responses
+ *   200:
+ *     description: Deposit successfully simulated.
+ *   400:
+ *     description: Bad request.
+ *   404:
+ *     description: Pending deposit session not found.
+ *   500:
+ *     description: Internal server error.
+ */
+router.post('/simulate/confirm-deposit', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const { boothUid, slotIdentifier, chargeLevel } = req.body;
+
+  if (!boothUid || !slotIdentifier || chargeLevel === undefined) {
+    return res.status(400).json({ error: 'boothUid, slotIdentifier, and chargeLevel are required.' });
+  }
+
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // This logic is copied from /api/booths/confirm-deposit
+    const depositRes = await client.query(
+      `SELECT d.id, d.user_id FROM deposits d
+       JOIN booths b ON d.booth_id = b.id
+       JOIN booth_slots s ON d.slot_id = s.id
+       WHERE b.booth_uid = $1 AND s.slot_identifier = $2 AND d.status = 'pending' AND d.session_type = 'deposit'
+       ORDER BY d.created_at DESC LIMIT 1`,
+      [boothUid, slotIdentifier]
+    );
+
+    if (depositRes.rows.length === 0) {
+      throw new Error(`No pending deposit session found for booth '${boothUid}', slot '${slotIdentifier}'.`);
+    }
+    const { id: depositId, user_id: firebaseUid } = depositRes.rows[0];
+
+    // For simulation, we generate a random battery UID, mimicking a new user battery.
+    const simulatedBatteryUid = `sim-${uuidv4()}`;
+
+    // Upsert the simulated battery (create it if it doesn't exist) and link to user.
+    const upsertBatteryQuery = `
+      INSERT INTO batteries (battery_uid, user_id, charge_level_percent)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (battery_uid) DO UPDATE SET user_id = $2, charge_level_percent = $3
+      RETURNING id;
+    `;
+    const batteryRes = await client.query(upsertBatteryQuery, [simulatedBatteryUid, firebaseUid, chargeLevel]);
+    const batteryId = batteryRes.rows[0].id;
+
+    await client.query(
+      "UPDATE booth_slots SET status = 'occupied', current_battery_id = $1 WHERE slot_identifier = $2 AND booth_id = (SELECT id FROM booths WHERE booth_uid = $3)",
+      [batteryId, slotIdentifier, boothUid]
+    );
+    await client.query(
+      "UPDATE deposits SET status = 'completed', battery_id = $1, initial_charge_level = $2, completed_at = NOW() WHERE id = $3",
+      [batteryId, chargeLevel, depositId]
+    );
+
+    await client.query('COMMIT');
+    logger.info(`(SIMULATION) Admin ${req.user.uid} confirmed deposit for user '${firebaseUid}' with new battery '${simulatedBatteryUid}' in slot '${slotIdentifier}'.`);
+    res.status(200).json({ success: true, message: 'Deposit confirmed via simulation.' });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    logger.error(`(SIMULATION) Failed to confirm deposit for slot '${slotIdentifier}' at booth '${boothUid}':`, error);
+    res.status(500).json({ error: 'Failed to simulate deposit confirmation.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * POST /api/admin/simulate/confirm-payment
+ * @summary (Dev Tool) Simulate a successful M-Pesa payment for a withdrawal.
+ * @description Manually updates a withdrawal session's status to 'in_progress', mimicking a successful payment callback from M-Pesa.
+ * @tags [Admin, Simulation]
+ * @security
+ *   - bearerAuth: []
+ * @requestBody
+ *   required: true
+ *   content:
+ *     application/json:
+ *       schema:
+ *         type: object
+ *         required: [checkoutRequestId]
+ *         properties:
+ *           checkoutRequestId:
+ *             type: string
+ * @responses
+ *   200:
+ *     description: Payment successfully simulated.
+ */
+router.post('/simulate/confirm-payment', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const { checkoutRequestId } = req.body;
+
+  if (!checkoutRequestId) {
+    return res.status(400).json({ error: 'checkoutRequestId is required.' });
+  }
+
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    const updateResult = await client.query(
+      "UPDATE deposits SET status = 'in_progress' WHERE mpesa_checkout_id = $1 AND status = 'pending'",
+      [checkoutRequestId]
+    );
+
+    if (updateResult.rowCount > 0) {
+      logger.info(`(SIMULATION) Admin ${req.user.uid} confirmed payment for CheckoutRequestID: ${checkoutRequestId}.`);
+      res.status(200).json({ message: 'Payment status updated to in_progress via simulation.' });
+    } else {
+      logger.warn(`(SIMULATION) Could not find a pending session for CheckoutRequestID: ${checkoutRequestId}`);
+      res.status(404).json({ error: 'No pending withdrawal session found for that CheckoutRequestID.' });
+    }
+  } catch (error) {
+    logger.error(`(SIMULATION) Failed to confirm payment for ${checkoutRequestId}:`, error);
+    res.status(500).json({ error: 'Failed to simulate payment confirmation.', details: error.message });
   } finally {
     client.release();
   }

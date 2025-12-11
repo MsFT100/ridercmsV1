@@ -38,7 +38,8 @@ const getAccessToken = async () => {
 };
 
 // Lipa Na Mpesa STK Push
-const initiateSTKPush = async (phone, amount, accountRef, desc) => {
+const initiateSTKPush = async (options) => {
+  const { phone, amount, accountRef, transactionDesc } = options;
   const token = await getAccessToken();
   const timestamp = new Date().toISOString().replace(/[-:]/g, '').slice(0, 14);
   const password = Buffer.from(`${MPESA_CONFIG.shortCode}${MPESA_CONFIG.passkey}${timestamp}`).toString('base64');
@@ -54,7 +55,7 @@ const initiateSTKPush = async (phone, amount, accountRef, desc) => {
     PhoneNumber: `254${phone.slice(-9)}`,
     CallBackURL: MPESA_CONFIG.callbackUrl,
     AccountReference: accountRef,
-    TransactionDesc: desc,
+    TransactionDesc: transactionDesc,
   };
 
   return axios.post(`${MPESA_CONFIG.apiUrl}/mpesa/stkpush/v1/processrequest`, payload, {
@@ -62,7 +63,7 @@ const initiateSTKPush = async (phone, amount, accountRef, desc) => {
   });
 };
 
-// B2C (Driver Payout)
+// B2C (Payout)
 const initiateB2CPayout = async (driverPhone, amount, remarks) => {
   const token = await getAccessToken();
   const payload = {

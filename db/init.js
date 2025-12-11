@@ -86,6 +86,8 @@ const initializeDatabase = async () => {
         current_battery_id INT REFERENCES batteries(id) ON DELETE SET NULL,
         charge_level_percent INT CHECK (charge_level_percent BETWEEN 0 AND 100), -- Mirrored from Firebase for quick lookups
         door_status VARCHAR(20) DEFAULT 'closed' CHECK (door_status IN ('open', 'closed', 'locked')), -- Mirrored from Firebase
+        is_charging BOOLEAN DEFAULT FALSE,
+        telemetry JSONB, -- To store the full telemetry object from Firebase
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW(),
         last_seen_at TIMESTAMPTZ, -- To track when the last telemetry was received
@@ -102,6 +104,7 @@ const initializeDatabase = async () => {
         battery_id INT REFERENCES batteries(id) ON DELETE SET NULL,
         session_type VARCHAR(20) NOT NULL CHECK (session_type IN ('deposit', 'withdrawal')),
         initial_charge_level INT, -- Stored on deposit
+        amount DECIMAL(10, 2) NOT NULL DEFAULT 0.00, -- Amount charged for the session
         mpesa_checkout_id VARCHAR(255) UNIQUE, -- For tracking payment status
         status VARCHAR(50) NOT NULL CHECK (status IN ('pending', 'in_progress', 'completed', 'failed', 'cancelled')),
         started_at TIMESTAMPTZ DEFAULT NOW(),

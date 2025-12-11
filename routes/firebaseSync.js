@@ -46,9 +46,10 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
         status,
         door_status,
         charge_level_percent,
+        telemetry,
         last_seen_at
       )
-      SELECT id, $2, $3, $4, $5, NOW()
+      SELECT id, $2, $3, $4, $5, $6, NOW()
       FROM booths
       WHERE booth_uid = $1
       ON CONFLICT (booth_id, slot_identifier)
@@ -56,6 +57,7 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
         status = EXCLUDED.status,
         door_status = EXCLUDED.door_status,
         charge_level_percent = EXCLUDED.charge_level_percent,
+        telemetry = EXCLUDED.telemetry,
         last_seen_at = NOW(),
         updated_at = NOW()
       RETURNING id;
@@ -64,6 +66,7 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
     const status = mapSlotStatus(slotData.status, slotData.devicePresent);
     const doorStatus = mapDoorStatus(slotData.doorClosed, slotData.doorLocked);
     const chargeLevel = slotData.soc || null;
+    const telemetry = slotData.telemetry || null;
 
     const result = await pgClient.query(upsertQuery, [
       boothUid,
@@ -71,6 +74,7 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
       status,
       doorStatus,
       chargeLevel,
+      telemetry,
     ]);
 
     if (result.rowCount > 0) {
