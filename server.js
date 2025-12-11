@@ -12,6 +12,7 @@ const poolPromise = require('./db/index.js'); // Corrected path
 const { initializeDatabase } = require('./db/init'); // Corrected path
 const { initializeFirebase } = require('./utils/firebase');
 const swaggerUi = require('swagger-ui-express');
+const { initializeFirebaseListener } = require('./utils/firebaseListener');
 const swaggerSpec = require('./utils/swaggerConfig');
 
 
@@ -27,6 +28,9 @@ const PORT = process.env.PORT || 8080;
 
 // --- Initialize Firebase Admin SDK ---
 initializeFirebase();
+
+// --- Initialize Firebase Realtime Database Listener ---
+initializeFirebaseListener();
 
 // Security check
 if (!process.env.JWT_SECRET && process.env.NODE_ENV === 'production') {

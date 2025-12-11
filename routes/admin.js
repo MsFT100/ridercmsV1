@@ -1561,4 +1561,80 @@ router.get('/dashboard-summary', [verifyFirebaseToken, isAdmin], async (req, res
   }
 });
 
+/**
+ * GET /api/admin/sessions
+ * @summary Get all sessions from the deposits table
+ * @description Retrieves a paginated list of all sessions (deposits and withdrawals) from the deposits table, including detailed information. This is a protected route only accessible by users with the 'admin' role.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @parameters
+ *   - in: query
+ *     name: limit
+ *     schema:
+ *       type: integer
+ *       default: 50
+ *     description: The number of sessions to return.
+ *   - in: query
+ *     name: offset
+ *     schema:
+ *       type: integer
+ *       default: 0
+ *     description: The number of sessions to skip for pagination.
+ * @responses
+ *   200:
+ *     description: A paginated list of all sessions.
+ *   500:
+ *     description: Internal server error.
+ */
+router.get('/sessions', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const limit = parseInt(req.query.limit, 10) || 50;
+  const offset = parseInt(req.query.offset, 10) || 0;
+
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    const query = `
+      SELECT
+        d.id,
+        d.session_type AS "sessionType",
+        d.status,
+        d.amount,
+        d.mpesa_checkout_id AS "mpesaCheckoutId",
+        d.initial_charge_level AS "initialChargeLevel",
+        d.created_at AS "createdAt",
+        d.started_at AS "startedAt",
+        d.completed_at AS "completedAt",
+        u.email AS "userEmail",
+        b.booth_uid AS "boothUid",
+        s.slot_identifier AS "slotIdentifier",
+        bat.battery_uid AS "batteryUid"
+      FROM deposits d
+      LEFT JOIN users u ON d.user_id = u.user_id
+      LEFT JOIN booths b ON d.booth_id = b.id
+      LEFT JOIN booth_slots s ON d.slot_id = s.id
+      LEFT JOIN batteries bat ON d.battery_id = bat.id
+      ORDER BY d.created_at DESC
+      LIMIT $1 OFFSET $2;
+    `;
+
+    const countQuery = 'SELECT COUNT(*) FROM deposits;';
+
+    const [sessionsResult, totalCountResult] = await Promise.all([
+      client.query(query, [limit, offset]),
+      client.query(countQuery),
+    ]);
+
+    res.status(200).json({
+      sessions: sessionsResult.rows,
+      total: parseInt(totalCountResult.rows[0].count, 10),
+    });
+  } catch (error) {
+    logger.error('Failed to get all sessions for admin:', error);
+    res.status(500).json({ error: 'Failed to retrieve sessions.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 module.exports = router;

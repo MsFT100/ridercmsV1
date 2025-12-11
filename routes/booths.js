@@ -123,47 +123,47 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (req, res) => {
 
     await client.query('COMMIT');
 
-    // --- Development Simulation ---
-    // If not in production, automatically simulate the hardware confirming the deposit.
-    if (process.env.NODE_ENV !== 'production') {
-      try {
-        // Use a nested transaction for the simulation part.
-        await client.query('BEGIN');
+    // // --- Development Simulation ---
+    // // If not in production, automatically simulate the hardware confirming the deposit.
+    // if (process.env.NODE_ENV !== 'production') {
+    //   try {
+    //     // Use a nested transaction for the simulation part.
+    //     await client.query('BEGIN');
 
-        // 1. Generate a random battery UID and charge level for the simulation.
-        const { v4: uuidv4 } = require('uuid');
-        const simulatedBatteryUid = `sim-user-${uuidv4().slice(0, 8)}`;
-        const simulatedChargeLevel = Math.floor(Math.random() * 80) + 10; // Random charge: 10-90%
+    //     // 1. Generate a random battery UID and charge level for the simulation.
+    //     const { v4: uuidv4 } = require('uuid');
+    //     const simulatedBatteryUid = `sim-user-${uuidv4().slice(0, 8)}`;
+    //     const simulatedChargeLevel = Math.floor(Math.random() * 80) + 10; // Random charge: 10-90%
 
-        // 2. Find the pending deposit session we just created.
-        const depositRes = await client.query("SELECT id FROM deposits WHERE user_id = $1 AND slot_id = $2 AND status = 'pending' AND session_type = 'deposit'", [firebaseUid, slotId]);
-        const depositId = depositRes.rows[0].id;
+    //     // 2. Find the pending deposit session we just created.
+    //     const depositRes = await client.query("SELECT id FROM deposits WHERE user_id = $1 AND slot_id = $2 AND status = 'pending' AND session_type = 'deposit'", [firebaseUid, slotId]);
+    //     const depositId = depositRes.rows[0].id;
 
-        // 3. Upsert the simulated battery (create if new) and link to the user.
-        const upsertBatteryQuery = `
-          INSERT INTO batteries (battery_uid, user_id, charge_level_percent)
-          VALUES ($1, $2, $3)
-          ON CONFLICT (battery_uid) DO UPDATE SET user_id = $2, charge_level_percent = $3
-          RETURNING id;
-        `;
-        const batteryRes = await client.query(upsertBatteryQuery, [simulatedBatteryUid, firebaseUid, simulatedChargeLevel]);
-        const batteryId = batteryRes.rows[0].id;
+    //     // 3. Upsert the simulated battery (create if new) and link to the user.
+    //     const upsertBatteryQuery = `
+    //       INSERT INTO batteries (battery_uid, user_id, charge_level_percent)
+    //       VALUES ($1, $2, $3)
+    //       ON CONFLICT (battery_uid) DO UPDATE SET user_id = $2, charge_level_percent = $3
+    //       RETURNING id;
+    //     `;
+    //     const batteryRes = await client.query(upsertBatteryQuery, [simulatedBatteryUid, firebaseUid, simulatedChargeLevel]);
+    //     const batteryId = batteryRes.rows[0].id;
 
-        // 4. Update the slot and complete the deposit record.
-        await client.query("UPDATE booth_slots SET status = 'occupied', current_battery_id = $1 WHERE id = $2", [batteryId, slotId]);
-        await client.query("UPDATE deposits SET status = 'completed', battery_id = $1, initial_charge_level = $2, completed_at = NOW() WHERE id = $3", [batteryId, simulatedChargeLevel, depositId]);
+    //     // 4. Update the slot and complete the deposit record.
+    //     await client.query("UPDATE booth_slots SET status = 'occupied', current_battery_id = $1 WHERE id = $2", [batteryId, slotId]);
+    //     await client.query("UPDATE deposits SET status = 'completed', battery_id = $1, initial_charge_level = $2, completed_at = NOW() WHERE id = $3", [batteryId, simulatedChargeLevel, depositId]);
 
-        await client.query('COMMIT');
-        logger.info(`(SIMULATION) Deposit automatically confirmed for user '${firebaseUid}' with new battery '${simulatedBatteryUid}' in slot '${slotIdentifier}'.`);
+    //     await client.query('COMMIT');
+    //     logger.info(`(SIMULATION) Deposit automatically confirmed for user '${firebaseUid}' with new battery '${simulatedBatteryUid}' in slot '${slotIdentifier}'.`);
 
-      } catch (simError) {
-        await client.query('ROLLBACK');
-        // Log the simulation error, but don't fail the main request,
-        // as the initial deposit session was already created successfully.
-        logger.error('(SIMULATION) Failed to auto-confirm deposit:', simError);
-      }
-    }
-    // --- End of Development Simulation ---
+    //   } catch (simError) {
+    //     await client.query('ROLLBACK');
+    //     // Log the simulation error, but don't fail the main request,
+    //     // as the initial deposit session was already created successfully.
+    //     logger.error('(SIMULATION) Failed to auto-confirm deposit:', simError);
+    //   }
+    // }
+    // // --- End of Development Simulation ---
 
     logger.info(`Deposit session initiated for user '${firebaseUid}' at booth '${boothUid}', slot '${slotIdentifier}'.`);
 
@@ -185,74 +185,6 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (req, res) => {
 });
 
 /**
- * POST /api/booths/confirm-deposit
- * Called by the BOOTH HARDWARE after a battery is deposited and the door closes.
- * This finalizes the deposit, linking the battery to the user and slot.
- */
-router.post('/confirm-deposit', verifyApiKey, async (req, res) => {
-  const { boothUid, slotIdentifier, batteryUid, chargeLevel } = req.body;
-
-  if (!boothUid || !slotIdentifier || !batteryUid || chargeLevel === undefined) {
-    return res.status(400).json({ error: 'boothUid, slotIdentifier, batteryUid, and chargeLevel are required.' });
-  }
-
-  const pool = await poolPromise;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    // 1. Find the pending deposit session for this user and slot
-    const depositRes = await client.query(
-      `SELECT d.id, d.user_id FROM deposits d
-       JOIN booths b ON d.booth_id = b.id
-       JOIN booth_slots s ON d.slot_id = s.id
-       WHERE b.booth_uid = $1 AND s.slot_identifier = $2 AND d.status = 'pending'
-       ORDER BY d.created_at DESC LIMIT 1`,
-      [boothUid, slotIdentifier]
-    );
-
-    if (depositRes.rows.length === 0) {
-      throw new Error(`No pending deposit found for booth '${boothUid}', slot '${slotIdentifier}'.`);
-    }
-    const { id: depositId, user_id: firebaseUid } = depositRes.rows[0];
-
-    // --- Battery dependency removed for testing ---
-    // // 2. Find the battery's internal ID
-    // const batteryRes = await client.query('SELECT id FROM batteries WHERE battery_uid = $1', [batteryUid]);
-    // if (batteryRes.rows.length === 0) {
-    //   throw new Error(`Battery with UID ${batteryUid} not found in the system.`);
-    // }
-    // const batteryId = batteryRes.rows[0].id;
-    //
-    // // 3. Update the battery to link it to the user
-    // await client.query('UPDATE batteries SET user_id = $1 WHERE id = $2', [firebaseUid, batteryId]);
-    const batteryId = null; // Set to null for testing
-
-    // 4. Update the slot to show it's occupied by this battery
-    await client.query(
-      "UPDATE booth_slots SET status = 'occupied', current_battery_id = $1 WHERE slot_identifier = $2 AND booth_id = (SELECT id FROM booths WHERE booth_uid = $3)",
-      [null, slotIdentifier, boothUid] // Using null for current_battery_id
-    );
-
-    // 5. Mark the deposit session as completed
-    await client.query(
-      "UPDATE deposits SET status = 'completed', battery_id = $1, initial_charge_level = $2, completed_at = NOW() WHERE id = $3",
-      [batteryId, chargeLevel, depositId]
-    );
-
-    await client.query('COMMIT');
-    logger.info(`Deposit confirmed for user '${firebaseUid}' with battery '${batteryUid}' in slot '${slotIdentifier}' at booth '${boothUid}'.`);
-    res.status(200).json({ success: true, message: 'Deposit confirmed.' });
-  } catch (error) {
-    await client.query('ROLLBACK');
-    logger.error(`Failed to confirm deposit for slot '${slotIdentifier}' at booth '${boothUid}':`, error);
-    res.status(500).json({ error: 'Failed to confirm deposit.', details: error.message });
-  } finally {
-    client.release();
-  }
-});
-
-/**
  * GET /api/booths/my-battery-status
  * Allows a logged-in user to check the status and location of their deposited battery.
  */
@@ -263,20 +195,21 @@ router.get('/my-battery-status', verifyFirebaseToken, async (req, res) => {
   const client = await pool.connect();
   try {
     // 1. Find where the user's battery is located from our database.
+    // This query now correctly finds the last successful deposit session for the user
+    // that has not yet been part of a completed withdrawal. This ignores any cancelled or failed sessions.
     const locationQuery = `
       SELECT
         bo.booth_uid AS "boothUid",
         s.id AS "slotId",
         s.slot_identifier AS "slotIdentifier",
         s.charge_level_percent AS "lastKnownChargeLevel",
-        d.status AS "sessionStatus"
-      FROM deposits d
-      JOIN booth_slots s ON d.slot_id = s.id
+        'deposited' AS "sessionStatus" -- The status is implicitly 'deposited' if found
+      FROM batteries bat
+      JOIN booth_slots s ON bat.id = s.current_battery_id
       JOIN booths bo ON s.booth_id = bo.id
-      WHERE d.user_id = $1
-        AND d.id = (
-          SELECT MAX(id) FROM deposits WHERE user_id = $1
-        )
+      WHERE bat.user_id = $1
+        AND s.status = 'occupied'
+      LIMIT 1;
     `;
     const locationResult = await client.query(locationQuery, [firebaseUid]);
 
@@ -680,8 +613,8 @@ router.post('/open-for-collection', verifyFirebaseToken, async (req, res) => {
 
 /**
  * POST /api/booths/cancel-session
- * @summary Cancel a pending deposit or withdrawal session
- * @description Allows a user to cancel their own active session that is in a 'pending' state. This will free up a reserved slot (for deposits) or abort a payment process (for withdrawals).
+ * @summary Cancel any active user session
+ * @description Allows a user to cancel their own active session (e.g., 'pending', 'in_progress', 'opening'). This will free up the reserved slot and reset its state, making it available for another user.
  * @tags [Booths]
  * @security
  *   - bearerAuth: []
@@ -689,7 +622,7 @@ router.post('/open-for-collection', verifyFirebaseToken, async (req, res) => {
  *   200:
  *     description: Session cancelled successfully.
  *   404:
- *     description: No pending session found to cancel.
+ *     description: No active session found to cancel.
  *   500:
  *     description: Internal server error.
  */
@@ -701,7 +634,7 @@ router.post('/cancel-session', verifyFirebaseToken, async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // 1. Find the user's pending session, regardless of type.
+    // 1. Find the user's active (non-terminal) session.
     const sessionQuery = `
       SELECT
         d.id,
@@ -712,13 +645,13 @@ router.post('/cancel-session', verifyFirebaseToken, async (req, res) => {
       FROM deposits d
       JOIN booth_slots s ON d.slot_id = s.id
       JOIN booths b ON d.booth_id = b.id
-      WHERE d.user_id = $1 AND d.status = 'pending'
+      WHERE d.user_id = $1 AND d.status IN ('pending', 'in_progress', 'opening')
       LIMIT 1;
     `;
     const sessionRes = await client.query(sessionQuery, [firebaseUid]);
 
     if (sessionRes.rows.length === 0) {
-      return res.status(404).json({ error: 'No pending session found to cancel.' });
+      return res.status(404).json({ error: 'No active session found to cancel.' });
     }
 
     const { id: sessionId, session_type: sessionType, slot_id: slotId, slot_identifier: slotIdentifier, booth_uid: boothUid } = sessionRes.rows[0];
@@ -726,22 +659,20 @@ router.post('/cancel-session', verifyFirebaseToken, async (req, res) => {
     // 2. Mark the session as 'cancelled' in the database.
     await client.query("UPDATE deposits SET status = 'cancelled' WHERE id = $1", [sessionId]);
 
-    // 3. If it was a deposit, the slot was reserved. We need to free it.
-    if (sessionType === 'deposit') {
-      // Revert the slot status from 'opening' back to 'available'.
-      await client.query("UPDATE booth_slots SET status = 'available' WHERE id = $1 AND status = 'opening'", [slotId]);
+    // 3. The slot was reserved for the session. We need to free it and reset its state.
+    // This applies to both deposits and withdrawals that have reserved a slot.
+    await client.query("UPDATE booth_slots SET status = 'available' WHERE id = $1", [slotId]);
 
-      // Send a command to Firebase to ensure the door opening command is cancelled.
-      const db = getDatabase();
-      const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
-      await commandRef.update({
-        openForDeposit: false
-      });
+    // 4. Send a command to Firebase to ensure any door opening commands are cancelled.
+    // This resets the command state for the slot.
+    const db = getDatabase();
+    const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
+    await commandRef.update({
+      openForDeposit: false,
+      openForCollection: false
+    });
 
-      logger.info(`User ${firebaseUid} cancelled deposit session ${sessionId}. Slot ${slotIdentifier} at booth ${boothUid} is now available.`);
-    } else { // It was a withdrawal
-      logger.info(`User ${firebaseUid} cancelled withdrawal session ${sessionId}. The M-Pesa STK push will expire.`);
-    }
+    logger.info(`User ${firebaseUid} cancelled session ${sessionId} (type: ${sessionType}). Slot ${slotIdentifier} at booth ${boothUid} is now available.`);
 
     await client.query('COMMIT');
     res.status(200).json({ message: 'Your session has been successfully cancelled.' });
@@ -749,60 +680,6 @@ router.post('/cancel-session', verifyFirebaseToken, async (req, res) => {
     await client.query('ROLLBACK');
     logger.error(`Failed to cancel session for user ${firebaseUid}:`, error);
     res.status(500).json({ error: 'Failed to cancel session.', details: error.message });
-  } finally {
-    client.release();
-  }
-});
-
-/**
- * POST /api/booths/confirm-withdrawal
- * Called by the BOOTH HARDWARE after a battery is collected and the door closes.
- */
-router.post('/confirm-withdrawal', verifyApiKey, async (req, res) => {
-  const { boothUid, slotIdentifier } = req.body;
-
-  if (!boothUid || !slotIdentifier) {
-    return res.status(400).json({ error: 'boothUid and slotIdentifier are required.' });
-  }
-
-  const pool = await poolPromise;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    // 1. Find the pending withdrawal session
-    const sessionRes = await client.query(
-      `SELECT d.id, d.slot_id FROM deposits d
-       JOIN booths b ON d.booth_id = b.id
-       JOIN booth_slots s ON d.slot_id = s.id
-       WHERE b.booth_uid = $1 AND s.slot_identifier = $2 AND d.session_type = 'withdrawal' AND d.status = 'pending'
-       ORDER BY d.created_at DESC LIMIT 1`,
-      [boothUid, slotIdentifier]
-    );
-
-    if (sessionRes.rows.length === 0) {
-      throw new Error(`No pending withdrawal found for booth '${boothUid}', slot '${slotIdentifier}'.`);
-    }
-    const { id: sessionId, slot_id: slotId } = sessionRes.rows[0];
-
-    // 2. Mark the session as completed
-    await client.query("UPDATE deposits SET status = 'completed', completed_at = NOW() WHERE id = $1", [sessionId]);
-
-    // 3. Find the battery that was in the slot
-    const batteryRes = await client.query('SELECT current_battery_id FROM booth_slots WHERE id = $1', [slotId]);
-    const batteryId = batteryRes.rows[0].current_battery_id;
-
-    // 4. Free up the slot and unlink the battery from it
-    await client.query("UPDATE booth_slots SET status = 'available', current_battery_id = NULL, charge_level_percent = NULL WHERE id = $1", [slotId]);
-
-    await client.query('COMMIT');
-
-    logger.info(`Withdrawal confirmed for slot '${slotIdentifier}' at booth '${boothUid}'. Slot is now available.`);
-    res.status(200).json({ success: true, message: 'Withdrawal confirmed.' });
-  } catch (error) {
-    await client.query('ROLLBACK');
-    logger.error(`Failed to confirm withdrawal for slot '${slotIdentifier}' at booth '${boothUid}':`, error);
-    res.status(500).json({ error: 'Failed to confirm withdrawal.', details: error.message });
   } finally {
     client.release();
   }
