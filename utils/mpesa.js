@@ -63,6 +63,28 @@ const initiateSTKPush = async (options) => {
   });
 };
 
+/**
+ * Queries the status of a previously initiated STK push transaction.
+ * @param {string} checkoutRequestId The CheckoutRequestID from the initial STK push.
+ * @returns {Promise<object>} A promise that resolves with the M-Pesa query response.
+ */
+const querySTKStatus = async (checkoutRequestId) => {
+  const token = await getAccessToken();
+  const timestamp = new Date().toISOString().replace(/[-:]/g, '').slice(0, 14);
+  const password = Buffer.from(`${MPESA_CONFIG.shortCode}${MPESA_CONFIG.passkey}${timestamp}`).toString('base64');
+
+  const payload = {
+    BusinessShortCode: MPESA_CONFIG.shortCode,
+    Password: password,
+    Timestamp: timestamp,
+    CheckoutRequestID: checkoutRequestId,
+  };
+
+  return axios.post(`${MPESA_CONFIG.apiUrl}/mpesa/stkpushquery/v1/query`, payload, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+};
+
 // B2C (Payout)
 const initiateB2CPayout = async (driverPhone, amount, remarks) => {
   const token = await getAccessToken();
@@ -84,4 +106,4 @@ const initiateB2CPayout = async (driverPhone, amount, remarks) => {
   });
 };
 
-module.exports = { initiateSTKPush, initiateB2CPayout };
+module.exports = { initiateSTKPush, initiateB2CPayout, querySTKStatus };

@@ -4,7 +4,7 @@ const logger = require('../utils/logger');
 const poolPromise = require('../db');
 const { verifyFirebaseToken } = require('../middleware/auth');
 const verifyApiKey = require('../middleware/verifyApiKey');
-const { initiateSTKPush} = require('../utils/mpesa'); // Import the specific function
+const { initiateSTKPush, querySTKStatus } = require('../utils/mpesa'); // Import the specific function
 
 const router = Router();
 
@@ -561,21 +561,63 @@ router.get('/withdrawal-status/:checkoutRequestId', verifyFirebaseToken, async (
   try {
     // Find the session and check its status.
     // The M-Pesa callback would have updated the status to 'in_progress' upon successful payment.
-    const result = await client.query(
-      "SELECT status FROM deposits WHERE mpesa_checkout_id = $1 AND user_id = $2 AND session_type = 'withdrawal'",
+    const sessionRes = await client.query(
+      "SELECT id, status, started_at FROM deposits WHERE mpesa_checkout_id = $1 AND user_id = $2 AND session_type = 'withdrawal'",
       [checkoutRequestId, firebaseUid]
     );
 
-    if (result.rows.length === 0) {
+    if (sessionRes.rows.length === 0) {
       return res.status(404).json({ error: 'Withdrawal session not found.' });
     }
 
-    const status = result.rows[0].status;
-    if (status === 'in_progress') { // 'in_progress' means paid, ready to open
-      res.status(200).json({ paymentStatus: 'paid' });
-    } else {
-      res.status(200).json({ paymentStatus: 'pending' });
+    const { id: sessionId, status, started_at: startedAt } = sessionRes.rows[0];
+
+    // If status is not pending, the callback has already been processed. Return immediately.
+    if (status !== 'pending') {
+      const paymentStatus = (status === 'in_progress' || status === 'completed') ? 'paid' : status;
+      return res.status(200).json({ paymentStatus });
     }
+
+    // --- Self-Healing Logic for Pending Transactions ---
+    const PENDING_TIMEOUT_SECONDS = 30;
+    const secondsSinceStart = (new Date() - new Date(startedAt)) / 1000;
+
+    // If it has been pending for less than the timeout, just tell the client to keep polling.
+    if (secondsSinceStart < PENDING_TIMEOUT_SECONDS) {
+      return res.status(200).json({ paymentStatus: 'pending' });
+    }
+
+    // If the timeout is reached, proactively query M-Pesa for the transaction status.
+    logger.info(`Session ${sessionId} is stuck in pending. Proactively querying M-Pesa status for ${checkoutRequestId}...`);
+    const mpesaStatusResponse = await querySTKStatus(checkoutRequestId);
+    const { ResultCode, ResultDesc } = mpesaStatusResponse.data;
+
+    if (ResultCode === '0') {
+      // The payment was successful. Manually trigger the same logic as the callback.
+      logger.info(`M-Pesa query confirmed payment for ${checkoutRequestId}. Manually completing session.`);
+      const updateResult = await client.query(
+        `UPDATE deposits d SET status = 'in_progress' FROM booth_slots s, booths b
+         WHERE d.id = $1 AND d.slot_id = s.id AND s.booth_id = b.id
+         RETURNING b.booth_uid, s.slot_identifier;`,
+        [sessionId]
+      );
+
+      if (updateResult.rowCount > 0) {
+        const { booth_uid: boothUid, slot_identifier: slotIdentifier } = updateResult.rows[0];
+        const db = getDatabase();
+        const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
+        await commandRef.update({ openForCollection: true, openForDeposit: false });
+        logger.info(`Command to open slot ${slotIdentifier} at booth ${boothUid} sent to Firebase.`);
+      }
+      return res.status(200).json({ paymentStatus: 'paid' });
+    } else {
+      // The payment failed or is still processing according to M-Pesa.
+      // Mark it as failed in our DB to stop polling.
+      logger.warn(`M-Pesa query for ${checkoutRequestId} indicates failure or ongoing issue: ${ResultDesc}. Marking session as failed.`);
+      await client.query("UPDATE deposits SET status = 'failed' WHERE id = $1", [sessionId]);
+      return res.status(200).json({ paymentStatus: 'failed', reason: ResultDesc });
+    }
+
   } catch (error) {
     logger.error(`Failed to get withdrawal status for checkoutId ${checkoutRequestId}:`, error);
     res.status(500).json({ error: 'Failed to retrieve withdrawal status.', details: error.message });

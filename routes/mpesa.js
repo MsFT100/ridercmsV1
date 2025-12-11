@@ -1,5 +1,6 @@
 const { Router } = require('express');
 const logger = require('../utils/logger');
+const { getDatabase } = require('firebase-admin/database');
 const pool = require('../db');
 
 const router = Router();
@@ -35,13 +36,29 @@ router.post('/callback', async (req, res) => {
 
       // 3. Update the corresponding deposit session status to 'in_progress'.
       // This signals to the polling endpoint that payment is complete.
+      // We also retrieve the booth and slot identifiers for the Firebase command.
       const updateResult = await client.query(
-        "UPDATE deposits SET status = 'in_progress' WHERE mpesa_checkout_id = $1 AND status = 'pending'",
+        `UPDATE deposits d
+         SET status = 'in_progress'
+         FROM booth_slots s, booths b
+         WHERE d.mpesa_checkout_id = $1
+           AND d.status = 'pending'
+           AND d.slot_id = s.id
+           AND s.booth_id = b.id
+         RETURNING b.booth_uid, s.slot_identifier;`,
         [checkoutRequestId]
       );
 
       if (updateResult.rowCount > 0) {
         logger.info(`Payment successful for CheckoutRequestID: ${checkoutRequestId}. Amount: ${amount}. Session status updated to 'in_progress'.`);
+        const { booth_uid: boothUid, slot_identifier: slotIdentifier } = updateResult.rows[0];
+
+        // 4. Send the command to Firebase to open the door for collection.
+        const db = getDatabase();
+        const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
+        await commandRef.update({ openForCollection: true, openForDeposit: false });
+
+        logger.info(`Command to open slot ${slotIdentifier} at booth ${boothUid} sent to Firebase.`);
       } else {
         logger.warn(`Received a successful M-Pesa callback for an unknown or already processed CheckoutRequestID: ${checkoutRequestId}`);
       }

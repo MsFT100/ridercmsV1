@@ -250,7 +250,7 @@ router.get('/booths', [verifyFirebaseToken, isAdmin], async (req, res) => {
     // It uses a window function to get the total count of booths efficiently.
     const listQuery = `
       SELECT
-        b.booth_uid, b.name, b.location_address, b.status, b.created_at, b.updated_at,
+        b.booth_uid, b.name, b.location_address, b.status, b.created_at, b.updated_at, b.latitude, b.longitude,
         s.slot_identifier, s.status as slot_status, s.door_status, s.charge_level_percent as slot_charge_level,
         bat.battery_uid,
         COUNT(*) OVER() as total_booths
@@ -279,6 +279,8 @@ router.get('/booths', [verifyFirebaseToken, isAdmin], async (req, res) => {
           location_address: row.location_address,
           status: row.status,
           created_at: row.created_at,
+          latitude: row.latitude,
+          longitude: row.longitude,
           updated_at: row.updated_at,
           slots: [],
           slotCount: 0
@@ -375,6 +377,7 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
           doorStatus: row.door_status,
           status: row.slot_status,
           telemetry: row.telemetry,
+
           battery: row.battery_uid ? {
             batteryUid: row.battery_uid,
             chargeLevel: row.charge_level_percent,
@@ -1346,6 +1349,213 @@ router.post('/simulate/confirm-payment', [verifyFirebaseToken, isAdmin], async (
   } catch (error) {
     logger.error(`(SIMULATION) Failed to confirm payment for ${checkoutRequestId}:`, error);
     res.status(500).json({ error: 'Failed to simulate payment confirmation.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * POST /api/admin/booths/:boothUid/reset-slots
+ * @summary Reset one or all slots in a booth to their default state.
+ * @description Resets slot data in both PostgreSQL and Firebase to a default, 'available' state. This is a powerful maintenance tool. If `slotIdentifier` is provided in the body, only that slot is reset. Otherwise, all slots in the booth are reset.
+ * @tags [Admin, Simulation]
+ * @security
+ *   - bearerAuth: []
+ * @parameters
+ *   - in: path
+ *     name: boothUid
+ *     required: true
+ *     schema:
+ *       type: string
+ *     description: The UID of the booth to perform the reset on.
+ * @requestBody
+ *   required: false
+ *   content:
+ *     application/json:
+ *       schema:
+ *         type: object
+ *         properties:
+ *           slotIdentifier:
+ *             type: string
+ *             description: (Optional) The specific slot to reset. If omitted, all slots in the booth will be reset.
+ * @responses
+ *   200:
+ *     description: Slot(s) reset successfully.
+ *   404:
+ *     description: Booth not found.
+ *   500:
+ *     description: Internal server error.
+ */
+router.post('/booths/:boothUid/reset-slots', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const { boothUid } = req.params;
+  const { slotIdentifier } = req.body; // Optional: to reset a single slot
+
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Get the internal booth ID
+    const boothRes = await client.query('SELECT id FROM booths WHERE booth_uid = $1', [boothUid]);
+    if (boothRes.rows.length === 0) {
+      return res.status(404).json({ error: `Booth with UID ${boothUid} not found.` });
+    }
+    const boothId = boothRes.rows[0].id;
+
+    // 2. Find and terminate any active user sessions in the slot(s) being reset.
+    // An active session is one that is not already in a terminal state (failed, cancelled, or a completed withdrawal).
+    const terminateSessionsQuery = `
+      UPDATE deposits
+      SET status = 'failed'
+      WHERE id IN (
+        SELECT d.id FROM deposits d
+        JOIN booth_slots s ON d.slot_id = s.id
+        WHERE s.booth_id = $1
+          ${slotIdentifier ? 'AND s.slot_identifier = $2' : ''}
+          AND d.status NOT IN ('failed', 'cancelled')
+          AND NOT (d.session_type = 'withdrawal' AND d.status = 'completed')
+      );
+    `;
+    const terminateParams = slotIdentifier ? [boothId, slotIdentifier] : [boothId];
+    await client.query(terminateSessionsQuery, terminateParams);
+
+    // 2. Reset the slot(s) in PostgreSQL
+    const pgResetQuery = `
+      UPDATE booth_slots
+      SET
+        status = 'available',
+        current_battery_id = NULL,
+        charge_level_percent = NULL,
+        door_status = 'closed',
+        is_charging = FALSE,
+        telemetry = NULL,
+        updated_at = NOW()
+      WHERE booth_id = $1
+    ` + (slotIdentifier ? 'AND slot_identifier = $2' : '');
+
+    const pgQueryParams = slotIdentifier ? [boothId, slotIdentifier] : [boothId];
+    await client.query(pgResetQuery, pgQueryParams);
+
+    // 3. Reset the slot(s) in Firebase
+    const db = getDatabase();
+    const allDefaultSlots = initializeFirebaseSlots();
+
+    if (slotIdentifier) {
+      // Reset a single slot in Firebase
+      const defaultSlotData = allDefaultSlots[slotIdentifier];
+      if (!defaultSlotData) {
+        throw new Error(`Invalid slot identifier '${slotIdentifier}' provided.`);
+      }
+      const slotRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}`);
+      await slotRef.set(defaultSlotData);
+      logger.info(`Admin ${req.user.uid} reset slot ${boothUid}/${slotIdentifier}.`);
+    } else {
+      // Reset all slots for the booth in Firebase
+      const slotsRef = db.ref(`booths/${boothUid}/slots`);
+      await slotsRef.set(allDefaultSlots);
+      logger.info(`Admin ${req.user.uid} reset all slots for booth ${boothUid}.`);
+    }
+
+    await client.query('COMMIT');
+
+    res.status(200).json({
+      message: slotIdentifier
+        ? `Slot ${slotIdentifier} in booth ${boothUid} has been reset.`
+        : `All slots in booth ${boothUid} have been reset.`
+    });
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+    logger.error(`Failed to reset slots for booth ${boothUid}:`, error);
+    res.status(500).json({ error: 'Failed to reset slots.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/admin/dashboard-summary
+ * @summary Get aggregated data for the main admin dashboard.
+ * @description Retrieves key performance indicators like revenue, station counts, user counts, and data for charts.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @responses
+ *   200:
+ *     description: An object containing all dashboard metrics.
+ *   500:
+ *     description: Internal server error.
+ */
+router.get('/dashboard-summary', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    // Define all queries to be run in parallel
+    const queries = {
+      totalRevenue: `
+        SELECT SUM(amount) as "totalRevenue"
+        FROM deposits
+        WHERE session_type = 'withdrawal' AND status = 'completed' AND completed_at >= date_trunc('month', NOW());
+      `,
+      activeStations: `SELECT COUNT(*) as "activeStations" FROM booths WHERE status = 'online';`,
+      totalSwaps: `SELECT COUNT(*) as "totalSwaps" FROM deposits WHERE session_type = 'withdrawal' AND status = 'completed';`,
+      activeSessions: `SELECT COUNT(*) as "activeSessions" FROM deposits WHERE status = 'in_progress';`,
+      totalUsers: `SELECT COUNT(*) as "totalUsers" FROM users;`,
+      swapVolumeTrend: `
+        SELECT
+          to_char(day_series, 'Dy') as name,
+          COALESCE(swap_count, 0) as val
+        FROM
+          generate_series(
+            date_trunc('day', NOW() - interval '6 days'),
+            date_trunc('day', NOW()),
+            '1 day'
+          ) as day_series
+        LEFT JOIN (
+          SELECT
+            date_trunc('day', completed_at) as swap_day,
+            COUNT(*) as swap_count
+          FROM deposits
+          WHERE session_type = 'withdrawal' AND status = 'completed' AND completed_at >= NOW() - interval '7 days'
+          GROUP BY swap_day
+        ) as swaps ON day_series = swaps.swap_day
+        ORDER BY day_series;
+      `
+    };
+
+    // Execute all queries in parallel for maximum efficiency
+    const [
+      revenueRes,
+      stationsRes,
+      swapsRes,
+      sessionsRes,
+      usersRes,
+      trendRes,
+    ] = await Promise.all([
+      client.query(queries.totalRevenue),
+      client.query(queries.activeStations),
+      client.query(queries.totalSwaps),
+      client.query(queries.activeSessions),
+      client.query(queries.totalUsers),
+      client.query(queries.swapVolumeTrend)
+    ]);
+
+    // Consolidate results into a single response object
+    const summary = {
+      totalRevenue: parseFloat(revenueRes.rows[0]?.totalRevenue || 0),
+      activeStations: parseInt(stationsRes.rows[0]?.activeStations || 0, 10),
+      totalSwaps: parseInt(swapsRes.rows[0]?.totalSwaps || 0, 10),
+      activeSessions: parseInt(sessionsRes.rows[0]?.activeSessions || 0, 10),
+      totalUsers: parseInt(usersRes.rows[0]?.totalUsers || 0, 10),
+      swapVolumeTrend: trendRes.rows,
+      batteryUsage: [], // Return an empty array as this chart is disabled
+    };
+
+    res.status(200).json(summary);
+
+  } catch (error) {
+    logger.error('Failed to get dashboard summary:', error);
+    res.status(500).json({ error: 'Failed to retrieve dashboard summary.', details: error.message });
   } finally {
     client.release();
   }
