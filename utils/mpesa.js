@@ -1,5 +1,6 @@
 // utils/mpesa.js
 const axios = require('axios');
+const logger = require('./logger'); // Import logger for warnings
 const crypto = require('crypto');
 require('dotenv').config();
 
@@ -8,8 +9,20 @@ const MPESA_CONFIG = {
   consumerSecret: process.env.MPESA_CONSUMER_SECRET,
   shortCode: process.env.MPESA_SHORTCODE, // Till Number
   passkey: process.env.MPESA_PASSKEY,
-  callbackUrl: process.env.MPESA_CALLBACK_URL, // e.g., "/api/mpesa/callback"
+  baseUrl: process.env.MPESA_BASE_URL, // e.g., "https://your-ngrok-url.io"
   apiUrl: 'https://api.safaricom.co.ke',
+};
+
+/**
+ * Returns an array of whitelisted M-Pesa IP addresses.
+ * In a real-world scenario, these should be managed carefully.
+ * @returns {string[]}
+ */
+const getMpesaIpWhitelist = () => {
+  // These are example IPs. You should get the official list from Safaricom documentation.
+  // It's better to store this in environment variables for flexibility.
+  // e.g., MPESA_WHITELISTED_IPS="196.201.214.200,196.201.214.206"
+  return process.env.MPESA_WHITELISTED_IPS?.split(',') || [];
 };
 
 // --- In-memory cache for the M-Pesa access token ---
@@ -40,8 +53,15 @@ const getAccessToken = async () => {
 // Lipa Na Mpesa STK Push
 const initiateSTKPush = async (options) => {
   const { phone, amount, accountRef, transactionDesc } = options;
+
+  // Sanity check for amount
+  if (amount < 1) {
+    logger.warn(`Attempted to initiate STK push with invalid amount: ${amount}`);
+    throw new Error('M-Pesa amount must be at least 1.');
+  }
+
   const token = await getAccessToken();
-  const timestamp = new Date().toISOString().replace(/[-:]/g, '').slice(0, 14);
+  const timestamp = getTimestamp(); // Use the corrected timestamp function
   const password = Buffer.from(`${MPESA_CONFIG.shortCode}${MPESA_CONFIG.passkey}${timestamp}`).toString('base64');
 
   const payload = {
@@ -49,11 +69,11 @@ const initiateSTKPush = async (options) => {
     Password: password,
     Timestamp: timestamp,
     TransactionType: 'CustomerPayBillOnline',
-    Amount: amount,
+    Amount: Math.round(amount), // M-Pesa API expects an integer
     PartyA: `254${phone.slice(-9)}`, // e.g., 254712345678
     PartyB: MPESA_CONFIG.shortCode,
     PhoneNumber: `254${phone.slice(-9)}`,
-    CallBackURL: MPESA_CONFIG.callbackUrl,
+    CallBackURL: `${MPESA_CONFIG.baseUrl}/api/mpesa/callback`,
     AccountReference: accountRef,
     TransactionDesc: transactionDesc,
   };
@@ -64,13 +84,28 @@ const initiateSTKPush = async (options) => {
 };
 
 /**
+ * Generates a timestamp in the required M-Pesa format (YYYYMMDDHHMMSS).
+ * @returns {string} The formatted timestamp.
+ */
+const getTimestamp = () => {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  const hours = String(now.getHours()).padStart(2, '0');
+  const minutes = String(now.getMinutes()).padStart(2, '0');
+  const seconds = String(now.getSeconds()).padStart(2, '0');
+  return `${year}${month}${day}${hours}${minutes}${seconds}`;
+};
+
+/**
  * Queries the status of a previously initiated STK push transaction.
  * @param {string} checkoutRequestId The CheckoutRequestID from the initial STK push.
  * @returns {Promise<object>} A promise that resolves with the M-Pesa query response.
  */
 const querySTKStatus = async (checkoutRequestId) => {
   const token = await getAccessToken();
-  const timestamp = new Date().toISOString().replace(/[-:]/g, '').slice(0, 14);
+  const timestamp = getTimestamp();
   const password = Buffer.from(`${MPESA_CONFIG.shortCode}${MPESA_CONFIG.passkey}${timestamp}`).toString('base64');
 
   const payload = {
@@ -96,8 +131,8 @@ const initiateB2CPayout = async (driverPhone, amount, remarks) => {
     PartyA: MPESA_CONFIG.shortCode,
     PartyB: `254${driverPhone.slice(-9)}`,
     Remarks: remarks,
-    QueueTimeOutURL: `${MPESA_CONFIG.callbackUrl}?type=b2c`,
-    ResultURL: MPESA_CONFIG.callbackUrl,
+    QueueTimeOutURL: `${MPESA_CONFIG.baseUrl}/api/mpesa/callback?type=b2c_timeout`,
+    ResultURL: `${MPESA_CONFIG.baseUrl}/api/mpesa/callback?type=b2c_result`,
     Occasion: 'DriverPayout',
   };
 
@@ -106,4 +141,4 @@ const initiateB2CPayout = async (driverPhone, amount, remarks) => {
   });
 };
 
-module.exports = { initiateSTKPush, initiateB2CPayout, querySTKStatus };
+module.exports = { initiateSTKPush, initiateB2CPayout, querySTKStatus, getMpesaIpWhitelist };

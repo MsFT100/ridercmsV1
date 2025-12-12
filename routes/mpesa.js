@@ -1,7 +1,19 @@
 const { Router } = require('express');
 const logger = require('../utils/logger');
+const { getMpesaIpWhitelist } = require('../utils/mpesa');
 const { getDatabase } = require('firebase-admin/database');
-const pool = require('../db');
+const poolPromise = require('../db');
+
+// This function is defined in booths.js but we need its signature here for clarity.
+// We can't import it directly due to circular dependency issues.
+/**
+ * @typedef {import('./booths.js').completePaidWithdrawal} completePaidWithdrawal
+ * async function completePaidWithdrawal(client, checkoutRequestId) { ... }
+ */
+
+// A bit of a workaround to avoid circular dependencies. We will require it inside the function.
+// A better long-term solution might be to move shared functions to a separate module.
+let completePaidWithdrawalFn;
 
 const router = Router();
 
@@ -11,12 +23,22 @@ const router = Router();
  * It's an asynchronous webhook.
  */
 router.post('/callback', async (req, res) => {
+  // Security: Basic IP whitelisting to ensure the request is from a trusted source.
+  const requestIp = req.ip;
+  const whitelist = getMpesaIpWhitelist();
+  if (process.env.NODE_ENV === 'production' && !whitelist.includes(requestIp)) {
+    logger.warn(`M-Pesa callback from untrusted IP blocked: ${requestIp}`);
+    return res.status(403).json({ ResultCode: 'C2B00017', ResultDesc: 'Forbidden' });
+  }
+
   const callbackData = req.body;
+  console.log("Mpesa Callback Data:", JSON.stringify(callbackData, null, 2));
   logger.info('M-Pesa Callback Received:', JSON.stringify(callbackData, null, 2));
 
   // Immediately respond to M-Pesa to acknowledge receipt and avoid timeouts.
   res.status(200).json({ ResultCode: 0, ResultDesc: 'Accepted' });
 
+  const pool = await poolPromise;
   const client = await pool.connect();
   try {
     // 1. Log the entire callback payload for auditing and debugging.
@@ -27,6 +49,11 @@ router.post('/callback', async (req, res) => {
 
     const { Body: { stkCallback } } = callbackData;
 
+    // Robustness: Check if stkCallback exists before proceeding.
+    if (!stkCallback) {
+      throw new Error('Invalid M-Pesa callback format: stkCallback is missing.');
+    }
+
     // 2. Check if the transaction was successful.
     if (stkCallback.ResultCode === 0) {
       // Payment was successful.
@@ -34,39 +61,33 @@ router.post('/callback', async (req, res) => {
       const amountItem = stkCallback.CallbackMetadata.Item.find(item => item.Name === 'Amount');
       const amount = amountItem ? amountItem.Value : null;
 
+      // Robustness: Ensure we have the necessary metadata.
+      if (!checkoutRequestId || !amount) {
+        throw new Error(`Invalid successful callback data: Missing CheckoutRequestID or Amount for payload: ${JSON.stringify(stkCallback)}`);
+      }
+
       // 3. Update the corresponding deposit session status to 'in_progress'.
       // This signals to the polling endpoint that payment is complete.
-      // We also retrieve the booth and slot identifiers for the Firebase command.
-      const updateResult = await client.query(
-        `UPDATE deposits d
-         SET status = 'in_progress'
-         FROM booth_slots s, booths b
-         WHERE d.mpesa_checkout_id = $1
-           AND d.status = 'pending'
-           AND d.slot_id = s.id
-           AND s.booth_id = b.id
-         RETURNING b.booth_uid, s.slot_identifier;`,
-        [checkoutRequestId]
-      );
+      // Lazily require the function to avoid circular dependency at startup.
+      if (!completePaidWithdrawalFn) {
+        completePaidWithdrawalFn = require('./booths.js').completePaidWithdrawal;
+      }
+      const wasUpdated = await completePaidWithdrawalFn(client, checkoutRequestId);
 
-      if (updateResult.rowCount > 0) {
+      if (wasUpdated) {
         logger.info(`Payment successful for CheckoutRequestID: ${checkoutRequestId}. Amount: ${amount}. Session status updated to 'in_progress'.`);
-        const { booth_uid: boothUid, slot_identifier: slotIdentifier } = updateResult.rows[0];
-
-        // 4. Send the command to Firebase to open the door for collection.
-        const db = getDatabase();
-        const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
-        await commandRef.update({ openForCollection: true, openForDeposit: false });
-
-        logger.info(`Command to open slot ${slotIdentifier} at booth ${boothUid} sent to Firebase.`);
       } else {
         logger.warn(`Received a successful M-Pesa callback for an unknown or already processed CheckoutRequestID: ${checkoutRequestId}`);
       }
     } else {
       // Payment failed or was cancelled by the user.
       logger.warn(`M-Pesa STK push failed for CheckoutRequestID: ${stkCallback.CheckoutRequestID}. Reason: ${stkCallback.ResultDesc}`);
-      // Optionally, update the status to 'failed'
-      await client.query("UPDATE deposits SET status = 'failed' WHERE mpesa_checkout_id = $1", [stkCallback.CheckoutRequestID]);
+      // Update the status to 'failed' only if it's currently 'pending'.
+      // This prevents overwriting a 'completed' status from a self-healing query.
+      await client.query(
+        "UPDATE deposits SET status = 'failed' WHERE mpesa_checkout_id = $1 AND status = 'pending'",
+        [stkCallback.CheckoutRequestID]
+      );
     }
   } catch (error) {
     logger.error('Error processing M-Pesa callback:', error);

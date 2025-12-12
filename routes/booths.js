@@ -409,13 +409,14 @@ router.post('/sessions/:sessionId/pay', verifyFirebaseToken, async (req, res) =>
     await client.query('BEGIN');
 
     // 1. Find the pending withdrawal session for this user.
+    // Allow retrying payment if the previous attempt failed.
     const sessionRes = await client.query(
-      "SELECT amount FROM deposits WHERE id = $1 AND user_id = $2 AND session_type = 'withdrawal' AND status = 'pending'",
+      "SELECT amount FROM deposits WHERE id = $1 AND user_id = $2 AND session_type = 'withdrawal' AND status IN ('pending', 'failed')",
       [sessionId, firebaseUid]
     );
 
     if (sessionRes.rows.length === 0) {
-      return res.status(404).json({ error: 'No pending withdrawal session found to pay for.' });
+      return res.status(404).json({ error: 'No active withdrawal session found to pay for.' });
     }
     const amount = sessionRes.rows[0].amount;
 
@@ -427,10 +428,14 @@ router.post('/sessions/:sessionId/pay', verifyFirebaseToken, async (req, res) =>
       transactionDesc: `Payment for battery charging session ${sessionId}`
     });
 
-    const checkoutRequestId = mpesaResponse.CheckoutRequestID; // Assuming this is the correct property from the response
+    const checkoutRequestId = mpesaResponse.data.CheckoutRequestID;
 
-    // 3. Update the session record with the CheckoutRequestID from M-Pesa.
-    await client.query("UPDATE deposits SET mpesa_checkout_id = $1 WHERE id = $2", [checkoutRequestId, sessionId]);
+    // 3. Update the session record with the new CheckoutRequestID from M-Pesa.
+    // Reset the status to 'pending' in case it was 'failed'.
+    // Also, reset the started_at timestamp to restart the self-healing timer.
+    await client.query(
+      "UPDATE deposits SET mpesa_checkout_id = $1, status = 'pending', started_at = NOW() WHERE id = $2",
+      [checkoutRequestId, sessionId]);
 
     await client.query('COMMIT');
 
@@ -438,9 +443,18 @@ router.post('/sessions/:sessionId/pay', verifyFirebaseToken, async (req, res) =>
       message: 'STK push sent. Please complete the payment on your phone.',
       checkoutRequestId: checkoutRequestId,
     });
+    console.log(`STK push initiated for session ${sessionId}, CheckoutRequestID: ${checkoutRequestId}`);
   } catch (error) {
     await client.query('ROLLBACK');
-    logger.error(`Failed to trigger payment for session ${sessionId}:`, error);
+    // Improved error logging for external API calls
+    if (error.isAxiosError) {
+      // Log more detailed info if it's an Axios error (from M-Pesa call)
+      const errorDetails = { request: error.config, response: error.response?.data };
+      console.log('M-Pesa API error details:', errorDetails);
+      logger.error(`Failed to trigger payment for session ${sessionId} due to an M-Pesa API error:`, errorDetails);
+    } else {
+      logger.error(`Failed to trigger payment for session ${sessionId}:`, error);
+    }
     res.status(500).json({ error: 'Failed to trigger payment.', details: error.message });
   } finally {
     client.release();
@@ -504,6 +518,41 @@ router.get('/sessions/pending-withdrawal', verifyFirebaseToken, async (req, res)
 });
 
 /**
+ * A reusable function to complete a paid withdrawal session.
+ * It updates the database and sends the command to Firebase to open the slot.
+ * This prevents code duplication between the M-Pesa callback and self-healing logic.
+ * @param {object} client - The PostgreSQL client.
+ * @param {string} checkoutRequestId - The M-Pesa checkout request ID.
+ * @returns {Promise<boolean>} - True if the session was successfully updated, false otherwise.
+ */
+async function completePaidWithdrawal(client, checkoutRequestId) {
+  // Atomically update the status from 'pending' to 'in_progress'.
+  // This prevents race conditions with the M-Pesa callback.
+  const updateResult = await client.query(
+    `UPDATE deposits d
+     SET status = 'in_progress'
+     FROM booth_slots s, booths b
+     WHERE d.mpesa_checkout_id = $1
+       AND d.status = 'pending' -- This is the crucial part for idempotency
+       AND d.slot_id = s.id
+       AND s.booth_id = b.id
+     RETURNING b.booth_uid, s.slot_identifier;`,
+    [checkoutRequestId]
+  );
+
+  if (updateResult.rowCount > 0) {
+    const { booth_uid: boothUid, slot_identifier: slotIdentifier } = updateResult.rows[0];
+    const db = getDatabase();
+    const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
+    await commandRef.update({ openForCollection: true, openForDeposit: false });
+    logger.info(`Command to open slot ${slotIdentifier} at booth ${boothUid} sent to Firebase for checkout ID ${checkoutRequestId}.`);
+    return true;
+  }
+  // If rowCount is 0, it means the session was already processed.
+  return false;
+}
+
+/**
  * GET /api/booths/withdrawal-status/:checkoutRequestId
  * @summary Poll for withdrawal payment status
  * Called by the frontend to poll for the status of a withdrawal payment.
@@ -517,16 +566,16 @@ router.get('/withdrawal-status/:checkoutRequestId', verifyFirebaseToken, async (
   try {
     // Find the session and check its status.
     // The M-Pesa callback would have updated the status to 'in_progress' upon successful payment.
-    const sessionRes = await client.query(
+    const sessionQuery = await client.query(
       "SELECT id, status, started_at FROM deposits WHERE mpesa_checkout_id = $1 AND user_id = $2 AND session_type = 'withdrawal'",
       [checkoutRequestId, firebaseUid]
     );
 
-    if (sessionRes.rows.length === 0) {
+    if (sessionQuery.rows.length === 0) {
       return res.status(404).json({ error: 'Withdrawal session not found.' });
     }
 
-    const { id: sessionId, status, started_at: startedAt } = sessionRes.rows[0];
+    const { id: sessionId, status, started_at: startedAt } = sessionQuery.rows[0];
 
     // If status is not pending, the callback has already been processed. Return immediately.
     if (status !== 'pending') {
@@ -534,8 +583,8 @@ router.get('/withdrawal-status/:checkoutRequestId', verifyFirebaseToken, async (
       return res.status(200).json({ paymentStatus });
     }
 
-    // --- Self-Healing Logic for Pending Transactions ---
-    const PENDING_TIMEOUT_SECONDS = 30;
+    // --- Self-Healing Logic for Stuck Pending Transactions ---
+    const PENDING_TIMEOUT_SECONDS = parseInt(process.env.MPESA_PENDING_TIMEOUT_SECONDS, 10) || 45;
     const secondsSinceStart = (new Date() - new Date(startedAt)) / 1000;
 
     // If it has been pending for less than the timeout, just tell the client to keep polling.
@@ -543,35 +592,27 @@ router.get('/withdrawal-status/:checkoutRequestId', verifyFirebaseToken, async (
       return res.status(200).json({ paymentStatus: 'pending' });
     }
 
-    // If the timeout is reached, proactively query M-Pesa for the transaction status.
-    logger.info(`Session ${sessionId} is stuck in pending. Proactively querying M-Pesa status for ${checkoutRequestId}...`);
-    const mpesaStatusResponse = await querySTKStatus(checkoutRequestId);
-    const { ResultCode, ResultDesc } = mpesaStatusResponse.data;
+    try {
+      // If the timeout is reached, proactively query M-Pesa for the transaction status.
+      logger.info(`Session ${sessionId} is stuck in pending. Proactively querying M-Pesa status for ${checkoutRequestId}...`);
+      const mpesaStatusResponse = await querySTKStatus(checkoutRequestId);
+      const { ResultCode, ResultDesc } = mpesaStatusResponse.data;
 
-    if (ResultCode === '0') {
-      // The payment was successful. Manually trigger the same logic as the callback.
-      logger.info(`M-Pesa query confirmed payment for ${checkoutRequestId}. Manually completing session.`);
-      const updateResult = await client.query(
-        `UPDATE deposits d SET status = 'in_progress' FROM booth_slots s, booths b
-         WHERE d.id = $1 AND d.slot_id = s.id AND s.booth_id = b.id
-         RETURNING b.booth_uid, s.slot_identifier;`,
-        [sessionId]
-      );
-
-      if (updateResult.rowCount > 0) {
-        const { booth_uid: boothUid, slot_identifier: slotIdentifier } = updateResult.rows[0];
-        const db = getDatabase();
-        const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
-        await commandRef.update({ openForCollection: true, openForDeposit: false });
-        logger.info(`Command to open slot ${slotIdentifier} at booth ${boothUid} sent to Firebase.`);
+      if (ResultCode === '0') {
+        // The payment was successful. Manually trigger the same logic as the callback.
+        logger.info(`M-Pesa query confirmed payment for ${checkoutRequestId}. Manually completing session.`);
+        await completePaidWithdrawal(client, checkoutRequestId);
+        return res.status(200).json({ paymentStatus: 'paid' });
+      } else {
+        // The payment failed or is still processing according to M-Pesa. Mark it as failed to stop polling.
+        logger.warn(`M-Pesa query for ${checkoutRequestId} indicates failure: ${ResultDesc}. Marking session as failed.`);
+        await client.query("UPDATE deposits SET status = 'failed' WHERE id = $1 AND status = 'pending'", [sessionId]);
+        return res.status(200).json({ paymentStatus: 'failed', reason: ResultDesc });
       }
-      return res.status(200).json({ paymentStatus: 'paid' });
-    } else {
-      // The payment failed or is still processing according to M-Pesa.
-      // Mark it as failed in our DB to stop polling.
-      logger.warn(`M-Pesa query for ${checkoutRequestId} indicates failure or ongoing issue: ${ResultDesc}. Marking session as failed.`);
-      await client.query("UPDATE deposits SET status = 'failed' WHERE id = $1", [sessionId]);
-      return res.status(200).json({ paymentStatus: 'failed', reason: ResultDesc });
+    } catch (mpesaError) {
+      logger.error(`Self-healing failed to query M-Pesa for ${checkoutRequestId}:`, mpesaError.response?.data || mpesaError.message);
+      // Don't fail the session; just tell the client to keep trying.
+      return res.status(200).json({ paymentStatus: 'pending' });
     }
 
   } catch (error) {
