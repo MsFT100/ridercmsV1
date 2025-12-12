@@ -73,17 +73,40 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // --- Pre-check for existing sessions ---
-    // Check if the user already has a battery in a slot or a pending session.
-    const existingSessionRes = await client.query(
-      `SELECT 1 FROM deposits WHERE user_id = $1 AND status IN ('pending', 'in_progress')`,
+    // --- Self-Healing & Pre-check for existing sessions ---
+    // Find any active sessions. If a 'pending' deposit exists, we'll clean it up.
+    // If an 'in_progress' session exists (deposit or withdrawal), we must block.
+    const existingSessionQuery = `
+      SELECT id, status, slot_id FROM deposits
+      WHERE user_id = $1 AND status IN ('pending', 'in_progress')
+    `;
+    const existingSessionRes = await client.query(existingSessionQuery, [firebaseUid]);
+
+    for (const session of existingSessionRes.rows) {
+      if (session.status === 'in_progress') {
+        // An 'in_progress' session is a hard stop. The user must wait for it to complete or timeout.
+        return res.status(409).json({
+          error: 'Active session in progress.',
+          message: 'You have a session that is currently in progress. Please complete or cancel it before starting a new one.'
+        });
+      }
+      if (session.status === 'pending' && session.slot_id) {
+        // This is a stale, pending deposit. Clean it up.
+        logger.warn(`Cleaning up stale pending deposit session ${session.id} for user ${firebaseUid}.`);
+        await client.query("UPDATE deposits SET status = 'cancelled' WHERE id = $1", [session.id]);
+        await client.query("UPDATE booth_slots SET status = 'available' WHERE id = $1", [session.slot_id]);
+      }
+    }
+
+    // After cleanup, re-check for any non-deposit pending sessions (like a pending withdrawal)
+    const postCleanupCheck = await client.query(
+      `SELECT 1 FROM deposits WHERE user_id = $1 AND status = 'pending' AND session_type = 'withdrawal'`,
       [firebaseUid]
     );
-    if (existingSessionRes.rows.length > 0) {
-      // Use a 409 Conflict status code for this specific, predictable user error.
+    if (postCleanupCheck.rows.length > 0) {
       return res.status(409).json({
         error: 'Active session exists.',
-        message: 'You already have an active battery session. Please complete or cancel it before starting a new deposit.'
+        message: 'You have a pending withdrawal. Please complete or cancel it before starting a new deposit.'
       });
     }
 
