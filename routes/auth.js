@@ -82,7 +82,7 @@ async function verifyRecaptcha(token) {
  */
 router.post('/register', async (req, res) => {
   const { email, password, name, phoneNumber, recaptchaToken } = req.body;
-  const defaultRole = 'user';
+  const defaultRole = 'customer';
 
   let userRecord; // To hold the created Firebase Auth user for rollback purposes
   try {
@@ -97,31 +97,30 @@ router.post('/register', async (req, res) => {
       password,
       displayName: name,
       phoneNumber,
-      emailVerified: false,
-      disabled: false,
+      disabled: true, // User is disabled by default, requires admin approval.
     });
     
     // 2. Set custom role claim for authorization
     await admin.auth().setCustomUserClaims(userRecord.uid, { role: defaultRole });
 
-    // 3. Insert user record into PostgreSQL
+    // 3. Insert user record into PostgreSQL with 'inactive' status
     const pool = await poolPromise;
     const pgClient = await pool.connect();
     try {
       await pgClient.query(
-        'INSERT INTO users (user_id, email, name, phone, role) VALUES ($1, $2, $3, $4, $5)',
-        [userRecord.uid, userRecord.email, name, phoneNumber, defaultRole]
+        'INSERT INTO users (user_id, email, name, phone, role, status) VALUES ($1, $2, $3, $4, $5, $6)',
+        [userRecord.uid, userRecord.email, name, phoneNumber, defaultRole, 'inactive']
       );
     } finally {
       pgClient.release(); // Always release the client back to the pool
     }
 
     logger.info(
-      `Successfully created new user: ${email} (UID: ${userRecord.uid}) with role '${defaultRole}'. ` +
-      `Data saved to Firebase Auth and PostgreSQL.`
+      `New user registered (pending approval): ${email} (UID: ${userRecord.uid}) with role '${defaultRole}'. ` +
+      `Account is currently disabled.`
     );
     res.status(201).json({
-      message: 'User registered successfully.',
+      message: 'User registered successfully. Your account is pending admin approval.',
       userId: userRecord.uid,
       role: defaultRole,
     });

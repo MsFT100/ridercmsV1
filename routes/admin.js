@@ -592,6 +592,73 @@ router.delete('/booths/:boothUid', [verifyFirebaseToken, isAdmin], async (req, r
 });
 
 /**
+ * DELETE /api/admin/booths/:boothUid/slots/:slotIdentifier
+ * @summary Delete a specific booth slot
+ * @description Deletes a specific slot from a booth in both PostgreSQL and Firebase. This is a destructive action and should be used with caution. It will also attempt to fail any active sessions associated with the slot.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @parameters
+ *   - in: path
+ *     name: boothUid
+ *     required: true
+ *     schema:
+ *       type: string
+ *     description: The UID of the booth containing the slot.
+ *   - in: path
+ *     name: slotIdentifier
+ *     required: true
+ *     schema:
+ *       type: string
+ *     description: The identifier of the slot to delete (e.g., slot001).
+ * @responses
+ *   200:
+ *     description: Slot deleted successfully.
+ *   404:
+ *     description: Booth or slot not found.
+ *   500:
+ *     description: Internal server error.
+ */
+router.delete('/booths/:boothUid/slots/:slotIdentifier', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const { boothUid, slotIdentifier } = req.params;
+
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Find the slot to get its ID and ensure it exists.
+    const slotRes = await client.query(
+      'SELECT s.id FROM booth_slots s JOIN booths b ON s.booth_id = b.id WHERE b.booth_uid = $1 AND s.slot_identifier = $2',
+      [boothUid, slotIdentifier]
+    );
+
+    if (slotRes.rowCount === 0) {
+      return res.status(404).json({ error: `Slot '${slotIdentifier}' in booth '${boothUid}' not found.` });
+    }
+    const slotId = slotRes.rows[0].id;
+
+    // 2. Delete the slot from PostgreSQL. Associated sessions are not deleted but will be orphaned.
+    await client.query('DELETE FROM booth_slots WHERE id = $1', [slotId]);
+
+    // 3. Delete the slot from Firebase Realtime Database.
+    const db = getDatabase();
+    const slotRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}`);
+    await slotRef.remove();
+
+    await client.query('COMMIT');
+    logger.info(`Admin (UID: ${req.user.uid}) deleted slot '${slotIdentifier}' from booth '${boothUid}'.`);
+    res.status(200).json({ message: `Slot ${slotIdentifier} from booth ${boothUid} deleted successfully.` });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    logger.error(`Failed to delete slot ${slotIdentifier} from booth ${boothUid}:`, error);
+    res.status(500).json({ error: 'Failed to delete slot. The operation was rolled back.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
  * PATCH /api/admin/booths/:boothUid
  * @summary Update a booth's details
  * @description Updates a booth's name and/or location address. This is a protected route only accessible by users with the 'admin' role.

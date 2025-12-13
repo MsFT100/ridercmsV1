@@ -317,7 +317,12 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
       FROM batteries bat
       JOIN booth_slots s ON bat.id = s.current_battery_id
       JOIN booths bo ON s.booth_id = bo.id
-      JOIN deposits d ON bat.id = d.battery_id AND d.session_type = 'deposit' AND d.status = 'completed'
+      -- Join with the most recent completed deposit for this battery to get the correct initial charge.
+      JOIN deposits d ON d.id = (
+        SELECT id FROM deposits
+        WHERE battery_id = bat.id AND session_type = 'deposit' AND status = 'completed'
+        ORDER BY completed_at DESC LIMIT 1
+      )
       WHERE bat.user_id = $1 AND s.status = 'occupied'
     `;
     const batteryRes = await client.query(batteryQuery, [firebaseUid]);
@@ -544,8 +549,15 @@ async function completePaidWithdrawal(client, checkoutRequestId) {
     const { booth_uid: boothUid, slot_identifier: slotIdentifier } = updateResult.rows[0];
     const db = getDatabase();
     const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
-    await commandRef.update({ openForCollection: true, openForDeposit: false });
-    logger.info(`Command to open slot ${slotIdentifier} at booth ${boothUid} sent to Firebase for checkout ID ${checkoutRequestId}.`);
+    // Per IoT spec, stop charging before opening the door for collection.
+    await commandRef.update({
+      stopCharging: true,
+      startCharging: false, // Ensure mutual exclusivity
+      openForCollection: true,
+      openForDeposit: false
+    });
+
+    logger.info(`Sent 'stopCharging' and 'openForCollection' commands to ${slotIdentifier} at booth ${boothUid} for checkout ID ${checkoutRequestId}.`);
     return true;
   }
   // If rowCount is 0, it means the session was already processed.

@@ -36,6 +36,7 @@ function mapDoorStatus(doorClosed, doorLocked) {
  */
 async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
   const pgClient = await pool.connect();
+  let slotId = null;
   try {
     // The main query to insert or update a booth_slot.
     // It uses a subquery to get the booth's primary key (id) from its UID.
@@ -77,12 +78,46 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
       telemetry,
     ]);
 
-    if (result.rowCount > 0) {
-      logger.debug(`Successfully synced slot ${slotIdentifier} for booth ${boothUid}.`);
-    } else {
+    if (result.rowCount === 0) {
       // This can happen if the booth_uid doesn't exist in the `booths` table yet.
       logger.warn(`Could not sync slot ${slotIdentifier}. Booth with UID ${boothUid} not found in the database.`);
+      return; // Exit if we can't find the slot
     }
+
+    slotId = result.rows[0].id;
+    logger.debug(`Successfully synced slot ${slotIdentifier} for booth ${boothUid}.`);
+
+    // --- Logic to complete a pending deposit session ---
+    // If a device is now present and the slot status was 'opening', it means a deposit just happened.
+    if (slotData.devicePresent && status === 'occupied') {
+      const findAndUpdateDepositQuery = `
+        UPDATE deposits
+        SET
+          status = 'completed',
+          initial_charge_level = $1,
+          completed_at = NOW()
+        WHERE
+          slot_id = $2
+          AND status = 'pending'
+          AND session_type = 'deposit'
+        RETURNING id;
+      `;
+      // Use the real-time SOC from the hardware as the initial charge level.
+      const depositUpdateResult = await pgClient.query(findAndUpdateDepositQuery, [chargeLevel, slotId]);
+
+      if (depositUpdateResult.rowCount > 0) {
+        const depositId = depositUpdateResult.rows[0].id;
+        logger.info(`Deposit session ${depositId} completed for slot ${slotIdentifier} at booth ${boothUid} with initial charge ${chargeLevel}%.`);
+
+        // Per IoT spec, explicitly command the slot to start charging after a successful deposit.
+        const db = getDatabase();
+        const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
+        await commandRef.update({ startCharging: true, stopCharging: false });
+        logger.info(`Sent 'startCharging' command to ${boothUid}/${slotIdentifier} after successful deposit.`);
+      }
+    }
+    // --- End of deposit completion logic ---
+
   } catch (error) {
     logger.error(`Error syncing slot ${boothUid}/${slotIdentifier}:`, error);
   } finally {
