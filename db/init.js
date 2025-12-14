@@ -82,7 +82,7 @@ const initializeDatabase = async () => {
         id SERIAL PRIMARY KEY,
         booth_id INT NOT NULL REFERENCES booths(id) ON DELETE CASCADE,
         slot_identifier VARCHAR(50) NOT NULL, -- e.g., 'A01', 'B05'
-        status VARCHAR(50) NOT NULL DEFAULT 'available' CHECK (status IN ('available', 'occupied', 'opening', 'maintenance', 'faulty', 'offline')),
+        status VARCHAR(50) NOT NULL DEFAULT 'available' CHECK (status IN ('available', 'occupied', 'opening', 'maintenance', 'faulty', 'offline', 'disabled')),
         current_battery_id INT REFERENCES batteries(id) ON DELETE SET NULL,
         charge_level_percent INT CHECK (charge_level_percent BETWEEN 0 AND 100), -- Mirrored from Firebase for quick lookups
         door_status VARCHAR(20) DEFAULT 'closed' CHECK (door_status IN ('open', 'closed', 'locked')), -- Mirrored from Firebase

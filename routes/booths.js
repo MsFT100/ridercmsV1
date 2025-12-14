@@ -637,58 +637,6 @@ router.get('/withdrawal-status/:checkoutRequestId', verifyFirebaseToken, async (
 });
 
 /**
- * POST /api/booths/open-for-collection
- * @summary Open slot after payment
- * Called by the frontend AFTER payment is confirmed. This is the final step
- * that tells the hardware to open the slot.
- */
-router.post('/open-for-collection', verifyFirebaseToken, async (req, res) => {
-  const { checkoutRequestId } = req.body;
-  const { uid: firebaseUid } = req.user;
-
-  const pool = await poolPromise;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    // 1. Find the paid, but not yet opened, session
-    const sessionRes = await client.query(
-      `SELECT d.id, d.slot_id, s.slot_identifier, b.booth_uid FROM deposits d
-       JOIN booth_slots s ON d.slot_id = s.id
-       JOIN booths b ON d.booth_id = b.id
-       WHERE d.mpesa_checkout_id = $1 AND d.user_id = $2 AND d.status = 'in_progress'`,
-      [checkoutRequestId, firebaseUid]
-    );
-
-    if (sessionRes.rows.length === 0) {
-      throw new Error('Withdrawal session not found or payment not confirmed.');
-    }
-    const { slot_id: slotId, slot_identifier: slotIdentifier, booth_uid: boothUid } = sessionRes.rows[0];
-
-    // 2. Mark the slot as 'opening'
-    await client.query("UPDATE booth_slots SET status = 'opening' WHERE id = $1", [slotId]);
-
-    // 3. Send the command to Firebase to open the door for collection.
-    const db = getDatabase();
-    const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
-    await commandRef.update({
-      openForCollection: true,
-      openForDeposit: false // Ensure mutual exclusivity
-    });
-
-    await client.query('COMMIT');
-
-    res.status(200).json({ message: 'Your battery is ready for collection. The slot will now open.' });
-  } catch (error) {
-    await client.query('ROLLBACK');
-    logger.error(`Failed to open slot for collection for checkoutId ${checkoutRequestId}:`, error);
-    res.status(500).json({ error: 'Failed to open slot.', details: error.message });
-  } finally {
-    client.release();
-  }
-});
-
-/**
  * POST /api/booths/cancel-session
  * @summary Cancel any active user session
  * @description Allows a user to cancel their own active session (e.g., 'pending', 'in_progress', 'opening'). This will free up the reserved slot and reset its state, making it available for another user.

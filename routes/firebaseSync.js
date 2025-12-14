@@ -64,10 +64,11 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
       RETURNING id;
     `;
 
+    // Correctly read telemetry data, providing default values if telemetry is missing.
+    const telemetry = slotData.telemetry || {};
     const status = mapSlotStatus(slotData.status, slotData.devicePresent);
-    const doorStatus = mapDoorStatus(slotData.doorClosed, slotData.doorLocked);
-    const chargeLevel = slotData.soc || null;
-    const telemetry = slotData.telemetry || null;
+    const doorStatus = mapDoorStatus(telemetry.doorClosed, telemetry.doorLocked);
+    const chargeLevel = telemetry.soc || null;
 
     const result = await pgClient.query(upsertQuery, [
       boothUid,
