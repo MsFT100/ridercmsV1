@@ -82,7 +82,7 @@ async function verifyRecaptcha(token) {
  */
 router.post('/register', async (req, res) => {
   const { email, password, name, phoneNumber, recaptchaToken } = req.body;
-  const defaultRole = 'customer';
+  const defaultRole = 'user';
 
   let userRecord; // To hold the created Firebase Auth user for rollback purposes
   try {
