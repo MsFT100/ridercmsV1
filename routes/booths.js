@@ -310,12 +310,14 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
       SELECT
         bat.charge_level_percent AS "chargeLevel",
         d.completed_at AS "depositCompletedAt",
+        bat.id AS "batteryId", -- Get the battery ID
         d.initial_charge_level AS "initialCharge", -- The charge when it was deposited
         s.id AS "slotId",
         s.slot_identifier AS "slotIdentifier",
         bo.id AS "boothId",
         bo.booth_uid AS "boothUid"
       FROM batteries bat
+      -- Find the battery by user ID first
       JOIN booth_slots s ON bat.id = s.current_battery_id
       JOIN booths bo ON s.booth_id = bo.id
       -- Join with the most recent completed deposit for this battery to get the correct initial charge.
@@ -331,7 +333,7 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
     if (batteryRes.rows.length === 0) {
       throw new Error('You do not have a battery currently deposited.');
     }
-    const { chargeLevel, initialCharge, depositCompletedAt, slotId, slotIdentifier, boothId, boothUid } = batteryRes.rows[0];
+    const { chargeLevel, initialCharge, batteryId, depositCompletedAt, slotId, slotIdentifier, boothId, boothUid } = batteryRes.rows[0];
 
     // 2. Calculate the cost
     const settingsRes = await client.query("SELECT value FROM app_settings WHERE key = 'pricing'");
@@ -357,8 +359,8 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
 
     // 4. Create a withdrawal session record with the calculated cost.
     const sessionRes = await client.query(
-      "INSERT INTO deposits (user_id, booth_id, slot_id, session_type, status, amount) VALUES ($1, $2, $3, 'withdrawal', 'pending', $4) RETURNING id",
-      [firebaseUid, boothId, slotId, totalCost]
+      "INSERT INTO deposits (user_id, booth_id, slot_id, battery_id, session_type, status, amount) VALUES ($1, $2, $3, $4, 'withdrawal', 'pending', $5) RETURNING id",
+      [firebaseUid, boothId, slotId, batteryId, totalCost]
     );
     const sessionId = sessionRes.rows[0].id;
 
@@ -664,6 +666,7 @@ router.post('/cancel-session', verifyFirebaseToken, async (req, res) => {
       SELECT
         d.id,
         d.session_type,
+        d.status,
         d.slot_id,
         s.slot_identifier,
         b.booth_uid
@@ -679,9 +682,18 @@ router.post('/cancel-session', verifyFirebaseToken, async (req, res) => {
       return res.status(404).json({ error: 'No active session found to cancel.' });
     }
 
-    const { id: sessionId, session_type: sessionType, slot_id: slotId, slot_identifier: slotIdentifier, booth_uid: boothUid } = sessionRes.rows[0];
+    const { id: sessionId, session_type: sessionType, status: sessionStatus, slot_id: slotId, slot_identifier: slotIdentifier, booth_uid: boothUid } = sessionRes.rows[0];
 
-    // 2. Mark the session as 'cancelled' in the database.
+    // 2. Add specific logic to prevent cancelling a paid withdrawal.
+    if (sessionType === 'withdrawal' && sessionStatus === 'in_progress') {
+      await client.query('ROLLBACK'); // No changes needed, so end the transaction.
+      return res.status(409).json({
+        error: 'Cannot cancel a paid session.',
+        message: 'This withdrawal has already been paid for. Please collect your battery from the slot.'
+      });
+    }
+
+    // 3. Mark the session as 'cancelled' in the database.
     await client.query("UPDATE deposits SET status = 'cancelled' WHERE id = $1", [sessionId]);
 
     // 3. The slot was reserved for the session. We need to free it and reset its state.

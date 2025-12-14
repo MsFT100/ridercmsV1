@@ -203,6 +203,63 @@ router.post('/users/set-status', [verifyFirebaseToken, isAdmin], async (req, res
 });
 
 /**
+ * DELETE /api/admin/users/:uid
+ * @summary Delete a user
+ * @description Deletes a user from both Firebase Authentication and the local PostgreSQL database. This is a protected route only accessible by users with the 'admin' role.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @parameters
+ *   - in: path
+ *     name: uid
+ *     required: true
+ *     schema:
+ *       type: string
+ *     description: The Firebase UID of the user to delete.
+ * @responses
+ *   200:
+ *     description: User deleted successfully.
+ *   404:
+ *     description: User not found.
+ *   500:
+ *     description: Internal server error.
+ */
+router.delete('/users/:uid', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const { uid } = req.params;
+
+  const pool = await poolPromise;
+  const pgClient = await pool.connect();
+  try {
+    await pgClient.query('BEGIN');
+
+    // 1. Delete the user from the PostgreSQL database.
+    // The ON DELETE CASCADE constraint on the users table should handle related records.
+    const deleteResult = await pgClient.query('DELETE FROM users WHERE user_id = $1', [uid]);
+
+    if (deleteResult.rowCount === 0) {
+      // If no rows were deleted, the user didn't exist in our DB.
+      // We can still try to delete them from Firebase Auth to be safe.
+      logger.warn(`Attempted to delete user (UID: ${uid}) not found in PostgreSQL. Proceeding to delete from Firebase Auth.`);
+    }
+
+    // 2. Delete the user from Firebase Authentication.
+    await admin.auth().deleteUser(uid);
+
+    // 3. If both operations succeed, commit the transaction.
+    await pgClient.query('COMMIT');
+
+    logger.info(`Admin (UID: ${req.user.uid}) successfully deleted user (UID: ${uid}).`);
+    res.status(200).json({ message: `User ${uid} deleted successfully.` });
+  } catch (error) {
+    await pgClient.query('ROLLBACK');
+    logger.error(`Failed to delete user ${uid}:`, error);
+    res.status(500).json({ error: 'Failed to delete user. The operation was rolled back.', details: error.message });
+  } finally {
+    pgClient.release();
+  }
+});
+
+/**
  * GET /api/admin/booths
  * @summary Get a list of all booths
  * @description Retrieves a paginated list of all registered booths in the system. This is a protected route only accessible by users with the 'admin' role.
@@ -1728,39 +1785,60 @@ router.get('/dashboard-summary', [verifyFirebaseToken, isAdmin], async (req, res
 router.get('/sessions', [verifyFirebaseToken, isAdmin], async (req, res) => {
   const limit = parseInt(req.query.limit, 10) || 50;
   const offset = parseInt(req.query.offset, 10) || 0;
+  const { searchTerm, status, sessionType } = req.query;
 
   const pool = await poolPromise;
   const client = await pool.connect();
   try {
-    const query = `
-      SELECT
-        d.id,
-        d.session_type AS "sessionType",
-        d.status,
-        d.amount,
-        d.mpesa_checkout_id AS "mpesaCheckoutId",
-        d.initial_charge_level AS "initialChargeLevel",
-        d.created_at AS "createdAt",
-        d.started_at AS "startedAt",
-        d.completed_at AS "completedAt",
-        u.email AS "userEmail",
-        b.booth_uid AS "boothUid",
-        s.slot_identifier AS "slotIdentifier",
-        bat.battery_uid AS "batteryUid"
+    let whereClauses = [];
+    let queryParams = [];
+    let paramIndex = 1;
+
+    if (searchTerm) {
+      whereClauses.push(`u.email ILIKE $${paramIndex++}`);
+      queryParams.push(`%${searchTerm}%`);
+    }
+    if (status) {
+      whereClauses.push(`d.status = $${paramIndex++}`);
+      queryParams.push(status);
+    }
+    if (sessionType) {
+      whereClauses.push(`d.session_type = $${paramIndex++}`);
+      queryParams.push(sessionType);
+    }
+
+    const whereString = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+
+    const baseQuery = `
       FROM deposits d
       LEFT JOIN users u ON d.user_id = u.user_id
       LEFT JOIN booths b ON d.booth_id = b.id
       LEFT JOIN booth_slots s ON d.slot_id = s.id
       LEFT JOIN batteries bat ON d.battery_id = bat.id
-      ORDER BY d.created_at DESC
-      LIMIT $1 OFFSET $2;
+      ${whereString}
     `;
 
-    const countQuery = 'SELECT COUNT(*) FROM deposits;';
+    const dataQuery = `
+      SELECT
+        d.id, d.session_type AS "sessionType", d.status, d.amount,
+        d.mpesa_checkout_id AS "mpesaCheckoutId", d.initial_charge_level AS "initialChargeLevel",
+        d.created_at AS "createdAt", d.started_at AS "startedAt", d.completed_at AS "completedAt",
+        u.email AS "userEmail", b.booth_uid AS "boothUid", s.slot_identifier AS "slotIdentifier",
+        bat.battery_uid AS "batteryUid"
+      ${baseQuery}
+      ORDER BY d.created_at DESC
+      LIMIT $${paramIndex++} OFFSET $${paramIndex++};
+    `;
+
+    // The count query must use the same WHERE clause but without limit/offset params
+    const countQuery = `SELECT COUNT(d.id) ${baseQuery}`;
+    const countParams = [...queryParams]; // The count query uses only the filter params
+
+    const dataQueryParams = [...queryParams, limit, offset]; // The data query uses filters, limit, and offset
 
     const [sessionsResult, totalCountResult] = await Promise.all([
-      client.query(query, [limit, offset]),
-      client.query(countQuery),
+      client.query(dataQuery, dataQueryParams),
+      client.query(countQuery, countParams),
     ]);
 
     res.status(200).json({
@@ -1770,6 +1848,69 @@ router.get('/sessions', [verifyFirebaseToken, isAdmin], async (req, res) => {
   } catch (error) {
     logger.error('Failed to get all sessions for admin:', error);
     res.status(500).json({ error: 'Failed to retrieve sessions.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * DELETE /api/admin/sessions/:sessionId
+ * @summary Delete a session and reset the associated slot
+ * @description Deletes a session from the deposits table and resets the linked slot to 'available' state. This is a destructive action for cleaning up problematic or stuck sessions.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @parameters
+ *   - in: path
+ *     name: sessionId
+ *     required: true
+ *     schema:
+ *       type: integer
+ *     description: The ID of the session (from the deposits table) to delete.
+ * @responses
+ *   200:
+ *     description: Session deleted and slot reset successfully.
+ *   404:
+ *     description: Session not found.
+ *   500:
+ *     description: Internal server error.
+ */
+router.delete('/sessions/:sessionId', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const { sessionId } = req.params;
+
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Get the session details, specifically the slot_id
+    const sessionRes = await client.query('SELECT slot_id FROM deposits WHERE id = $1', [sessionId]);
+
+    if (sessionRes.rowCount === 0) {
+      return res.status(404).json({ error: 'Session not found.' });
+    }
+    const { slot_id: slotId } = sessionRes.rows[0];
+
+    // 2. If a slot is associated, reset it to a clean state
+    if (slotId) {
+      await client.query(
+        `UPDATE booth_slots SET status = 'available', current_battery_id = NULL, door_status = 'closed', is_charging = FALSE, updated_at = NOW() WHERE id = $1`,
+        [slotId]
+      );
+    }
+
+    // 3. Delete the session from the deposits table
+    await client.query('DELETE FROM deposits WHERE id = $1', [sessionId]);
+
+    // 4. Commit the transaction
+    await client.query('COMMIT');
+
+    logger.info(`Admin (UID: ${req.user.uid}) deleted session ${sessionId} and reset associated slot (ID: ${slotId || 'N/A'}).`);
+    res.status(200).json({ message: 'Session deleted and slot reset successfully.' });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    logger.error(`Failed to delete session ${sessionId}:`, error);
+    res.status(500).json({ error: 'Failed to delete session. The operation was rolled back.', details: error.message });
   } finally {
     client.release();
   }

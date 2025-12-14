@@ -119,6 +119,92 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
     }
     // --- End of deposit completion logic ---
 
+    // --- Event-driven logic based on hardware ACK messages ---
+    const ackMessage = slotData.command?.ack;
+
+    if (ackMessage) {
+      // Use a switch to handle different ACK messages from the hardware.
+      switch (ackMessage) {
+        case 'collection_complete': {
+          logger.info(`Received 'collection_complete' ACK for slot ${slotIdentifier}. Finalizing withdrawal session.`);
+          try {
+            const findAndUpdateWithdrawalQuery = `
+              WITH updated_deposit AS (
+                UPDATE deposits
+                SET
+                  status = 'completed',
+                  completed_at = NOW()
+                WHERE
+                  slot_id = $1
+                  AND status = 'in_progress' -- The session must have been paid for
+                  AND session_type = 'withdrawal'
+                RETURNING id, battery_id, user_id
+              )
+              UPDATE batteries
+              SET user_id = NULL -- Disassociate the battery from the user
+              WHERE id = (SELECT battery_id FROM updated_deposit)
+              RETURNING (SELECT id FROM updated_deposit), (SELECT user_id FROM updated_deposit);
+            `;
+            const withdrawalUpdateResult = await pgClient.query(findAndUpdateWithdrawalQuery, [slotId]);
+
+            if (withdrawalUpdateResult.rowCount > 0) {
+              const { id: depositId, user_id: userId } = withdrawalUpdateResult.rows[0];
+              logger.info(`Withdrawal session ${depositId} for user ${userId} successfully completed for slot ${slotIdentifier}.`);
+            }
+          } catch (dbError) {
+            logger.error(`Failed to finalize withdrawal session in DB for slot ${slotIdentifier} after 'collection_complete' ACK:`, dbError);
+          }
+          break;
+        }
+
+        case 'collection_timeout':
+        case 'openForCollection_rejected_no_battery': {
+          logger.warn(`Received '${ackMessage}' ACK for slot ${slotIdentifier}. Failing the in-progress withdrawal session.`);
+          // The user paid but failed to collect the battery in time, or the slot was unexpectedly empty.
+          // Mark the session as 'failed' to un-stick the user.
+          const failQueryResult = await pgClient.query(
+            "UPDATE deposits SET status = 'failed' WHERE slot_id = $1 AND status = 'in_progress' AND session_type = 'withdrawal' RETURNING id",
+            [slotId]
+          );
+          if (failQueryResult.rowCount > 0) {
+            logger.info(`Session ${failQueryResult.rows[0].id} marked as 'failed' due to collection issue.`);
+          }
+          break;
+        }
+
+        case 'deposit_timeout':
+        case 'openForDeposit_rejected_battery_present':
+        case 'rejected_no_plug':
+        case 'rejected_voltage':
+        case 'rejected_temperature':
+        case 'rejected_door_open': {
+          logger.warn(`Received deposit failure ACK '${ackMessage}' for slot ${slotIdentifier}. Cancelling pending deposit session.`);
+          // The deposit failed for a variety of reasons. Cancel the pending session so the user can try again.
+          const cancelQueryResult = await pgClient.query(
+            "UPDATE deposits SET status = 'cancelled' WHERE slot_id = $1 AND status = 'pending' AND session_type = 'deposit' RETURNING id",
+            [slotId]
+          );
+          if (cancelQueryResult.rowCount > 0) {
+            logger.info(`Session ${cancelQueryResult.rows[0].id} marked as 'cancelled' due to deposit failure.`);
+          }
+          break;
+        }
+
+        case 'startCharging_rejected_safety': {
+          logger.error(`CRITICAL: Received 'startCharging_rejected_safety' for slot ${slotIdentifier}. Updating DB to reflect charging is OFF.`);
+          // The hardware refused to charge. This is important to reflect in our database.
+          await pgClient.query("UPDATE booth_slots SET is_charging = false WHERE id = $1", [slotId]);
+          break;
+        }
+
+        default:
+          // For other ACKs like 'deposit_accepted', 'startCharging_accepted', etc., we can just log them for now.
+          logger.debug(`Received unhandled ACK '${ackMessage}' for slot ${slotIdentifier}. No action taken.`);
+          break;
+      }
+    }
+    // --- End of ACK-based logic ---
+
   } catch (error) {
     logger.error(`Error syncing slot ${boothUid}/${slotIdentifier}:`, error);
   } finally {
