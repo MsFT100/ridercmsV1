@@ -118,7 +118,8 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (req, res) => {
     const boothId = boothRes.rows[0].id;
 
     // 2. Find an available, empty slot in that booth
-    const slotRes = await client.query(
+    // This query correctly finds a slot that is 'available' and not in another state like 'occupied', 'faulty', or 'disabled'.
+     const slotRes = await client.query(
       "SELECT id, slot_identifier FROM booth_slots WHERE booth_id = $1 AND status = 'available' LIMIT 1",
       [boothId]
     );

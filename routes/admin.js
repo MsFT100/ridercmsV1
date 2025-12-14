@@ -809,6 +809,77 @@ router.post('/booths/:boothUid/status', [verifyFirebaseToken, isAdmin], async (r
 });
 
 /**
+ * POST /api/admin/booths/:boothUid/slots/:slotIdentifier/status
+ * @summary Update a specific slot's status (e.g., enable/disable)
+ * @description Updates the operational status of a specific slot. 'disabled' will prevent it from being used. 'available' will re-enable it (if it's empty). This is a protected route only accessible by users with the 'admin' role.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @parameters
+ *   - in: path
+ *     name: boothUid
+ *     required: true
+ *     schema:
+ *       type: string
+ *     description: The UID of the booth containing the slot.
+ *   - in: path
+ *     name: slotIdentifier
+ *     required: true
+ *     schema:
+ *       type: string
+ *     description: The identifier of the slot to update (e.g., slot001).
+ * @requestBody
+ *   required: true
+ *   content:
+ *     application/json:
+ *       schema:
+ *         type: object
+ *         required: [status]
+ *         properties:
+ *           status:
+ *             type: string
+ *             description: The new status for the slot.
+ *             enum: [available, disabled]
+ * @responses
+ *   200:
+ *     description: Slot status updated successfully.
+ *   400:
+ *     description: Bad request (e.g., invalid status).
+ *   404:
+ *     description: Booth or slot not found.
+ *   500:
+ *     description: Internal server error.
+ */
+router.post('/booths/:boothUid/slots/:slotIdentifier/status', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const { boothUid, slotIdentifier } = req.params;
+  const { status } = req.body;
+  const validStatuses = ['available', 'disabled'];
+
+  if (!status || !validStatuses.includes(status)) {
+    return res.status(400).json({ error: `Invalid status. Must be one of: ${validStatuses.join(', ')}` });
+  }
+
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    const updateQuery = `UPDATE booth_slots SET status = $1, updated_at = NOW() WHERE slot_identifier = $2 AND booth_id = (SELECT id FROM booths WHERE booth_uid = $3) RETURNING *`;
+    const result = await client.query(updateQuery, [status, slotIdentifier, boothUid]);
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: `Slot '${slotIdentifier}' in booth '${boothUid}' not found.` });
+    }
+
+    logger.info(`Admin (UID: ${req.user.uid}) updated status for slot '${slotIdentifier}' in booth '${boothUid}' to '${status}'.`);
+    res.status(200).json({ message: 'Slot status updated successfully.', slot: result.rows[0] });
+  } catch (error) {
+    logger.error(`Failed to update status for slot ${slotIdentifier} in booth ${boothUid}:`, error);
+    res.status(500).json({ error: 'Failed to update slot status.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
  * POST /api/admin/booths/:boothUid/slots/:slotIdentifier/command
  * @summary Send a command to a specific booth slot
  * @description Sends a command to a specific slot (e.g., force unlock, start charging) by updating its command object in Firebase. This is a protected route only accessible by users with the 'admin' role.
