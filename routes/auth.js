@@ -87,11 +87,6 @@ router.post('/register', async (req, res) => {
   let userRecord; // To hold the created Firebase Auth user for rollback purposes
   try {
     // 0. Verify reCAPTCHA token before proceeding
-    if (!await verifyRecaptcha(recaptchaToken)) {
-      return res.status(400).json({ error: 'reCAPTCHA verification failed. Please try again.' });
-    }
-
-    // 1. Create user in Firebase Authentication
     userRecord = await admin.auth().createUser({
       email,
       password,
@@ -99,6 +94,11 @@ router.post('/register', async (req, res) => {
       phoneNumber,
       disabled: true, // User is disabled by default, requires admin approval.
     });
+
+    // Verify reCAPTCHA token after creating user but before DB insert
+    if (!await verifyRecaptcha(recaptchaToken)) {
+      throw new Error('reCAPTCHA verification failed.');
+    }
     
     // 2. Set custom role claim for authorization
     await admin.auth().setCustomUserClaims(userRecord.uid, { role: defaultRole });
@@ -141,6 +141,9 @@ router.post('/register', async (req, res) => {
     // Handle specific Firebase Auth errors
     if (error.code === 'auth/email-already-exists') {
       return res.status(409).json({ error: 'The email address is already in use by another account.' });
+    }
+    if (error.message === 'reCAPTCHA verification failed.') {
+      return res.status(400).json({ error: 'reCAPTCHA verification failed. Please try again.' });
     }
     if (error.code === 'auth/invalid-phone-number') {
       return res.status(400).json({ error: 'The phone number is not valid. Please use E.164 format (e.g., +15551234567).' });

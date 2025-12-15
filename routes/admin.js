@@ -232,18 +232,19 @@ router.delete('/users/:uid', [verifyFirebaseToken, isAdmin], async (req, res) =>
   try {
     await pgClient.query('BEGIN');
 
-    // 1. Delete the user from the PostgreSQL database.
+    // 1. Delete the user from Firebase Authentication first.
+    // If this fails, the transaction will be rolled back and nothing will happen in the local DB.
+    await admin.auth().deleteUser(uid);
+
+    // 2. If Firebase deletion is successful, delete the user from the PostgreSQL database.
     // The ON DELETE CASCADE constraint on the users table should handle related records.
     const deleteResult = await pgClient.query('DELETE FROM users WHERE user_id = $1', [uid]);
 
     if (deleteResult.rowCount === 0) {
       // If no rows were deleted, the user didn't exist in our DB.
-      // We can still try to delete them from Firebase Auth to be safe.
-      logger.warn(`Attempted to delete user (UID: ${uid}) not found in PostgreSQL. Proceeding to delete from Firebase Auth.`);
+      // This is not a critical error, as the primary record in Firebase Auth was just deleted.
+      logger.warn(`User (UID: ${uid}) was deleted from Firebase Auth but was not found in the local PostgreSQL database.`);
     }
-
-    // 2. Delete the user from Firebase Authentication.
-    await admin.auth().deleteUser(uid);
 
     // 3. If both operations succeed, commit the transaction.
     await pgClient.query('COMMIT');

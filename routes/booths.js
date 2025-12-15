@@ -130,7 +130,7 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (req, res) => {
 
     // 3. Create a 'deposits' record to track this session
     await client.query(
-      "INSERT INTO deposits (user_id, booth_id, slot_id, session_type, status) VALUES ($1, $2, $3, 'deposit', 'pending')",
+      "INSERT INTO deposits (user_id, booth_id, slot_id, session_type, status) VALUES ($1, $2, $3, 'deposit', 'opening')",
       [firebaseUid, boothId, slotId]
     );
 
@@ -539,7 +539,7 @@ async function completePaidWithdrawal(client, checkoutRequestId) {
   const updateResult = await client.query(
     `UPDATE deposits d
      SET status = 'in_progress'
-     FROM booth_slots s, booths b
+     FROM booth_slots s, booths b -- Joins to get the UIDs for the Firebase command
      WHERE d.mpesa_checkout_id = $1
        AND d.status = 'pending' -- This is the crucial part for idempotency
        AND d.slot_id = s.id
@@ -549,6 +549,7 @@ async function completePaidWithdrawal(client, checkoutRequestId) {
   );
 
   if (updateResult.rowCount > 0) {
+    // The session was successfully moved from 'pending' to 'in_progress'. Now send the command.
     const { booth_uid: boothUid, slot_identifier: slotIdentifier } = updateResult.rows[0];
     const db = getDatabase();
     const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
@@ -563,7 +564,8 @@ async function completePaidWithdrawal(client, checkoutRequestId) {
     logger.info(`Sent 'stopCharging' and 'openForCollection' commands to ${slotIdentifier} at booth ${boothUid} for checkout ID ${checkoutRequestId}.`);
     return true;
   }
-  // If rowCount is 0, it means the session was already processed.
+  // If rowCount is 0, it means the session was NOT in 'pending' status.
+  // This could be because it was already processed, or it was cancelled/failed due to a hardware ACK.
   return false;
 }
 
