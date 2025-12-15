@@ -368,24 +368,27 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
     if (settingsRes.rows.length === 0) {
       throw new Error('Pricing settings are not configured in the database.');
     }
-    const pricing = settingsRes.rows[0].value;
-    const { base_swap_fee, cost_per_charge_percent } = pricing;
+    const pricingRules = settingsRes.rows[0].value;
+    const baseSwapFee = pricingRules.base_swap_fee;
+    const costPerChargePercent = pricingRules.cost_per_charge_percent;
+    const overtimePenaltyPerMin = pricingRules.overtime_penalty_per_minute;
+    const gracePeriodMinutes = pricingRules.grace_period_minutes || 0; // Default to 0 if not set
 
-    if (base_swap_fee === undefined || cost_per_charge_percent === undefined) {
+    if (baseSwapFee === undefined || costPerChargePercent === undefined) {
       throw new Error('Incomplete pricing settings. `base_swap_fee` and `cost_per_charge_percent` are required.');
     }
 
-    // 3. Calculate the cost.
-    const chargeAdded = Math.max(0, parseFloat(chargeLevel) - parseFloat(initialCharge));
-    const totalCost = parseFloat((parseFloat(base_swap_fee) + (chargeAdded * parseFloat(cost_per_charge_percent || 0))).toFixed(2));
-    
-    // 4. Calculate duration and energy delivered
+    // 3. Calculate duration and energy delivered
     const chargeDurationMs = new Date() - new Date(depositCompletedAt);
     const chargeDurationMinutes = Math.round(chargeDurationMs / 60000);
-    // Assuming a standard battery capacity (e.g., 500Wh) to estimate kWh.
-    const energyDeliveredKWh = parseFloat(((chargeAdded / 100) * 0.5).toFixed(3)); // 0.5 kWh is 500Wh
+    const chargeAdded = Math.max(0, parseFloat(chargeLevel) - parseFloat(initialCharge));
+    
+    // 4. Calculate the cost based on the minimum fee logic.
+    const chargeComponent = chargeAdded * parseFloat(costPerChargePercent || 0);
+    // The cost is the greater of the base fee or the calculated charging cost.
+    const totalCost = parseFloat(Math.max(baseSwapFee, chargeComponent).toFixed(2));
 
-    // 4. Create a withdrawal session record with the calculated cost.
+    // 5. Create a withdrawal session record with the calculated cost.
     const sessionRes = await client.query(
       "INSERT INTO deposits (user_id, booth_id, slot_id, battery_id, session_type, status, amount, initial_charge_level) VALUES ($1, $2, $3, $4, 'withdrawal', 'pending', $5, $6) RETURNING id",
       [firebaseUid, boothId, slotId, batteryId, totalCost, chargeLevel]
@@ -410,7 +413,10 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
       sessionId: sessionId,
       amount: totalCost,
       durationMinutes: chargeDurationMinutes,
-      energyDelivered: energyDeliveredKWh,
+      costPerChargePercent: parseFloat(costPerChargePercent),
+      soc: parseFloat(chargeLevel),
+      initialCharge: parseFloat(initialCharge),
+      depositCompletedAt: depositCompletedAt
     });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -527,41 +533,83 @@ router.get('/sessions/pending-withdrawal', verifyFirebaseToken, async (req, res)
   const client = await pool.connect();
   try {
     const query = `
-      SELECT
-        d.id AS "sessionId",
-        d.amount,
-        EXTRACT(EPOCH FROM (NOW() - dep.completed_at)) / 60 AS "durationMinutes",
-        -- Calculate energy delivered by comparing the slot's current charge with the initial charge from the preceding deposit.
-        GREATEST(0, (s.charge_level_percent - dep.initial_charge_level)) / 100 * 0.5 AS "energyDelivered" -- Assuming 0.5 kWh capacity
-      FROM deposits d
-      JOIN booth_slots s ON d.slot_id = s.id
-      -- Find the user's most recent completed deposit that happened *before* this withdrawal was created.
-      -- This correctly links the sessions without relying on a battery_id.
-      CROSS JOIN LATERAL (
-        SELECT initial_charge_level, completed_at
-        FROM deposits
-        WHERE user_id = d.user_id AND session_type = 'deposit' AND status = 'completed' AND completed_at < d.created_at
-        ORDER BY completed_at DESC
-        LIMIT 1
-      ) AS dep
-      WHERE d.user_id = $1 AND d.session_type = 'withdrawal' AND d.status = 'pending'
-      ORDER BY d.created_at DESC
-      LIMIT 1;
+        SELECT
+            d.id AS "sessionId",
+            s.charge_level_percent AS "chargeLevel",
+            b.booth_uid AS "boothUid",
+            s.slot_identifier AS "slotIdentifier", dep.initial_charge_level AS "initialCharge",
+            dep.completed_at AS "depositCompletedAt"
+        FROM deposits d
+        JOIN booth_slots s ON d.slot_id = s.id
+        JOIN booths b ON s.booth_id = b.id
+        -- Find the user's most recent completed deposit that happened *before* this withdrawal was created.
+        CROSS JOIN LATERAL (
+            SELECT initial_charge_level, completed_at
+            FROM deposits
+            WHERE user_id = d.user_id AND session_type = 'deposit' AND status = 'completed' AND completed_at < d.created_at
+            ORDER BY completed_at DESC
+            LIMIT 1
+        ) AS dep
+        WHERE d.user_id = $1 AND d.session_type = 'withdrawal' AND d.status = 'pending'
+        ORDER BY d.created_at DESC
+        LIMIT 1;
     `;
     const { rows } = await client.query(query, [firebaseUid]);
 
     if (rows.length === 0) {
-      // Use 204 No Content, which is more appropriate than 404 for an empty result.
       return res.status(204).send();
     }
 
     const session = rows[0];
-    console.log(`Pending withdrawal session found for user ${firebaseUid}:`, session);
+
+    // --- Real-time Data Fetch ---
+    // Fetch the most current SOC directly from Firebase to ensure accurate pricing.
+    const db = getDatabase();
+    const slotRef = db.ref(`booths/${session.boothUid}/slots/${session.slotIdentifier}`);
+    const snapshot = await slotRef.get();
+
+    let realTimeSoc = session.chargeLevel; // Fallback to DB value
+    if (snapshot.exists() && snapshot.val().telemetry) {
+      realTimeSoc = snapshot.val().telemetry.soc || realTimeSoc;
+    }
+    // --- End of Real-time Fetch ---
+
+    // Re-calculate the cost on the fly, just like in initiate-withdrawal
+    const settingsRes = await client.query("SELECT value FROM app_settings WHERE key = 'pricing'");
+    if (settingsRes.rows.length === 0) {
+      throw new Error('Pricing settings are not configured in the database.');
+    }
+    const pricingRules = settingsRes.rows[0].value;
+    console.log('Pricing rules fetched for pending withdrawal cost recalculation:', pricingRules);
+    const baseSwapFee = pricingRules.base_swap_fee || 0;
+    console.log('Base swap fee:', baseSwapFee);
+    const costPerChargePercent = pricingRules.cost_per_charge_percent || 0;
+    console.log('Cost per charge percent:', costPerChargePercent);
+
+    // Calculate duration and energy delivered
+
+    const chargeDurationMs = new Date() - new Date(session.depositCompletedAt);
+    const chargeDurationMinutes = Math.round(chargeDurationMs / 60000);
+    const chargeAdded = Math.max(0, parseFloat(realTimeSoc) - parseFloat(session.initialCharge));
+
+    const chargingCost = chargeAdded * parseFloat(costPerChargePercent || 0);
+    const totalCost = parseFloat(Math.max(baseSwapFee, chargingCost).toFixed(2));
+
+    // Update the amount in the database for the eventual payment.
+    // This is a "fire-and-forget" update; we don't need to wait for it.
+    client.query("UPDATE deposits SET amount = $1 WHERE id = $2", [totalCost, session.sessionId])
+      .catch(err => logger.error(`Failed to background-update amount for session ${session.sessionId}:`, err));
+
     res.status(200).json({
       sessionId: session.sessionId,
-      amount: parseFloat(parseFloat(session.amount).toFixed(2)),
-      durationMinutes: Math.round(parseFloat(session.durationMinutes)),
-      energyDelivered: parseFloat(Math.max(0, session.energyDelivered).toFixed(3)), // Ensure it's not negative and is rounded
+      amount: totalCost,
+      durationMinutes: chargeDurationMinutes,
+      pricingRules: pricingRules,
+      baseSwapFee: parseFloat(baseSwapFee),
+      costPerChargePercent: parseFloat(costPerChargePercent),
+      soc: parseFloat(realTimeSoc),
+      initialCharge: parseFloat(session.initialCharge),
+      depositCompletedAt: session.depositCompletedAt
     });
   } catch (error) {
     logger.error(`Failed to get pending withdrawal session for user ${firebaseUid}:`, error);
