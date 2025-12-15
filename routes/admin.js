@@ -561,11 +561,19 @@ function initializeFirebaseSlots() {
  *     description: Internal server error.
  */
 router.post('/booths', [verifyFirebaseToken, isAdmin], async (req, res) => {
-  const { name, locationAddress } = req.body;
+  const { name, locationAddress, latitude, longitude } = req.body;
 
   if (!name || !locationAddress) {
     return res.status(400).json({ error: 'Booth name and locationAddress are required.' });
   }
+  if (latitude && isNaN(parseFloat(latitude))) {
+    return res.status(400).json({ error: 'Latitude must be a valid number.' });
+  }
+  if (longitude && isNaN(parseFloat(longitude))) {
+    return res.status(400).json({ error: 'Longitude must be a valid number.' });
+  }
+
+  console.log('Creating new booth with data:', { name, locationAddress, latitude, longitude });
 
   const pool = await poolPromise;
   const client = await pool.connect();
@@ -578,8 +586,8 @@ router.post('/booths', [verifyFirebaseToken, isAdmin], async (req, res) => {
 
     // 2. Insert the new booth into PostgreSQL with the generated UID.
     const boothInsertResult = await client.query(
-      "INSERT INTO booths (booth_uid, name, location_address, status) VALUES ($1, $2, $3, 'online') RETURNING id",
-      [boothUid, name, locationAddress]
+      "INSERT INTO booths (booth_uid, name, location_address, latitude, longitude, status) VALUES ($1, $2, $3, $4, $5,'online') RETURNING id",
+      [boothUid, name, locationAddress, latitude, longitude]
     );
     const newBoothId = boothInsertResult.rows[0].id;
 
