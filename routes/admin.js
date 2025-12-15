@@ -386,73 +386,68 @@ router.get('/booths', [verifyFirebaseToken, isAdmin], async (req, res) => {
  */
 router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) => {
   const pool = await poolPromise;
-  const client = await pool.connect();
+  const pgClient = await pool.connect();
   try {
-    const query = `
-      SELECT
-        bo.booth_uid,
-        bo.name,
-        bo.location_address,
-        bo.status as booth_status,
-        bo.updated_at as last_heartbeat_at,
-        bs.slot_identifier,
-        bs.door_status,
-        bs.status as slot_status,
-        bs.is_charging as slot_is_charging,
-        bs.telemetry,
-        bat.battery_uid,
-        bat.charge_level_percent,
-        u.email as battery_owner_email
-      FROM booths bo
-      LEFT JOIN booth_slots bs ON bo.id = bs.booth_id
-      LEFT JOIN batteries bat ON bs.current_battery_id = bat.id
-      LEFT JOIN users u ON bat.user_id = u.user_id
-      ORDER BY bo.booth_uid, bs.slot_identifier;
-    `;
+    // 1. Get all booths from PostgreSQL to know which UIDs to query in Firebase.
+    const boothsResult = await pgClient.query('SELECT booth_uid, name, location_address, status, updated_at FROM booths ORDER BY name');
+    const boothsFromDb = boothsResult.rows;
 
-    const { rows } = await client.query(query);
+    const db = getDatabase();
 
-    // Process the flat list of rows into a structured, nested object for a cleaner API response.
-    const boothsStatus = rows.reduce((acc, row) => {
-      // Find or create the booth entry in the accumulator
-      let booth = acc.find(b => b.boothUid === row.booth_uid);
-      if (!booth) {
-        booth = {
-          boothUid: row.booth_uid,
-          name: row.name,
-          location: row.location_address,
-          status: row.booth_status,
-          lastHeartbeatAt: row.last_heartbeat_at,
-          slots: []
-        };
-        acc.push(booth);
+    // 2. Fetch real-time data from Firebase for each booth.
+    const boothStatusPromises = boothsFromDb.map(async (booth) => {
+      const boothRef = db.ref(`booths/${booth.booth_uid}`);
+      const snapshot = await boothRef.get();
+
+      const boothData = {
+        boothUid: booth.booth_uid,
+        name: booth.name,
+        location: booth.location_address,
+        status: booth.status, // The overall status from our DB
+        lastHeartbeatAt: booth.updated_at,
+        slots: [],
+      };
+
+      if (snapshot.exists()) {
+        const firebaseBooth = snapshot.val();
+        if (firebaseBooth.slots) {
+          // Map over the slots from Firebase to get the most real-time data.
+          boothData.slots = Object.entries(firebaseBooth.slots).map(([slotIdentifier, slotData]) => {
+            const telemetry = slotData.telemetry || {};
+            return {
+              slotIdentifier: slotIdentifier,
+              // Use live data from Firebase for these critical fields
+              status: slotData.status || 'unknown',
+              doorStatus: slotData.doorLocked ? 'locked' : (slotData.doorClosed ? 'closed' : 'open'),
+              telemetry: telemetry,
+              // The battery object contains the most up-to-date info
+              battery: {
+                isOccupied: slotData.battery === true || slotData.devicePresent === true,
+                chargeLevel: telemetry.soc || 0,
+                isCharging: telemetry.relayOn === true,
+                // We can add more live telemetry here if needed
+                voltage: telemetry.voltage,
+                temperature: telemetry.temperatureC,
+              }
+            };
+          });
+        }
+      } else {
+        logger.warn(`Booth ${booth.booth_uid} exists in PostgreSQL but not in Firebase.`);
       }
+      // Sort slots for a consistent UI
+      boothData.slots.sort((a, b) => a.slotIdentifier.localeCompare(b.slotIdentifier));
+      return boothData;
+    });
 
-      // Only add slot information if a slot identifier exists (i.e., it's not a booth without slots)
-      if (row.slot_identifier) {
-        booth.slots.push({
-          slotIdentifier: row.slot_identifier,
-          doorStatus: row.door_status,
-          status: row.slot_status,
-          telemetry: row.telemetry,
-
-          battery: row.battery_uid ? {
-            batteryUid: row.battery_uid,
-            chargeLevel: row.charge_level_percent,
-            ownerEmail: row.battery_owner_email
-          } : null
-        });
-      }
-
-      return acc;
-    }, []);
+    const boothsStatus = await Promise.all(boothStatusPromises);
 
     res.status(200).json(boothsStatus);
   } catch (error) {
     logger.error('Failed to get booths status for admin:', error);
     res.status(500).json({ error: 'Failed to retrieve booths status.', details: error.message });
   } finally {
-    client.release();
+    pgClient.release();
   }
 });
 
@@ -696,10 +691,13 @@ router.delete('/booths/:boothUid/slots/:slotIdentifier', [verifyFirebaseToken, i
     }
     const slotId = slotRes.rows[0].id;
 
-    // 2. Delete the slot from PostgreSQL. Associated sessions are not deleted but will be orphaned.
+    // 2. Delete any associated deposit records to satisfy the foreign key constraint.
+    await client.query('DELETE FROM deposits WHERE slot_id = $1', [slotId]);
+
+    // 3. Delete the slot from PostgreSQL.
     await client.query('DELETE FROM booth_slots WHERE id = $1', [slotId]);
 
-    // 3. Delete the slot from Firebase Realtime Database.
+    // 4. Delete the slot from Firebase Realtime Database.
     const db = getDatabase();
     const slotRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}`);
     await slotRef.remove();
@@ -855,6 +853,29 @@ router.post('/booths/:boothUid/status', [verifyFirebaseToken, isAdmin], async (r
     if (result.rowCount === 0) {
       return res.status(404).json({ error: `Booth with UID ${boothUid} not found.` });
     }
+
+    // If the booth is being taken offline or put into maintenance, update Firebase slots.
+    if (status === 'maintenance' || status === 'offline') {
+      const db = getDatabase();
+      const boothSlotsRef = db.ref(`booths/${boothUid}/slots`);
+      const snapshot = await boothSlotsRef.get();
+
+      if (snapshot.exists()) {
+        const updates = {};
+        // Create a multi-path update to change the status of all slots at once.
+        snapshot.forEach((slotSnapshot) => {
+          updates[`${slotSnapshot.key}/status`] = status;
+        });
+
+        if (Object.keys(updates).length > 0) {
+          await boothSlotsRef.update(updates);
+          logger.info(`Propagated status '${status}' to all slots in Firebase for booth ${boothUid}.`);
+        }
+      }
+    }
+    // Note: We don't automatically change slots back to 'available' when a booth comes 'online'.
+    // The hardware's own telemetry should be the source of truth for individual slot availability.
+    // The firebaseSync listener will handle updating the DB from that telemetry.
 
     logger.info(`Admin (UID: ${req.user.uid}) updated status for booth '${boothUid}' to '${status}'.`);
     res.status(200).json({ message: 'Booth status updated successfully.', booth: result.rows[0] });

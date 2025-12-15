@@ -51,16 +51,16 @@ async function handleDeposit(client, boothUid, slotIdentifier, telemetry) {
     [batteryId, chargeLevel, depositId]
   );
 
-  // --- Frontend Notification (Commented Out) ---
-  // const db = getDatabase();
-  // const userStatusRef = db.ref(`users/${firebaseUid}/session_status`);
-  // await userStatusRef.set({
-  //   status: 'completed',
-  //   sessionType: 'deposit',
-  //   sessionId: depositId,
-  //   batteryUid: batteryUid,
-  //   updatedAt: new Date().toISOString(),
-  // });
+  // --- Automatically start charging ---
+  const db = getDatabase();
+  const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
+  await commandRef.update({
+    startCharging: true,
+    stopCharging: false // Ensure mutual exclusivity
+  });
+  logger.info(`[FB Listener] Sent 'startCharging' command to ${slotIdentifier} at booth ${boothUid} after deposit.`);
+  // --- End of start charging ---
+
 
   logger.info(`[FB Listener] Deposit confirmed for user '${firebaseUid}' with battery '${batteryUid}' in slot '${slotIdentifier}'.`);
 }
@@ -177,6 +177,9 @@ function initializeFirebaseListener() {
         client.release();
       }
     }
+
+    // CRITICAL: Update the cache with the new state for the next comparison.
+    boothStateCache[boothUid] = afterData;
   });
 
   logger.info('Firebase listener is active.');

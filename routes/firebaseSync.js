@@ -135,6 +135,16 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
         if (depositUpdateResult.rowCount > 0) {
           const depositId = depositUpdateResult.rows[0].id;
           logger.info(`Deposit session ${depositId} completed for slot ${slotIdentifier} via telemetry state change.`);
+
+          // Automatically send command to start charging the newly deposited battery.
+          const db = getDatabase();
+          const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
+          await commandRef.update({
+            startCharging: true,
+            stopCharging: false // Ensure mutual exclusivity
+          });
+          logger.info(`Sent 'startCharging' command to ${slotIdentifier} at booth ${boothUid} after telemetry-confirmed deposit.`);
+
         }
       } catch (dbError) {
         logger.error(`Failed to finalize deposit session in DB for slot ${slotIdentifier} via telemetry:`, dbError);
@@ -202,7 +212,16 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
             if (depositUpdateResult.rowCount > 0) {
               const depositId = depositUpdateResult.rows[0].id;
               logger.info(`Deposit session ${depositId} completed for slot ${slotIdentifier} with initial charge ${chargeLevel}%.`);
-              // The firmware should automatically start charging, so no command is needed here.
+
+              // Automatically send command to start charging the newly deposited battery.
+              const db = getDatabase();
+              const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
+              await commandRef.update({
+                startCharging: true,
+                stopCharging: false // Ensure mutual exclusivity
+              });
+              logger.info(`Sent 'startCharging' command to ${slotIdentifier} at booth ${boothUid} after 'deposit_accepted' ACK.`);
+
             }
           } catch (dbError) {
             logger.error(`Failed to finalize deposit session in DB for slot ${slotIdentifier} after 'deposit_accepted' ACK:`, dbError);

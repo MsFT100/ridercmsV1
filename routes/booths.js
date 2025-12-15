@@ -117,20 +117,47 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (req, res) => {
     }
     const boothId = boothRes.rows[0].id;
 
-    // 2. Find an available, empty slot in that booth
-    // This query correctly finds a slot that is 'available' and not in another state like 'occupied', 'faulty', or 'disabled'.
-     const slotRes = await client.query(
-      "SELECT id, slot_identifier FROM booth_slots WHERE booth_id = $1 AND status = 'available' LIMIT 1",
+    // 2. Find an available, empty slot in that booth, with a real-time check against Firebase.
+    const availableSlotsRes = await client.query(
+      "SELECT id, slot_identifier FROM booth_slots WHERE booth_id = $1 AND status = 'available' ORDER BY slot_identifier",
       [boothId]
     );
-    if (slotRes.rows.length === 0) {
-      throw new Error('No available slots for deposit at this booth.');
+
+    if (availableSlotsRes.rows.length === 0) {
+      throw new Error('No slots are marked as available for deposit at this booth.');
     }
-    const { id: slotId, slot_identifier: slotIdentifier } = slotRes.rows[0];
+
+    const db = getDatabase();
+    let assignedSlot = null;
+
+    // Iterate through DB-available slots and perform a real-time check against Firebase.
+    for (const potentialSlot of availableSlotsRes.rows) {
+      const slotRef = db.ref(`booths/${boothUid}/slots/${potentialSlot.slot_identifier}`);
+      const snapshot = await slotRef.get();
+
+      if (snapshot.exists()) {
+        const slotData = snapshot.val();
+        const telemetry = slotData.telemetry || {};
+
+        // A battery is present if both are true. This slot is not truly available.
+        if (telemetry.plugConnected === true && telemetry.batteryInserted === true) {
+          logger.warn(`Slot ${potentialSlot.slot_identifier} at booth ${boothUid} is marked 'available' in DB but has a battery according to Firebase. Skipping.`);
+          continue; // Skip to the next available slot.
+        }
+      }
+      // This slot is available in the DB and confirmed empty in Firebase. Assign it.
+      assignedSlot = potentialSlot;
+      break;
+    }
+
+    if (!assignedSlot) {
+      throw new Error('All available slots are currently occupied. Please try again later.');
+    }
+    const { id: slotId, slot_identifier: slotIdentifier } = assignedSlot;
 
     // 3. Create a 'deposits' record to track this session
     await client.query(
-      "INSERT INTO deposits (user_id, booth_id, slot_id, session_type, status) VALUES ($1, $2, $3, 'deposit', 'opening')",
+      "INSERT INTO deposits (user_id, booth_id, slot_id, session_type, status) VALUES ($1, $2, $3, 'deposit', 'pending')",
       [firebaseUid, boothId, slotId]
     );
 
@@ -138,7 +165,6 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (req, res) => {
     await client.query("UPDATE booth_slots SET status = 'opening' WHERE id = $1", [slotId]);
 
     // 5. Send the command to Firebase to open the door for deposit.
-    const db = getDatabase();
     const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
     await commandRef.update({
       openForDeposit: true,
@@ -297,7 +323,7 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
       [firebaseUid]
     );
     if (existingSessionRes.rows.length > 0) {
-      client.release(); // Release the client before returning
+      await client.query('ROLLBACK'); // End the transaction before releasing
       return res.status(409).json({
         error: 'Active session exists.',
         message: 'You already have an active session. Please complete or cancel it before starting a new withdrawal.'
@@ -308,24 +334,26 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
     // 1. Find the user's battery and its location
     const batteryQuery = `
       SELECT
-        bat.charge_level_percent AS "chargeLevel",
-        d.completed_at AS "depositCompletedAt",
+        -- Use the real-time charge level from the slot, not the stale one from the batteries table.
+        s.charge_level_percent AS "chargeLevel",
+        last_deposit.completed_at AS "depositCompletedAt",
         bat.id AS "batteryId", -- Get the battery ID
-        d.initial_charge_level AS "initialCharge", -- The charge when it was deposited
+        last_deposit.initial_charge_level AS "initialCharge",
         s.id AS "slotId",
         s.slot_identifier AS "slotIdentifier",
         bo.id AS "boothId",
         bo.booth_uid AS "boothUid"
-      FROM batteries bat
-      -- Find the battery by user ID first
-      JOIN booth_slots s ON bat.id = s.current_battery_id
+      FROM deposits d
+      JOIN booth_slots s ON d.slot_id = s.id
+      JOIN batteries bat ON s.current_battery_id = bat.id
       JOIN booths bo ON s.booth_id = bo.id
-      -- Join with the most recent completed deposit for this battery to get the correct initial charge.
-      JOIN deposits d ON d.id = (
-        SELECT id FROM deposits
-        WHERE battery_id = bat.id AND session_type = 'deposit' AND status = 'completed'
-        ORDER BY completed_at DESC LIMIT 1
-      )
+      -- Use a LATERAL JOIN to reliably find the single, most recent completed deposit for this user.
+      CROSS JOIN LATERAL (
+        SELECT dep.completed_at, dep.initial_charge_level
+        FROM deposits AS dep
+        WHERE dep.user_id = d.user_id AND dep.session_type = 'deposit' AND dep.status = 'completed'
+        ORDER BY dep.completed_at DESC LIMIT 1
+      ) AS last_deposit
       WHERE bat.user_id = $1 AND s.status = 'occupied'
     `;
     const batteryRes = await client.query(batteryQuery, [firebaseUid]);
@@ -359,15 +387,24 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
 
     // 4. Create a withdrawal session record with the calculated cost.
     const sessionRes = await client.query(
-      "INSERT INTO deposits (user_id, booth_id, slot_id, battery_id, session_type, status, amount) VALUES ($1, $2, $3, $4, 'withdrawal', 'pending', $5) RETURNING id",
-      [firebaseUid, boothId, slotId, batteryId, totalCost]
+      "INSERT INTO deposits (user_id, booth_id, slot_id, battery_id, session_type, status, amount, initial_charge_level) VALUES ($1, $2, $3, $4, 'withdrawal', 'pending', $5, $6) RETURNING id",
+      [firebaseUid, boothId, slotId, batteryId, totalCost, chargeLevel]
     );
     const sessionId = sessionRes.rows[0].id;
 
+    // 5. Send command to Firebase to stop charging immediately.
+    // This freezes the charge level at the point of cost calculation.
+    // The door will only be unlocked after payment is confirmed.
+    const db = getDatabase();
+    const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
+    await commandRef.update({ stopCharging: true, startCharging: false });
+
+    logger.info(`Sent 'stopCharging' command to ${slotIdentifier} at booth ${boothUid} upon withdrawal initiation for session ${sessionId}.`);
+
     await client.query('COMMIT');
 
-    // 6. Return the session ID and the calculated amount to the frontend.
-    // The STK push is NOT initiated here.
+    // 7. Return the session ID and the calculated amount to the frontend.
+    // The STK push is NOT initiated here; it happens when the user confirms payment.
     res.status(200).json({
       message: 'Withdrawal session created. Please confirm cost before payment.',
       sessionId: sessionId,
@@ -494,11 +531,19 @@ router.get('/sessions/pending-withdrawal', verifyFirebaseToken, async (req, res)
         d.id AS "sessionId",
         d.amount,
         EXTRACT(EPOCH FROM (NOW() - dep.completed_at)) / 60 AS "durationMinutes",
-        (bat.charge_level_percent - dep.initial_charge_level) / 100 * 0.5 AS "energyDelivered"
+        -- Calculate energy delivered by comparing the slot's current charge with the initial charge from the preceding deposit.
+        GREATEST(0, (s.charge_level_percent - dep.initial_charge_level)) / 100 * 0.5 AS "energyDelivered" -- Assuming 0.5 kWh capacity
       FROM deposits d
       JOIN booth_slots s ON d.slot_id = s.id
-      JOIN batteries bat ON s.current_battery_id = bat.id
-      JOIN deposits dep ON bat.id = dep.battery_id AND dep.session_type = 'deposit' AND dep.status = 'completed'
+      -- Find the user's most recent completed deposit that happened *before* this withdrawal was created.
+      -- This correctly links the sessions without relying on a battery_id.
+      CROSS JOIN LATERAL (
+        SELECT initial_charge_level, completed_at
+        FROM deposits
+        WHERE user_id = d.user_id AND session_type = 'deposit' AND status = 'completed' AND completed_at < d.created_at
+        ORDER BY completed_at DESC
+        LIMIT 1
+      ) AS dep
       WHERE d.user_id = $1 AND d.session_type = 'withdrawal' AND d.status = 'pending'
       ORDER BY d.created_at DESC
       LIMIT 1;
@@ -511,6 +556,7 @@ router.get('/sessions/pending-withdrawal', verifyFirebaseToken, async (req, res)
     }
 
     const session = rows[0];
+    console.log(`Pending withdrawal session found for user ${firebaseUid}:`, session);
     res.status(200).json({
       sessionId: session.sessionId,
       amount: parseFloat(session.amount),
