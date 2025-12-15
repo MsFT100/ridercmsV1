@@ -377,13 +377,13 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
 
     // 3. Calculate the cost.
     const chargeAdded = Math.max(0, parseFloat(chargeLevel) - parseFloat(initialCharge));
-    const totalCost = parseFloat(base_swap_fee) + (chargeAdded * parseFloat(cost_per_charge_percent || 0));
+    const totalCost = parseFloat((parseFloat(base_swap_fee) + (chargeAdded * parseFloat(cost_per_charge_percent || 0))).toFixed(2));
     
     // 4. Calculate duration and energy delivered
     const chargeDurationMs = new Date() - new Date(depositCompletedAt);
     const chargeDurationMinutes = Math.round(chargeDurationMs / 60000);
     // Assuming a standard battery capacity (e.g., 500Wh) to estimate kWh.
-    const energyDeliveredKWh = (chargeAdded / 100) * 0.5; // 0.5 kWh is 500Wh
+    const energyDeliveredKWh = parseFloat(((chargeAdded / 100) * 0.5).toFixed(3)); // 0.5 kWh is 500Wh
 
     // 4. Create a withdrawal session record with the calculated cost.
     const sessionRes = await client.query(
@@ -559,9 +559,9 @@ router.get('/sessions/pending-withdrawal', verifyFirebaseToken, async (req, res)
     console.log(`Pending withdrawal session found for user ${firebaseUid}:`, session);
     res.status(200).json({
       sessionId: session.sessionId,
-      amount: parseFloat(session.amount),
-      durationMinutes: Math.round(session.durationMinutes),
-      energyDelivered: Math.max(0, session.energyDelivered), // Ensure it's not negative
+      amount: parseFloat(parseFloat(session.amount).toFixed(2)),
+      durationMinutes: Math.round(parseFloat(session.durationMinutes)),
+      energyDelivered: parseFloat(Math.max(0, session.energyDelivered).toFixed(3)), // Ensure it's not negative and is rounded
     });
   } catch (error) {
     logger.error(`Failed to get pending withdrawal session for user ${firebaseUid}:`, error);

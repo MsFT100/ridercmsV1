@@ -389,7 +389,18 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
   const pgClient = await pool.connect();
   try {
     // 1. Get all booths from PostgreSQL to know which UIDs to query in Firebase.
-    const boothsResult = await pgClient.query('SELECT booth_uid, name, location_address, status, updated_at FROM booths ORDER BY name');
+    // Also fetch slot, battery, and user details to get the user's name for each occupied slot.
+    const boothsResult = await pgClient.query(`
+      SELECT
+        b.booth_uid, b.name, b.location_address, b.status, b.updated_at,
+        s.slot_identifier,
+        u.name as user_name
+      FROM booths b
+      LEFT JOIN booth_slots s ON b.id = s.booth_id
+      LEFT JOIN batteries bat ON s.current_battery_id = bat.id
+      LEFT JOIN users u ON bat.user_id = u.user_id
+      ORDER BY b.name, s.slot_identifier;
+    `);
     const boothsFromDb = boothsResult.rows;
 
     const db = getDatabase();
@@ -404,6 +415,10 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
         name: booth.name,
         location: booth.location_address,
         status: booth.status, // The overall status from our DB
+        // Use the live status from Firebase if available, otherwise fallback to DB status.
+        status: snapshot.exists() && snapshot.val().status
+          ? snapshot.val().status
+          : booth.status,
         lastHeartbeatAt: booth.updated_at,
         slots: [],
       };
@@ -411,21 +426,31 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
       if (snapshot.exists()) {
         const firebaseBooth = snapshot.val();
         if (firebaseBooth.slots) {
+          // Create a map of slotIdentifier -> userName for this booth for easy lookup.
+          const slotUserNameMap = boothsFromDb
+            .filter(row => row.booth_uid === booth.booth_uid && row.slot_identifier)
+            .reduce((acc, row) => {
+              acc[row.slot_identifier] = row.user_name;
+              return acc;
+            }, {});
+
           // Map over the slots from Firebase to get the most real-time data.
           boothData.slots = Object.entries(firebaseBooth.slots).map(([slotIdentifier, slotData]) => {
             const telemetry = slotData.telemetry || {};
+            const isCharging = telemetry.relayOn === true;
             return {
               slotIdentifier: slotIdentifier,
               // Use live data from Firebase for these critical fields
               status: slotData.status || 'unknown',
-              doorStatus: slotData.doorLocked ? 'locked' : (slotData.doorClosed ? 'closed' : 'open'),
+              doorStatus: telemetry.doorLocked ? 'locked' : (telemetry.doorClosed ? 'closed' : 'open'),
+              relayState: telemetry.relayOn ? 'ON' : 'OFF',
+              isCharging: isCharging,
+              userName: slotUserNameMap[slotIdentifier] || null, // Add user's name here
               telemetry: telemetry,
               // The battery object contains the most up-to-date info
               battery: {
                 isOccupied: slotData.battery === true || slotData.devicePresent === true,
                 chargeLevel: telemetry.soc || 0,
-                isCharging: telemetry.relayOn === true,
-                // We can add more live telemetry here if needed
                 voltage: telemetry.voltage,
                 temperature: telemetry.temperatureC,
               }
@@ -440,9 +465,12 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
       return boothData;
     });
 
-    const boothsStatus = await Promise.all(boothStatusPromises);
+    // Consolidate the results into a unique list of booths, as the initial DB query can have multiple rows per booth.
+    const uniqueBooths = (await Promise.all(boothStatusPromises)).filter((booth, index, self) =>
+      index === self.findIndex((b) => b.boothUid === booth.boothUid)
+    );
 
-    res.status(200).json(boothsStatus);
+    res.status(200).json(uniqueBooths);
   } catch (error) {
     logger.error('Failed to get booths status for admin:', error);
     res.status(500).json({ error: 'Failed to retrieve booths status.', details: error.message });
@@ -1081,8 +1109,10 @@ router.get('/booths/:boothUid', [verifyFirebaseToken, isAdmin], async (req, res)
   const pool = await poolPromise;
   const client = await pool.connect();
   try {
-    const query = `
+    // Query 1: Get the main booth details
+    const boothQuery = `
       SELECT
+        id,
         booth_uid,
         name,
         location_address,
@@ -1092,22 +1122,46 @@ router.get('/booths/:boothUid', [verifyFirebaseToken, isAdmin], async (req, res)
       FROM booths
       WHERE booth_uid = $1;
     `;
+    const boothResult = await client.query(boothQuery, [boothUid]);
 
-    const { rows } = await client.query(query, [boothUid]);
-
-    if (rows.length === 0) {
+    if (boothResult.rows.length === 0) {
       return res.status(404).json({ error: `Booth with UID ${boothUid} not found.` });
     }
+    const boothDetails = boothResult.rows[0];
 
-    // Explicitly construct the response to ensure all fields are included.
-    const boothDetails = rows[0];
+    // Query 2: Get all associated slots and their details
+    const slotsQuery = `
+      SELECT
+        s.slot_identifier,
+        s.status,
+        s.door_status,
+        s.charge_level_percent,
+        bat.battery_uid,
+        u.name as user_name
+      FROM booth_slots s
+      LEFT JOIN batteries bat ON s.current_battery_id = bat.id
+      LEFT JOIN users u ON bat.user_id = u.user_id
+      WHERE s.booth_id = $1
+      ORDER BY s.slot_identifier ASC;
+    `;
+    const slotsResult = await client.query(slotsQuery, [boothDetails.id]);
+
+    // Combine the results into a single response object
     res.status(200).json({
-      booth_uid: boothDetails.booth_uid,
+      booth_uid: boothDetails.booth_uid, // Keep snake_case for consistency
       name: boothDetails.name,
       location_address: boothDetails.location_address,
       status: boothDetails.status,
       created_at: boothDetails.created_at,
       updated_at: boothDetails.updated_at,
+      slots: slotsResult.rows.map(slot => ({
+        identifier: slot.slot_identifier,
+        status: slot.status,
+        doorStatus: slot.door_status,
+        chargeLevel: slot.charge_level_percent,
+        batteryUid: slot.battery_uid,
+        userName: slot.user_name
+      }))
     });
   } catch (error) {
     logger.error(`Failed to get booth ${boothUid} for admin:`, error);
@@ -1916,7 +1970,7 @@ router.delete('/sessions/:sessionId', [verifyFirebaseToken, isAdmin], async (req
     // 2. If a slot is associated, reset it to a clean state
     if (slotId) {
       await client.query(
-        `UPDATE booth_slots SET status = 'available', current_battery_id = NULL, door_status = 'closed', is_charging = FALSE, updated_at = NOW() WHERE id = $1`,
+        `UPDATE booth_slots SET status = 'available', current_battery_id = NULL, door_status = 'closed', is_charging = FALSE, charge_level_percent = NULL, telemetry = NULL, updated_at = NOW() WHERE id = $1`,
         [slotId]
       );
     }
