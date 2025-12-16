@@ -167,10 +167,10 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (req, res) => {
     // 5. Send the command to Firebase to open the door for deposit.
     const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
     await commandRef.update({
-      // openForDeposit: true,
-      // openForCollection: false // Ensure mutual exclusivity
-      forceUnlock: true, // New command to simply unlock the door
-      forceLock: false // Ensure mutual exclusivity
+      openForDeposit: true,
+      openForCollection: false // Ensure mutual exclusivity
+      // forceUnlock: true, // New command to simply unlock the door
+      // forceLock: false // Ensure mutual exclusivity
     });
 
     await client.query('COMMIT');
@@ -359,11 +359,24 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
       WHERE bat.user_id = $1 AND s.status = 'occupied'
     `;
     const batteryRes = await client.query(batteryQuery, [firebaseUid]);
+    
 
     if (batteryRes.rows.length === 0) {
       throw new Error('You do not have a battery currently deposited.');
     }
-    const { chargeLevel, initialCharge, batteryId, depositCompletedAt, slotId, slotIdentifier, boothId, boothUid } = batteryRes.rows[0];
+    const { chargeLevel: dbChargeLevel, initialCharge, batteryId, depositCompletedAt, slotId, slotIdentifier, boothId, boothUid } = batteryRes.rows[0];
+
+    // --- Real-time Data Fetch ---
+    // Fetch the most current SOC directly from Firebase to ensure accurate pricing.
+    const db = getDatabase();
+    const slotRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}`);
+    const snapshot = await slotRef.get();
+
+    let chargeLevel = dbChargeLevel; // Fallback to DB value
+    if (snapshot.exists() && snapshot.val().telemetry) {
+      chargeLevel = snapshot.val().telemetry.soc || chargeLevel;
+    }
+    // --- End of Real-time Fetch ---
 
     // 2. Calculate the cost
     const settingsRes = await client.query("SELECT value FROM app_settings WHERE key = 'pricing'");
@@ -400,9 +413,10 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
     // 5. Send command to Firebase to stop charging immediately.
     // This freezes the charge level at the point of cost calculation.
     // The door will only be unlocked after payment is confirmed.
-    const db = getDatabase();
+    // const db = getDatabase(); // db is already defined above
     const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
     await commandRef.update({ stopCharging: true, startCharging: false });
+
 
     logger.info(`Sent 'stopCharging' command to ${slotIdentifier} at booth ${boothUid} upon withdrawal initiation for session ${sessionId}.`);
 
@@ -416,7 +430,7 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
       amount: totalCost,
       durationMinutes: chargeDurationMinutes,
       costPerChargePercent: parseFloat(costPerChargePercent),
-      soc: parseFloat(chargeLevel),
+      soc: parseFloat(chargeAdded),
       initialCharge: parseFloat(initialCharge),
       depositCompletedAt: depositCompletedAt
     });
@@ -609,7 +623,7 @@ router.get('/sessions/pending-withdrawal', verifyFirebaseToken, async (req, res)
       pricingRules: pricingRules,
       baseSwapFee: parseFloat(baseSwapFee),
       costPerChargePercent: parseFloat(costPerChargePercent),
-      soc: parseFloat(realTimeSoc),
+      soc: parseFloat(chargeAdded),
       initialCharge: parseFloat(session.initialCharge),
       depositCompletedAt: session.depositCompletedAt
     });
@@ -653,10 +667,10 @@ async function completePaidWithdrawal(client, checkoutRequestId) {
     await commandRef.update({
       stopCharging: true,
       startCharging: false, // Ensure mutual exclusivity
-      // openForCollection: true,
-      // openForDeposit: false, // Ensure mutual exclusivity
-      forceUnlock: false,
-      forceLock: false
+      openForCollection: true,
+      openForDeposit: false, // Ensure mutual exclusivity
+      // forceUnlock: false,
+      // forceLock: false
     });
 
     logger.info(`Sent 'stopCharging' and 'openForCollection' commands to ${slotIdentifier} at booth ${boothUid} for checkout ID ${checkoutRequestId}.`);
