@@ -167,8 +167,10 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (req, res) => {
     // 5. Send the command to Firebase to open the door for deposit.
     const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
     await commandRef.update({
-      openForDeposit: true,
-      openForCollection: false // Ensure mutual exclusivity
+      // openForDeposit: true,
+      // openForCollection: false // Ensure mutual exclusivity
+      forceUnlock: true, // New command to simply unlock the door
+      forceLock: false // Ensure mutual exclusivity
     });
 
     await client.query('COMMIT');
@@ -651,8 +653,10 @@ async function completePaidWithdrawal(client, checkoutRequestId) {
     await commandRef.update({
       stopCharging: true,
       startCharging: false, // Ensure mutual exclusivity
-      openForCollection: true,
-      openForDeposit: false
+      // openForCollection: true,
+      // openForDeposit: false, // Ensure mutual exclusivity
+      forceUnlock: false,
+      forceLock: false
     });
 
     logger.info(`Sent 'stopCharging' and 'openForCollection' commands to ${slotIdentifier} at booth ${boothUid} for checkout ID ${checkoutRequestId}.`);
