@@ -109,6 +109,7 @@ const initializeDatabase = async () => {
         status VARCHAR(50) NOT NULL CHECK (status IN ('pending', 'in_progress', 'completed', 'failed', 'cancelled')),
         started_at TIMESTAMPTZ DEFAULT NOW(),
         completed_at TIMESTAMPTZ,
+        notes TEXT, -- For logging reasons for state changes (e.g., auto-cancellation)
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW()
       );
@@ -158,6 +159,18 @@ const initializeDatabase = async () => {
     await client.query(createBoothSlotsTableQuery);
     await client.query(createDepositsTableQuery);
     await client.query(createProblemReportsTableQuery);
+
+    // --- Schema Alterations for existing databases (Idempotent) ---
+    // Add 'notes' column to 'deposits' table if it doesn't exist.
+    const checkNotesColumnQuery = `
+      SELECT 1 FROM information_schema.columns
+      WHERE table_name='deposits' AND column_name='notes';
+    `;
+    const { rows } = await client.query(checkNotesColumnQuery);
+    if (rows.length === 0) {
+      await client.query('ALTER TABLE deposits ADD COLUMN notes TEXT;');
+      logger.info("Added 'notes' column to 'deposits' table.");
+    }
     
 
     const createUpdateTimestampFunction = `
