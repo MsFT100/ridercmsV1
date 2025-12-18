@@ -1,7 +1,6 @@
 const { Router } = require('express');
 const logger = require('../utils/logger');
 const { getMpesaIpWhitelist } = require('../utils/mpesa');
-const { getDatabase } = require('firebase-admin/database');
 const poolPromise = require('../db');
 
 // This function is defined in booths.js but we need its signature here for clarity.
@@ -23,77 +22,99 @@ const router = Router();
  * It's an asynchronous webhook.
  */
 router.post('/callback', async (req, res) => {
-  // Security: Basic IP whitelisting to ensure the request is from a trusted source.
   const requestIp = req.ip;
   const whitelist = getMpesaIpWhitelist();
+
   if (process.env.NODE_ENV === 'production' && !whitelist.includes(requestIp)) {
     logger.warn(`M-Pesa callback from untrusted IP blocked: ${requestIp}`);
     return res.status(403).json({ ResultCode: 'C2B00017', ResultDesc: 'Forbidden' });
   }
 
   const callbackData = req.body;
-  console.log("Mpesa Callback Data:", JSON.stringify(callbackData, null, 2));
   logger.info('M-Pesa Callback Received:', JSON.stringify(callbackData, null, 2));
 
-  // Immediately respond to M-Pesa to acknowledge receipt and avoid timeouts.
+  // ACK immediately
   res.status(200).json({ ResultCode: 0, ResultDesc: 'Accepted' });
 
   const pool = await poolPromise;
   const client = await pool.connect();
+
   try {
-    // 1. Log the entire callback payload for auditing and debugging.
+    await client.query('BEGIN');
+
+    // 1️⃣ Persist raw callback (audit trail)
     await client.query(
       'INSERT INTO mpesa_callbacks (callback_type, payload) VALUES ($1, $2)',
       ['stk_push', callbackData]
     );
 
-    const { Body: { stkCallback } } = callbackData;
-
-    // Robustness: Check if stkCallback exists before proceeding.
+    const stkCallback = callbackData?.Body?.stkCallback;
     if (!stkCallback) {
-      throw new Error('Invalid M-Pesa callback format: stkCallback is missing.');
+      throw new Error('Invalid callback payload');
     }
 
-    // 2. Check if the transaction was successful.
+    const checkoutRequestId = stkCallback.CheckoutRequestID;
+
+    // 2️⃣ Idempotency guard — lock the session row
+    const sessionRes = await client.query(
+      `
+      SELECT id, status
+      FROM deposits
+      WHERE mpesa_checkout_id = $1
+      FOR UPDATE
+      `,
+      [checkoutRequestId]
+    );
+
+    if (sessionRes.rows.length === 0) {
+      logger.warn(`Callback for unknown CheckoutRequestID: ${checkoutRequestId}`);
+      await client.query('ROLLBACK');
+      return;
+    }
+
+    const { status } = sessionRes.rows[0];
+
+    // Already processed — exit safely
+    if (status !== 'pending') {
+      logger.info(`Ignoring duplicate callback for ${checkoutRequestId}, status=${status}`);
+      await client.query('ROLLBACK');
+      return;
+    }
+
+    // 3️⃣ Successful payment
     if (stkCallback.ResultCode === 0) {
-      // Payment was successful.
-      const checkoutRequestId = stkCallback.CheckoutRequestID;
-      const amountItem = stkCallback.CallbackMetadata.Item.find(item => item.Name === 'Amount');
-      const amount = amountItem ? amountItem.Value : null;
-
-      // Robustness: Ensure we have the necessary metadata.
-      if (!checkoutRequestId || !amount) {
-        throw new Error(`Invalid successful callback data: Missing CheckoutRequestID or Amount for payload: ${JSON.stringify(stkCallback)}`);
-      }
-
-      // 3. Update the corresponding deposit session status to 'in_progress'.
-      // This signals to the polling endpoint that payment is complete.
-      // Lazily require the function to avoid circular dependency at startup.
       if (!completePaidWithdrawalFn) {
         completePaidWithdrawalFn = require('./booths.js').completePaidWithdrawal;
       }
-      const wasUpdated = await completePaidWithdrawalFn(client, checkoutRequestId);
 
-      if (wasUpdated) {
-        logger.info(`Payment successful for CheckoutRequestID: ${checkoutRequestId}. Amount: ${amount}. Session status updated to 'in_progress'.`);
-      } else {
-        logger.warn(`Received a successful M-Pesa callback for an unknown or already processed CheckoutRequestID: ${checkoutRequestId}`);
-      }
+      await completePaidWithdrawalFn(client, checkoutRequestId);
+
+      logger.info(`Payment confirmed for ${checkoutRequestId}`);
     } else {
-      // Payment failed or was cancelled by the user.
-      logger.warn(`M-Pesa STK push failed for CheckoutRequestID: ${stkCallback.CheckoutRequestID}. Reason: ${stkCallback.ResultDesc}`);
-      // Update the status to 'failed' only if it's currently 'pending'.
-      // This prevents overwriting a 'completed' status from a self-healing query.
+      // 4️⃣ Failure — only if still pending
       await client.query(
-        "UPDATE deposits SET status = 'failed' WHERE mpesa_checkout_id = $1 AND status = 'pending'",
-        [stkCallback.CheckoutRequestID]
+        `
+        UPDATE deposits
+        SET status = 'failed'
+        WHERE mpesa_checkout_id = $1
+          AND status = 'pending'
+        `,
+        [checkoutRequestId]
+      );
+
+      logger.warn(
+        `STK failed for ${checkoutRequestId}: ${stkCallback.ResultDesc}`
       );
     }
+
+    await client.query('COMMIT');
   } catch (error) {
+    await client.query('ROLLBACK');
     logger.error('Error processing M-Pesa callback:', error);
   } finally {
     client.release();
   }
 });
+
 
 module.exports = router;

@@ -106,7 +106,7 @@ const initializeDatabase = async () => {
         initial_charge_level INT, -- Stored on deposit
         amount DECIMAL(10, 2) NOT NULL DEFAULT 0.00, -- Amount charged for the session
         mpesa_checkout_id VARCHAR(255) UNIQUE, -- For tracking payment status
-        status VARCHAR(50) NOT NULL CHECK (status IN ('pending', 'in_progress', 'completed', 'failed', 'cancelled')),
+        status VARCHAR(50) NOT NULL CHECK (status IN ('pending', 'opening', 'in_progress', 'completed', 'failed', 'cancelled')),
         started_at TIMESTAMPTZ DEFAULT NOW(),
         completed_at TIMESTAMPTZ,
         notes TEXT, -- For logging reasons for state changes (e.g., auto-cancellation)

@@ -62,7 +62,7 @@ router.get('/', verifyFirebaseToken, async (req, res) => {
  */
 router.post('/initiate-deposit', verifyFirebaseToken, async (req, res) => {
   const { boothUid } = req.body;
-  const { uid: firebaseUid } = req.user; // Get user's UID from the verified session
+  const { uid: firebaseUid } = req.user;
 
   if (!boothUid) {
     return res.status(400).json({ error: 'boothUid is required.' });
@@ -70,125 +70,195 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (req, res) => {
 
   const pool = await poolPromise;
   const client = await pool.connect();
+
   try {
     await client.query('BEGIN');
 
-    // --- Self-Healing & Pre-check for existing sessions ---
-    // Find any active sessions. If a 'pending' deposit exists, we'll clean it up.
-    // If an 'in_progress' session exists (deposit or withdrawal), we must block.
+    // 🔧 FIX 1: Serialize per-user requests
+    await client.query(
+      'SELECT id FROM users WHERE user_id = $1 FOR UPDATE',
+      [firebaseUid]
+    );
+
+    // 🔧 FIX 2: Include 'opening' as an active state
     const existingSessionQuery = `
-      SELECT id, status, slot_id FROM deposits
-      WHERE user_id = $1 AND status IN ('pending', 'in_progress')
+      SELECT id, status, slot_id, session_type
+      FROM deposits
+      WHERE user_id = $1
+        AND status IN ('pending', 'opening', 'in_progress')
     `;
     const existingSessionRes = await client.query(existingSessionQuery, [firebaseUid]);
 
     for (const session of existingSessionRes.rows) {
       if (session.status === 'in_progress') {
-        // An 'in_progress' session is a hard stop. The user must wait for it to complete or timeout.
-        return res.status(409).json({
-          error: 'Active session in progress.',
-          message: 'You have a session that is currently in progress. Please complete or cancel it before starting a new one.'
-        });
+        throw new Error('ACTIVE_SESSION_IN_PROGRESS');
       }
-      if (session.status === 'pending' && session.slot_id) {
-        // This is a stale, pending deposit. Clean it up.
-        logger.warn(`Cleaning up stale pending deposit session ${session.id} for user ${firebaseUid}.`);
-        await client.query("UPDATE deposits SET status = 'cancelled' WHERE id = $1", [session.id]);
-        await client.query("UPDATE booth_slots SET status = 'available' WHERE id = $1", [session.slot_id]);
+
+      if (session.status === 'pending' && session.session_type === 'deposit') {
+        logger.warn(
+          `Cleaning up stale pending deposit session ${session.id} for user ${firebaseUid}.`
+        );
+
+        await client.query(
+          "UPDATE deposits SET status = 'cancelled' WHERE id = $1",
+          [session.id]
+        );
+
+        if (session.slot_id) {
+          await client.query(
+            "UPDATE booth_slots SET status = 'available' WHERE id = $1",
+            [session.slot_id]
+          );
+          // After cleanup, force the user to retry to ensure a clean state.
+          // This prevents the code from proceeding with stale data.
+          throw new Error('STALE_SESSION_CLEANED');
+        }
+      }
+
+      // 🔧 FIX 3: Block if a withdrawal is pending
+      if (
+        session.status === 'pending' &&
+        session.session_type === 'withdrawal'
+      ) {
+        throw new Error('PENDING_WITHDRAWAL_EXISTS');
       }
     }
 
-    // After cleanup, re-check for any non-deposit pending sessions (like a pending withdrawal)
-    const postCleanupCheck = await client.query(
-      `SELECT 1 FROM deposits WHERE user_id = $1 AND status = 'pending' AND session_type = 'withdrawal'`,
-      [firebaseUid]
+    // 1. Resolve booth
+    const boothRes = await client.query(
+      "SELECT id FROM booths WHERE booth_uid = $1 AND status = 'online'",
+      [boothUid]
     );
-    if (postCleanupCheck.rows.length > 0) {
-      return res.status(409).json({
-        error: 'Active session exists.',
-        message: 'You have a pending withdrawal. Please complete or cancel it before starting a new deposit.'
-      });
+
+    if (boothRes.rows.length === 0) {
+      throw new Error('BOOTH_NOT_AVAILABLE');
     }
 
-    // 1. Find the booth's internal ID from its public UID
-    const boothRes = await client.query('SELECT id FROM booths WHERE booth_uid = $1 AND status = \'online\'', [boothUid]);
-    if (boothRes.rows.length === 0) {
-      throw new Error(`Booth ${boothUid} is not online or does not exist.`);
-    }
     const boothId = boothRes.rows[0].id;
 
-    // 2. Find an available, empty slot in that booth, with a real-time check against Firebase.
-    const availableSlotsRes = await client.query(
-      "SELECT id, slot_identifier FROM booth_slots WHERE booth_id = $1 AND status = 'available' ORDER BY slot_identifier",
+    // 2. Find potential slots
+    const potentialSlotsRes = await client.query(
+      `
+      SELECT id, slot_identifier
+      FROM booth_slots
+      WHERE booth_id = $1
+        AND status = 'available'
+      ORDER BY slot_identifier ASC
+      `,
       [boothId]
     );
 
-    if (availableSlotsRes.rows.length === 0) {
-      throw new Error('No slots are marked as available for deposit at this booth.');
+    if (potentialSlotsRes.rows.length === 0) {
+      throw new Error('NO_AVAILABLE_SLOTS');
     }
 
     const db = getDatabase();
     let assignedSlot = null;
 
-    // Iterate through DB-available slots and perform a real-time check against Firebase.
-    for (const potentialSlot of availableSlotsRes.rows) {
-      const slotRef = db.ref(`booths/${boothUid}/slots/${potentialSlot.slot_identifier}`);
+    // 3. Verify + atomically reserve slot
+    for (const potentialSlot of potentialSlotsRes.rows) {
+      const slotRef = db.ref(
+        `booths/${boothUid}/slots/${potentialSlot.slot_identifier}`
+      );
       const snapshot = await slotRef.get();
 
       if (snapshot.exists()) {
-        const slotData = snapshot.val();
-        const telemetry = slotData.telemetry || {};
-
-        // A battery is present if both are true. This slot is not truly available.
-        if (telemetry.plugConnected === true && telemetry.batteryInserted === true) {
-          logger.warn(`Slot ${potentialSlot.slot_identifier} at booth ${boothUid} is marked 'available' in DB but has a battery according to Firebase. Skipping.`);
-          continue; // Skip to the next available slot.
+        const telemetry = snapshot.val()?.telemetry || {};
+        if (telemetry.plugConnected && telemetry.batteryInserted) {
+          continue;
         }
       }
-      // This slot is available in the DB and confirmed empty in Firebase. Assign it.
-      assignedSlot = potentialSlot;
-      break;
+
+      const slotReserveRes = await client.query(
+        `
+        UPDATE booth_slots
+        SET status = 'opening'
+        WHERE id = $1
+          AND status = 'available'
+        RETURNING id, slot_identifier
+        `,
+        [potentialSlot.id]
+      );
+
+      if (slotReserveRes.rowCount > 0) {
+        assignedSlot = slotReserveRes.rows[0];
+        break;
+      }
     }
 
     if (!assignedSlot) {
-      throw new Error('All available slots are currently occupied. Please try again later.');
+      throw new Error('NO_AVAILABLE_SLOTS');
     }
+
     const { id: slotId, slot_identifier: slotIdentifier } = assignedSlot;
 
-    // 3. Create a 'deposits' record to track this session
+    // 4. Issue hardware command
+    await db
+      .ref(`booths/${boothUid}/slots/${slotIdentifier}/command`)
+      .update({
+        openForDeposit: true,
+        openForCollection: false,
+      });
+
+    // 5. Create deposit session
     await client.query(
-      "INSERT INTO deposits (user_id, booth_id, slot_id, session_type, status) VALUES ($1, $2, $3, 'deposit', 'pending')",
+      `
+      INSERT INTO deposits (user_id, booth_id, slot_id, session_type, status)
+      VALUES ($1, $2, $3, 'deposit', 'opening')
+      `,
       [firebaseUid, boothId, slotId]
     );
 
-    // 4. Mark the slot as 'opening' to reserve it
-    await client.query("UPDATE booth_slots SET status = 'opening' WHERE id = $1", [slotId]);
-
-    // 5. Send the command to Firebase to open the door for deposit.
-    const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
-    await commandRef.update({
-      openForDeposit: true,
-      openForCollection: false // Ensure mutual exclusivity
-      // forceUnlock: true, // New command to simply unlock the door
-      // forceLock: false // Ensure mutual exclusivity
-    });
-
     await client.query('COMMIT');
 
-    logger.info(`Deposit session initiated for user '${firebaseUid}' at booth '${boothUid}', slot '${slotIdentifier}'.`);
-
-    // Return the slot information in the format the frontend expects.
-    res.status(200).json({
+    return res.status(200).json({
       slot: {
         identifier: slotIdentifier,
-        // Add other default/known properties of the slot if available
         status: 'opening',
-      }
+      },
     });
   } catch (error) {
     await client.query('ROLLBACK');
-    logger.error(`Failed to initiate deposit for user ${firebaseUid} at booth ${boothUid}:`, error);
-    res.status(500).json({ error: 'Failed to initiate deposit process.', details: error.message });
+
+    if (error.message === 'ACTIVE_SESSION_IN_PROGRESS') {
+      return res.status(409).json({
+        error: 'Active session in progress',
+        message: 'You already have a session in progress.',
+      });
+    }
+
+    if (error.message === 'PENDING_WITHDRAWAL_EXISTS') {
+      return res.status(409).json({
+        error: 'Pending withdrawal',
+        message: 'Complete or cancel the withdrawal before depositing.',
+      });
+    }
+
+    if (error.message === 'STALE_SESSION_CLEANED') {
+      return res.status(409).json({
+        error: 'Stale session cleaned',
+        message:
+          'We cleaned up a previous incomplete session. Please try again.',
+      });
+    }
+
+    if (error.message === 'NO_AVAILABLE_SLOTS' || error.message === 'BOOTH_NOT_AVAILABLE') {
+      const userMessage = error.message === 'NO_AVAILABLE_SLOTS'
+        ? 'All slots at this booth are currently occupied. Please try again later.'
+        : 'This booth is currently offline or does not exist.';
+      logger.warn(`Deposit initiation failed for user ${firebaseUid} at booth ${boothUid}: ${userMessage}`);
+      return res.status(409).json({ error: 'Booth not available', message: userMessage });
+    }
+
+    logger.error(
+      `Failed to initiate deposit for user ${firebaseUid} at booth ${boothUid}:`,
+      error
+    );
+
+    return res.status(500).json({
+      error: 'Failed to initiate deposit process',
+      details: error.message,
+    });
   } finally {
     client.release();
   }
@@ -268,36 +338,44 @@ router.get('/my-battery-status', verifyFirebaseToken, async (req, res) => {
  * POST /api/booths/initiate-withdrawal
  * Called by a user's app to start the collection of their charged battery.
  */
+/**
+ * POST /api/booths/initiate-withdrawal
+ */
 router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
-  const { uid: firebaseUid, phone_number: userPhone } = req.user;
-
+  const { uid: firebaseUid } = req.user;
   const pool = await poolPromise;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // --- Pre-check for existing sessions ---
-    // Check if the user already has a pending deposit or withdrawal.
-    const existingSessionRes = await client.query(
-      `SELECT 1 FROM deposits WHERE user_id = $1 AND status IN ('pending', 'in_progress')`,
+    // 🔧 FIX 1: Serialize per-user requests
+    await client.query(
+      'SELECT id FROM users WHERE user_id = $1 FOR UPDATE',
       [firebaseUid]
     );
-    if (existingSessionRes.rows.length > 0) {
-      await client.query('ROLLBACK'); // End the transaction before releasing
-      return res.status(409).json({
-        error: 'Active session exists.',
-        message: 'You already have an active session. Please complete or cancel it before starting a new withdrawal.'
-      });
-    }
-    // --- End of Pre-check ---
 
-    // 1. Find the user's battery and its location
+    const existingSessionRes = await client.query(
+      `
+      SELECT 1
+      FROM deposits
+      WHERE user_id = $1
+        AND status IN ('pending', 'opening', 'in_progress')
+      `,
+      [firebaseUid]
+    );
+
+    if (existingSessionRes.rows.length > 0) {
+      throw new Error('ACTIVE_SESSION_EXISTS');
+    }
+
+    /* -------------------------------------------------------
+     * 1. Find user's battery & slot
+     * ----------------------------------------------------- */
     const batteryQuery = `
       SELECT
-        -- Use the real-time charge level from the slot, not the stale one from the batteries table.
         s.charge_level_percent AS "chargeLevel",
         last_deposit.completed_at AS "depositCompletedAt",
-        bat.id AS "batteryId", -- Get the battery ID
+        bat.id AS "batteryId",
         last_deposit.initial_charge_level AS "initialCharge",
         s.id AS "slotId",
         s.slot_identifier AS "slotIdentifier",
@@ -307,100 +385,134 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
       JOIN booth_slots s ON d.slot_id = s.id
       JOIN batteries bat ON s.current_battery_id = bat.id
       JOIN booths bo ON s.booth_id = bo.id
-      -- Use a LATERAL JOIN to reliably find the single, most recent completed deposit for this user.
       CROSS JOIN LATERAL (
         SELECT dep.completed_at, dep.initial_charge_level
-        FROM deposits AS dep
-        WHERE dep.user_id = d.user_id AND dep.session_type = 'deposit' AND dep.status = 'completed'
-        ORDER BY dep.completed_at DESC LIMIT 1
+        FROM deposits dep
+        WHERE dep.user_id = d.user_id
+          AND dep.session_type = 'deposit'
+          AND dep.status = 'completed'
+        ORDER BY dep.completed_at DESC
+        LIMIT 1
       ) AS last_deposit
-      WHERE bat.user_id = $1 AND s.status = 'occupied'
+      WHERE bat.user_id = $1
+        AND s.status = 'occupied'
     `;
+
     const batteryRes = await client.query(batteryQuery, [firebaseUid]);
-    
 
     if (batteryRes.rows.length === 0) {
       throw new Error('You do not have a battery currently deposited.');
     }
-    const { chargeLevel: dbChargeLevel, initialCharge, batteryId, depositCompletedAt, slotId, slotIdentifier, boothId, boothUid } = batteryRes.rows[0];
 
-    // --- Real-time Data Fetch ---
-    // Fetch the most current SOC directly from Firebase to ensure accurate pricing.
+    const {
+      chargeLevel: dbChargeLevel,
+      initialCharge,
+      batteryId,
+      depositCompletedAt,
+      slotId,
+      slotIdentifier,
+      boothId,
+      boothUid,
+    } = batteryRes.rows[0];
+
+    /* -------------------------------------------------------
+     * 2. Real-time SOC fetch
+     * ----------------------------------------------------- */
     const db = getDatabase();
     const slotRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}`);
     const snapshot = await slotRef.get();
 
-    let chargeLevel = dbChargeLevel; // Fallback to DB value
+    let chargeLevel = dbChargeLevel;
     if (snapshot.exists() && snapshot.val().telemetry) {
-      chargeLevel = snapshot.val().telemetry.soc || chargeLevel;
+      chargeLevel = snapshot.val().telemetry.soc ?? chargeLevel;
     }
-    // --- End of Real-time Fetch ---
 
-    // 2. Calculate the cost
-    const settingsRes = await client.query("SELECT value FROM app_settings WHERE key = 'pricing'");
+    /* -------------------------------------------------------
+     * 3. Pricing
+     * ----------------------------------------------------- */
+    const settingsRes = await client.query(
+      "SELECT value FROM app_settings WHERE key = 'pricing'"
+    );
+
     if (settingsRes.rows.length === 0) {
       throw new Error('Pricing settings are not configured in the database.');
     }
+
     const pricingRules = settingsRes.rows[0].value;
     const baseSwapFee = pricingRules.base_swap_fee;
     const costPerChargePercent = pricingRules.cost_per_charge_percent;
-    const overtimePenaltyPerMin = pricingRules.overtime_penalty_per_minute;
-    const gracePeriodMinutes = pricingRules.grace_period_minutes || 0; // Default to 0 if not set
 
-    if (baseSwapFee === undefined || costPerChargePercent === undefined) {
-      throw new Error('Incomplete pricing settings. `base_swap_fee` and `cost_per_charge_percent` are required.');
-    }
+    const chargeAdded = Math.max(
+      0,
+      parseFloat(chargeLevel) - parseFloat(initialCharge)
+    );
 
-    // 3. Calculate duration and energy delivered
-    const chargeDurationMs = new Date() - new Date(depositCompletedAt);
-    const chargeDurationMinutes = Math.round(chargeDurationMs / 60000);
-    const chargeAdded = Math.max(0, parseFloat(chargeLevel) - parseFloat(initialCharge));
-    
-    // 4. Calculate the cost based on the minimum fee logic.
     const chargeComponent = chargeAdded * parseFloat(costPerChargePercent || 0);
-    // The cost is the greater of the base fee or the calculated charging cost.
-    const totalCost = parseFloat(Math.max(baseSwapFee, chargeComponent).toFixed(2));
+    const totalCost = parseFloat(
+      Math.max(baseSwapFee, chargeComponent).toFixed(2)
+    );
 
-    // 5. Create a withdrawal session record with the calculated cost.
+    /* -------------------------------------------------------
+     * 4. Create withdrawal session
+     * ----------------------------------------------------- */
     const sessionRes = await client.query(
-      "INSERT INTO deposits (user_id, booth_id, slot_id, battery_id, session_type, status, amount, initial_charge_level) VALUES ($1, $2, $3, $4, 'withdrawal', 'pending', $5, $6) RETURNING id",
+      `
+      INSERT INTO deposits
+        (user_id, booth_id, slot_id, battery_id, session_type, status, amount, initial_charge_level)
+      VALUES
+        ($1, $2, $3, $4, 'withdrawal', 'pending', $5, $6)
+      RETURNING id
+      `,
       [firebaseUid, boothId, slotId, batteryId, totalCost, chargeLevel]
     );
+
     const sessionId = sessionRes.rows[0].id;
 
-    // 5. Send command to Firebase to stop charging immediately.
-    // This freezes the charge level at the point of cost calculation.
-    // The door will only be unlocked after payment is confirmed.
-    // const db = getDatabase(); // db is already defined above
-    const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
-    await commandRef.update({ stopCharging: true, startCharging: false });
-
-
-    logger.info(`Sent 'stopCharging' command to ${slotIdentifier} at booth ${boothUid} upon withdrawal initiation for session ${sessionId}.`);
+    /* -------------------------------------------------------
+     * 5. Stop charging immediately
+     * ----------------------------------------------------- */
+    await db
+      .ref(`booths/${boothUid}/slots/${slotIdentifier}/command`)
+      .update({
+        stopCharging: true,
+        startCharging: false,
+      });
 
     await client.query('COMMIT');
 
-    // 7. Return the session ID and the calculated amount to the frontend.
-    // The STK push is NOT initiated here; it happens when the user confirms payment.
-    res.status(200).json({
+    return res.status(200).json({
       message: 'Withdrawal session created. Please confirm cost before payment.',
       sessionId: sessionId,
       amount: totalCost,
-      durationMinutes: chargeDurationMinutes,
-      costPerChargePercent: parseFloat(costPerChargePercent),
-      soc: parseFloat(chargeAdded),
+      soc: chargeAdded,
       initialCharge: parseFloat(initialCharge),
-      depositCompletedAt: depositCompletedAt
+      depositCompletedAt,
     });
   } catch (error) {
     await client.query('ROLLBACK');
-    console.log('Error initiating withdrawal:', error);
-    logger.error(`Failed to initiate withdrawal for user ${firebaseUid}:`, error);
-    res.status(500).json({ error: 'Failed to initiate withdrawal.', details: error.message });
+
+    if (error.message === 'ACTIVE_SESSION_EXISTS') {
+      return res.status(409).json({
+        error: 'Active session exists',
+        message:
+          'You already have an active session. Complete it before withdrawing.',
+      });
+    }
+
+    logger.error(
+      `Failed to initiate withdrawal for user ${firebaseUid}:`,
+      error
+    );
+
+    return res.status(500).json({
+      error: 'Failed to initiate withdrawal.',
+      details: error.message,
+    });
   } finally {
     client.release();
   }
 });
+
 
 /**
  * POST /api/booths/sessions/:sessionId/pay
@@ -602,41 +714,48 @@ router.get('/sessions/pending-withdrawal', verifyFirebaseToken, async (req, res)
  * @returns {Promise<boolean>} - True if the session was successfully updated, false otherwise.
  */
 async function completePaidWithdrawal(client, checkoutRequestId) {
-  // Atomically update the status from 'pending' to 'in_progress'.
-  // This prevents race conditions with the M-Pesa callback.
-  const updateResult = await client.query(
-    `UPDATE deposits d
-     SET status = 'in_progress'
-     FROM booth_slots s, booths b -- Joins to get the UIDs for the Firebase command
-     WHERE d.mpesa_checkout_id = $1
-       AND d.status = 'pending' -- This is the crucial part for idempotency
-       AND d.slot_id = s.id
-       AND s.booth_id = b.id
-     RETURNING b.booth_uid, s.slot_identifier;`,
-    [checkoutRequestId]
-  );
+  // Note: This function might be called from within an existing transaction (polling)
+  // or it might need to create its own (M-Pesa callback). We don't wrap it in BEGIN/COMMIT here.
+  try {
+    // 1. Find and lock the specific session row to prevent race conditions.
+    const sessionRes = await client.query(
+      `SELECT d.id, d.status, b.booth_uid, s.slot_identifier
+       FROM deposits d
+       JOIN booth_slots s ON d.slot_id = s.id
+       JOIN booths b ON s.booth_id = b.id
+       WHERE d.mpesa_checkout_id = $1 AND d.session_type = 'withdrawal'
+       FOR UPDATE;`,
+      [checkoutRequestId]
+    );
 
-  if (updateResult.rowCount > 0) {
-    // The session was successfully moved from 'pending' to 'in_progress'. Now send the command.
-    const { booth_uid: boothUid, slot_identifier: slotIdentifier } = updateResult.rows[0];
+    if (sessionRes.rowCount === 0 || sessionRes.rows[0].status !== 'pending') {
+      // If no session is found, or if it's not pending, it means it was already processed.
+      // This is the core of our idempotency check.
+      return false;
+    }
+
+    const { id: sessionId, booth_uid: boothUid, slot_identifier: slotIdentifier } = sessionRes.rows[0];
+
+    // 2. Atomically update the status from 'pending' to 'in_progress'.
+    await client.query("UPDATE deposits SET status = 'in_progress' WHERE id = $1", [sessionId]);
+
+    // 3. The session was successfully updated. Now send the hardware command.
     const db = getDatabase();
     const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
-    // Per IoT spec, stop charging before opening the door for collection.
     await commandRef.update({
       stopCharging: true,
-      startCharging: false, // Ensure mutual exclusivity
+      startCharging: false,
       openForCollection: true,
-      openForDeposit: false, // Ensure mutual exclusivity
-      // forceUnlock: false,
-      // forceLock: false
+      openForDeposit: false,
     });
 
-    logger.info(`Sent 'stopCharging' and 'openForCollection' commands to ${slotIdentifier} at booth ${boothUid} for checkout ID ${checkoutRequestId}.`);
+    logger.info(`Sent 'openForCollection' command to ${slotIdentifier} at booth ${boothUid} for checkout ID ${checkoutRequestId}.`);
     return true;
+  } catch (error) {
+    logger.error(`Error in completePaidWithdrawal for checkout ID ${checkoutRequestId}:`, error);
+    // Re-throw the error so the calling transaction can be rolled back.
+    throw error;
   }
-  // If rowCount is 0, it means the session was NOT in 'pending' status.
-  // This could be because it was already processed, or it was cancelled/failed due to a hardware ACK.
-  return false;
 }
 
 /**
