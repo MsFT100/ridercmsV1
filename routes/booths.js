@@ -175,48 +175,6 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (req, res) => {
 
     await client.query('COMMIT');
 
-    // // --- Development Simulation ---
-    // // If not in production, automatically simulate the hardware confirming the deposit.
-    // if (process.env.NODE_ENV !== 'production') {
-    //   try {
-    //     // Use a nested transaction for the simulation part.
-    //     await client.query('BEGIN');
-
-    //     // 1. Generate a random battery UID and charge level for the simulation.
-    //     const { v4: uuidv4 } = require('uuid');
-    //     const simulatedBatteryUid = `sim-user-${uuidv4().slice(0, 8)}`;
-    //     const simulatedChargeLevel = Math.floor(Math.random() * 80) + 10; // Random charge: 10-90%
-
-    //     // 2. Find the pending deposit session we just created.
-    //     const depositRes = await client.query("SELECT id FROM deposits WHERE user_id = $1 AND slot_id = $2 AND status = 'pending' AND session_type = 'deposit'", [firebaseUid, slotId]);
-    //     const depositId = depositRes.rows[0].id;
-
-    //     // 3. Upsert the simulated battery (create if new) and link to the user.
-    //     const upsertBatteryQuery = `
-    //       INSERT INTO batteries (battery_uid, user_id, charge_level_percent)
-    //       VALUES ($1, $2, $3)
-    //       ON CONFLICT (battery_uid) DO UPDATE SET user_id = $2, charge_level_percent = $3
-    //       RETURNING id;
-    //     `;
-    //     const batteryRes = await client.query(upsertBatteryQuery, [simulatedBatteryUid, firebaseUid, simulatedChargeLevel]);
-    //     const batteryId = batteryRes.rows[0].id;
-
-    //     // 4. Update the slot and complete the deposit record.
-    //     await client.query("UPDATE booth_slots SET status = 'occupied', current_battery_id = $1 WHERE id = $2", [batteryId, slotId]);
-    //     await client.query("UPDATE deposits SET status = 'completed', battery_id = $1, initial_charge_level = $2, completed_at = NOW() WHERE id = $3", [batteryId, simulatedChargeLevel, depositId]);
-
-    //     await client.query('COMMIT');
-    //     logger.info(`(SIMULATION) Deposit automatically confirmed for user '${firebaseUid}' with new battery '${simulatedBatteryUid}' in slot '${slotIdentifier}'.`);
-
-    //   } catch (simError) {
-    //     await client.query('ROLLBACK');
-    //     // Log the simulation error, but don't fail the main request,
-    //     // as the initial deposit session was already created successfully.
-    //     logger.error('(SIMULATION) Failed to auto-confirm deposit:', simError);
-    //   }
-    // }
-    // // --- End of Development Simulation ---
-
     logger.info(`Deposit session initiated for user '${firebaseUid}' at booth '${boothUid}', slot '${slotIdentifier}'.`);
 
     // Return the slot information in the format the frontend expects.
