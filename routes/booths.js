@@ -81,15 +81,35 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (req, res) => {
     );
 
     // 🔧 FIX 2: Include 'opening' as an active state
+    // Join with booth_slots to get the slot_identifier for the idempotency check.
     const existingSessionQuery = `
-      SELECT id, status, slot_id, session_type
-      FROM deposits
-      WHERE user_id = $1
-        AND status IN ('pending', 'opening', 'in_progress')
+      SELECT
+        d.id, d.status, d.slot_id, d.session_type,
+        s.slot_identifier
+      FROM deposits d
+      LEFT JOIN booth_slots s ON d.slot_id = s.id
+      WHERE d.user_id = $1
+        AND d.status IN ('pending', 'opening', 'in_progress')
+      ORDER BY d.created_at DESC -- Process the most recent session first
     `;
     const existingSessionRes = await client.query(existingSessionQuery, [firebaseUid]);
 
     for (const session of existingSessionRes.rows) {
+      // --- Robust Idempotency for Double-Clicks ---
+      // If an 'opening' deposit session exists from a previous tap, we don't just re-use it.
+      // We cancel it and proceed with the current request to find a fresh, verified slot.
+      // This prevents re-assigning a slot that may have become invalid.
+      if (session.status === 'opening' && session.session_type === 'deposit') {
+        logger.warn(`Cancelling stale 'opening' session ${session.id} for user ${firebaseUid} due to new deposit request.`);
+        await client.query("UPDATE deposits SET status = 'cancelled' WHERE id = $1", [session.id]);
+        if (session.slot_id) {
+          await client.query("UPDATE booth_slots SET status = 'available' WHERE id = $1", [session.slot_id]);
+        }
+        // By cancelling the old session, we allow the code to continue and find a new, valid slot.
+        // This is safer than re-using the old slot which might no longer be available.
+        continue; // Continue to the next check in the loop (or exit if this was the only one)
+      }
+
       if (session.status === 'in_progress') {
         throw new Error('ACTIVE_SESSION_IN_PROGRESS');
       }
@@ -211,6 +231,7 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (req, res) => {
 
     await client.query('COMMIT');
 
+    logger.info(`New deposit session initiated for user ${firebaseUid} at booth ${boothUid}, slot ${slotIdentifier}.`);
     return res.status(200).json({
       slot: {
         identifier: slotIdentifier,
