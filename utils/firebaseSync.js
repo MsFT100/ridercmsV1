@@ -14,7 +14,7 @@ function mapSlotStatus(firebaseStatus, currentDbStatus, devicePresent) {
   if (firebaseStatus === 'fault') return 'faulty';
   if (firebaseStatus === 'maintenance') return 'maintenance';
   if (currentDbStatus === 'opening' && devicePresent) return 'opening'; // Preserve 'opening' status until deposit is confirmed via ACK.
-  if (devicePresent) return 'occupied';
+  if (currentDbStatus === 'disabled') return 'disabled';
   return 'available';
 }
 
@@ -87,9 +87,7 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
     const telemetry = slotData.telemetry || {};
     console.log("Telemetry data for slot", slotIdentifier, ":", telemetry);
     // If a slot is administratively disabled, its status should not be changed by telemetry updates.
-    const status = currentDbStatus === 'disabled'
-      ? 'disabled'
-      : mapSlotStatus(slotData.status, currentDbStatus, slotData.devicePresent);
+    const status = mapSlotStatus(slotData.status, currentDbStatus, slotData.devicePresent);
     const doorStatus = mapDoorStatus(telemetry.doorClosed, telemetry.doorLocked);
     const chargeLevel = telemetry.soc || null;
 
