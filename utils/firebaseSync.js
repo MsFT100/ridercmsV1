@@ -87,7 +87,7 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
     const telemetry = slotData.telemetry || {};
     console.log("Telemetry data for slot", slotIdentifier, ":", telemetry);
     // If a slot is administratively disabled, its status should not be changed by telemetry updates.
-    const status = mapSlotStatus(slotData.status, currentDbStatus, slotData.devicePresent);
+    const status = currentDbStatus== 'disabled' ? 'disabled' : mapSlotStatus(slotData.status, currentDbStatus, slotData.devicePresent);
     const doorStatus = mapDoorStatus(telemetry.doorClosed, telemetry.doorLocked);
     const chargeLevel = telemetry.soc || null;
 
