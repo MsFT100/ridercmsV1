@@ -394,11 +394,18 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
       SELECT
         b.booth_uid, b.name, b.location_address, b.status, b.updated_at,
         s.slot_identifier,
-        u.name as user_name
+        u.name AS user_name
       FROM booths b
       LEFT JOIN booth_slots s ON b.id = s.booth_id
-      LEFT JOIN batteries bat ON s.current_battery_id = bat.id
-      LEFT JOIN users u ON bat.user_id = u.user_id
+      -- Use a lateral join to find the user from the most recent completed deposit in each slot.
+      LEFT JOIN LATERAL (
+        SELECT d.user_id
+        FROM deposits d
+        WHERE d.slot_id = s.id AND d.session_type = 'deposit' AND d.status = 'completed'
+        ORDER BY d.completed_at DESC
+        LIMIT 1
+      ) last_deposit ON true
+      LEFT JOIN users u ON last_deposit.user_id = u.user_id
       ORDER BY b.name, s.slot_identifier;
     `);
     const boothsFromDb = boothsResult.rows;
@@ -1145,10 +1152,17 @@ router.get('/booths/:boothUid', [verifyFirebaseToken, isAdmin], async (req, res)
         s.door_status,
         s.charge_level_percent,
         bat.battery_uid,
-        u.name as user_name
+        u.name AS user_name
       FROM booth_slots s
       LEFT JOIN batteries bat ON s.current_battery_id = bat.id
-      LEFT JOIN users u ON bat.user_id = u.user_id
+      LEFT JOIN LATERAL (
+        SELECT d.user_id
+        FROM deposits d
+        WHERE d.slot_id = s.id AND d.session_type = 'deposit' AND d.status = 'completed'
+        ORDER BY d.completed_at DESC
+        LIMIT 1
+      ) last_deposit ON true
+      LEFT JOIN users u ON last_deposit.user_id = u.user_id
       WHERE s.booth_id = $1
       ORDER BY s.slot_identifier ASC;
     `;

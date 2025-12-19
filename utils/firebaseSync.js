@@ -56,7 +56,7 @@ async function handleDepositCompletion(pgClient, boothUid, slotIdentifier, slotI
       completed_at = NOW()
     WHERE
       slot_id = $2
-      AND status = 'opening' -- The session must have been in an 'opening' state.
+      AND status IN ('opening', 'occupied') -- The session must have been in an 'opening' or 'occupied' state.
       AND session_type = 'deposit'
     RETURNING id;
   `;
@@ -152,20 +152,32 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
     // --- Telemetry-based Deposit Completion ---
     // This is our most reliable fallback. It triggers if a battery *was not* present before,
     // but *is* present now, and the door is secure. This detects the transition.
+    console.log("Current DB status for slot", slotIdentifier, ":", currentDbStatus);
+    if (currentDbStatus === 'opening') {
+      logger.debug(`[Deposit Check] slot: ${slotIdentifier}, currentDbStatus: ${currentDbStatus}, wasBatteryInserted: ${wasBatteryInserted}, batteryInserted: ${telemetry.batteryInserted}, doorClosed: ${telemetry.doorClosed}, doorLocked: ${telemetry.doorLocked}`);
+    }
+
+    // --- Telemetry-based Deposit Completion ---
+    // This triggers if a battery *was not* present before, but *is* present now,
+    // and the door is secure. It then attempts to complete any 'opening' deposit session.
     if (
       !wasBatteryInserted &&
       telemetry.batteryInserted === true &&
-      currentDbStatus === 'opening' &&
       telemetry.doorClosed === true &&
       telemetry.doorLocked === true
     ) {
       logger.info(`Telemetry transition indicates successful deposit for slot ${slotIdentifier}. Finalizing session.`);
-      await handleDepositCompletion(pgClient, boothUid, slotIdentifier, slotId, telemetry);
+      if (!await handleDepositCompletion(pgClient, boothUid, slotIdentifier, slotId, telemetry)) {
+        logger.debug(`Telemetry transition for deposit detected for ${slotIdentifier}, but no 'opening' or 'occupied' session found to complete.`);
+      }
     }
-
     // --- Telemetry-based Withdrawal Completion ---
     // This is a fallback for a missed 'collection_complete' ACK. It triggers if a battery
     // *was* present before, but *is not* present now, and the door is secure (closed again).
+    if (currentDbStatus === 'occupied') {
+      logger.debug(`[Withdrawal Check] slot: ${slotIdentifier}, currentDbStatus: ${currentDbStatus}, wasBatteryInserted: ${wasBatteryInserted}, batteryInserted: ${telemetry.batteryInserted}, doorClosed: ${telemetry.doorClosed}, doorLocked: ${telemetry.doorLocked}`);
+    }
+
     if (
       wasBatteryInserted &&
       telemetry.batteryInserted === false &&
