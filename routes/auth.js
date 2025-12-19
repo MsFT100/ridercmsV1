@@ -307,15 +307,18 @@ router.get('/profile', verifyFirebaseToken, async (req, res) => {
 
     // --- Check for an active battery session (consistent with login) ---
     const batteryQuery = `
+      -- Find the user's "deposit credit" - a completed deposit session
+      -- that has not yet been redeemed by a withdrawal.
       SELECT
-        b.battery_uid as "batteryUid",
+        bat.battery_uid as "batteryUid",
         s.charge_level_percent as "chargeLevel",
         bo.booth_uid AS "boothUid",
         s.slot_identifier AS "slotIdentifier"
-      FROM batteries b
-      LEFT JOIN booth_slots s ON b.id = s.current_battery_id
-      LEFT JOIN booths bo ON s.booth_id = bo.id
-      WHERE b.user_id = $1
+      FROM deposits d
+      JOIN booth_slots s ON d.slot_id = s.id
+      JOIN booths bo ON d.booth_id = bo.id
+      LEFT JOIN batteries bat ON s.current_battery_id = bat.id
+      WHERE d.user_id = $1 AND d.session_type = 'deposit' AND d.status = 'completed';
     `;
     const batteryRes = await pgClient.query(batteryQuery, [uid]);
 

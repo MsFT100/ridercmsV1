@@ -68,7 +68,6 @@ const initializeDatabase = async () => {
       CREATE TABLE IF NOT EXISTS batteries (
         id SERIAL PRIMARY KEY,
         battery_uid VARCHAR(100) UNIQUE NOT NULL, -- A unique serial number for the battery
-        user_id VARCHAR(255) REFERENCES users(user_id) ON DELETE SET NULL, -- Track the owner
         charge_level_percent INT DEFAULT 100 CHECK (charge_level_percent BETWEEN 0 AND 100),
         health_status VARCHAR(50) NOT NULL DEFAULT 'good' CHECK (health_status IN ('good', 'degraded', 'faulty')),
         created_at TIMESTAMPTZ DEFAULT NOW(),
@@ -98,15 +97,16 @@ const initializeDatabase = async () => {
     const createDepositsTableQuery = `
       CREATE TABLE IF NOT EXISTS deposits (
         id SERIAL PRIMARY KEY,
-        user_id VARCHAR(255) NOT NULL, -- Firebase UID of the user
+        user_id VARCHAR(255) NOT NULL REFERENCES users(user_id) ON DELETE CASCADE, -- Firebase UID of the user
         booth_id INT NOT NULL REFERENCES booths(id),
         slot_id INT NOT NULL REFERENCES booth_slots(id),
         battery_id INT REFERENCES batteries(id) ON DELETE SET NULL,
+        consumed_deposit_id INT REFERENCES deposits(id) ON DELETE SET NULL, -- Links a withdrawal to the deposit it consumes
         session_type VARCHAR(20) NOT NULL CHECK (session_type IN ('deposit', 'withdrawal')),
         initial_charge_level INT, -- Stored on deposit
         amount DECIMAL(10, 2) NOT NULL DEFAULT 0.00, -- Amount charged for the session
         mpesa_checkout_id VARCHAR(255) UNIQUE, -- For tracking payment status
-        status VARCHAR(50) NOT NULL CHECK (status IN ('pending', 'opening', 'in_progress', 'completed', 'failed', 'cancelled')),
+        status VARCHAR(50) NOT NULL CHECK (status IN ('pending', 'opening', 'in_progress', 'completed', 'failed', 'cancelled', 'redeemed')),
         started_at TIMESTAMPTZ DEFAULT NOW(),
         completed_at TIMESTAMPTZ,
         notes TEXT, -- For logging reasons for state changes (e.g., auto-cancellation)
@@ -161,17 +161,60 @@ const initializeDatabase = async () => {
     await client.query(createProblemReportsTableQuery);
 
     // --- Schema Alterations for existing databases (Idempotent) ---
-    // Add 'notes' column to 'deposits' table if it doesn't exist.
-    const checkNotesColumnQuery = `
-      SELECT 1 FROM information_schema.columns
-      WHERE table_name='deposits' AND column_name='notes';
-    `;
-    const { rows } = await client.query(checkNotesColumnQuery);
-    if (rows.length === 0) {
-      await client.query('ALTER TABLE deposits ADD COLUMN notes TEXT;');
-      logger.info("Added 'notes' column to 'deposits' table.");
+    const runAlteration = async (tableName, columnName, alterationSql, description) => {
+      const checkColumnQuery = `
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name=$1 AND column_name=$2;
+      `;
+      const { rows } = await client.query(checkColumnQuery, [tableName, columnName]);
+      if (rows.length === 0) {
+        await client.query(alterationSql);
+        logger.info(description);
+      }
+    };
+
+    // Add 'notes' column to 'deposits'
+    await runAlteration('deposits', 'notes', 'ALTER TABLE deposits ADD COLUMN notes TEXT;', "Added 'notes' column to 'deposits' table.");
+
+    // Add 'consumed_deposit_id' column to 'deposits'
+    await runAlteration(
+      'deposits',
+      'consumed_deposit_id',
+      'ALTER TABLE deposits ADD COLUMN consumed_deposit_id INT REFERENCES deposits(id) ON DELETE SET NULL;',
+      "Added 'consumed_deposit_id' column to 'deposits' table."
+    );
+
+    // Add 'redeemed' to the status check constraint on 'deposits'
+    const checkConstraintRes = await client.query("SELECT 1 FROM pg_constraint WHERE conname = 'deposits_status_check' AND conrelid = 'deposits'::regclass AND pg_get_constraintdef(oid) LIKE '%redeemed%';");
+    if (checkConstraintRes.rowCount === 0) {
+      await client.query("ALTER TABLE deposits DROP CONSTRAINT deposits_status_check;");
+      await client.query("ALTER TABLE deposits ADD CONSTRAINT deposits_status_check CHECK (status IN ('pending', 'opening', 'in_progress', 'completed', 'failed', 'cancelled', 'redeemed'));");
+      logger.info("Updated 'deposits.status' CHECK constraint to include 'redeemed'.");
     }
-    
+
+    // Add foreign key from deposits.user_id to users.user_id
+    const fkRes = await client.query("SELECT 1 FROM pg_constraint WHERE conname = 'deposits_user_id_fkey';");
+    if (fkRes.rowCount === 0) {
+      // Before adding the constraint, we must clean up any orphan deposit records
+      // where the user_id does not exist in the users table.
+      const cleanupQuery = `
+        DELETE FROM deposits
+        WHERE user_id NOT IN (SELECT user_id FROM users);
+      `;
+      const cleanupResult = await client.query(cleanupQuery);
+      if (cleanupResult.rowCount > 0) {
+        logger.warn(`Cleaned up ${cleanupResult.rowCount} orphan deposit records before adding foreign key.`);
+      }
+      await client.query("ALTER TABLE deposits ADD CONSTRAINT deposits_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE;");
+      logger.info("Added foreign key constraint from 'deposits.user_id' to 'users.user_id'.");
+    }
+
+    // Remove user_id from batteries table if it exists
+    const batteryUserColRes = await client.query("SELECT 1 FROM information_schema.columns WHERE table_name='batteries' AND column_name='user_id';");
+    if (batteryUserColRes.rowCount > 0) {
+      await client.query("ALTER TABLE batteries DROP COLUMN user_id;");
+      logger.info("Removed obsolete 'user_id' column from 'batteries' table.");
+    }
 
     const createUpdateTimestampFunction = `
       CREATE OR REPLACE FUNCTION update_updated_at_column()

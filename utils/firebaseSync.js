@@ -38,17 +38,98 @@ function mapDoorStatus(doorClosed, doorLocked) {
 }
 
 /**
+ * A robust function to find and complete a deposit session.
+ * This can be triggered by telemetry changes or an explicit ACK from the hardware.
+ * @param {object} pgClient - The active PostgreSQL client.
+ * @param {string} boothUid - The UID of the booth.
+ * @param {string} slotIdentifier - The identifier of the slot.
+ * @param {number} slotId - The primary key of the slot in the database.
+ * @param {object} telemetry - The latest telemetry data for the slot.
+ */
+async function handleDepositCompletion(pgClient, boothUid, slotIdentifier, slotId, telemetry) {
+  const chargeLevel = telemetry.soc || null;
+  const findAndUpdateDepositQuery = `
+    UPDATE deposits
+    SET
+      status = 'completed',
+      initial_charge_level = $1,
+      completed_at = NOW()
+    WHERE
+      slot_id = $2
+      AND status = 'opening' -- The session must have been in an 'opening' state.
+      AND session_type = 'deposit'
+    RETURNING id;
+  `;
+  const depositUpdateResult = await pgClient.query(findAndUpdateDepositQuery, [chargeLevel, slotId]);
+
+  if (depositUpdateResult.rowCount > 0) {
+    const depositId = depositUpdateResult.rows[0].id;
+    logger.info(`Deposit session ${depositId} for slot ${slotIdentifier} completed with initial charge ${chargeLevel}%.`);
+
+    // Automatically send command to start charging the newly deposited battery.
+    const db = getDatabase();
+    const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
+    await commandRef.update({
+      startCharging: true,
+      stopCharging: false // Ensure mutual exclusivity
+    });
+    logger.info(`Sent 'startCharging' command to ${slotIdentifier} at booth ${boothUid} after deposit completion.`);
+    return true; // Indicate that a session was completed.
+  }
+  return false; // No session was completed.
+}
+
+/**
+ * A robust function to find and complete a withdrawal session.
+ * This can be triggered by telemetry changes or an explicit ACK from the hardware.
+ * @param {object} pgClient - The active PostgreSQL client.
+ * @param {string} slotIdentifier - The identifier of the slot.
+ * @param {number} slotId - The primary key of the slot in the database.
+ */
+async function handleWithdrawalCompletion(pgClient, slotIdentifier, slotId) {
+  const findAndUpdateWithdrawalQuery = `
+    WITH updated_deposit AS (
+      UPDATE deposits
+      SET
+        status = 'completed',
+        completed_at = NOW()
+      WHERE slot_id = $1
+        AND status = 'in_progress' -- The session must have been paid for.
+        AND session_type = 'withdrawal'
+      RETURNING id, user_id, consumed_deposit_id
+    )
+    -- Mark the original deposit as 'redeemed' so it can't be used again.
+    UPDATE deposits
+    SET status = 'redeemed'
+    WHERE id = (SELECT consumed_deposit_id FROM updated_deposit)
+    RETURNING (SELECT id FROM updated_deposit) as id, (SELECT user_id FROM updated_deposit) as user_id;
+  `;
+  const withdrawalUpdateResult = await pgClient.query(findAndUpdateWithdrawalQuery, [slotId]);
+
+  if (withdrawalUpdateResult.rowCount > 0) {
+    const { id: sessionId, user_id: userId } = withdrawalUpdateResult.rows[0];
+    logger.info(`Withdrawal session ${sessionId} for user ${userId} successfully completed for slot ${slotIdentifier}.`);
+    return true; // Indicate that a session was completed.
+  }
+  return false; // No session was completed.
+}
+
+/**
  * Processes a single slot's data from a Firebase snapshot and updates the PostgreSQL database.
  * @param {string} boothUid - The UID of the booth (e.g., 'booth001').
  * @param {string} slotIdentifier - The identifier for the slot (e.g., 'slot001').
  * @param {object} slotData - The data object for the slot from Firebase.
  */
 async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
+  // Get the state of the slot *before* this change from our cache.
+  const slotBefore = boothStateCache[boothUid]?.slots?.[slotIdentifier];
+
   const dbPool = await pool;
   const pgClient = await dbPool.connect();
   let slotId = null;
   try {
     // First, get the current status of the slot from our database.
+    // This is essential for state-based logic.
     // This is crucial for the mapSlotStatus function to make an intelligent decision.
     const currentSlotStateQuery = `
       SELECT s.id, s.status
@@ -66,42 +147,36 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
 
     // Correctly read telemetry data, providing default values if telemetry is missing.
     const telemetry = slotData.telemetry || {};
-    const chargeLevel = telemetry.soc || null;
+    const wasBatteryInserted = slotBefore?.telemetry?.batteryInserted === true;
 
-    // --- Logic to complete a deposit session based on telemetry state change ---
-    // This provides resilience if the 'deposit_accepted' ACK is missed.
-    // We check if the slot was 'opening' and is now physically secured with a battery.
-    // This check MUST happen *before* we update the slot status in the DB.
+    // --- Telemetry-based Deposit Completion ---
+    // This is our most reliable fallback. It triggers if a battery *was not* present before,
+    // but *is* present now, and the door is secure. This detects the transition.
     if (
+      !wasBatteryInserted &&
+      telemetry.batteryInserted === true &&
       currentDbStatus === 'opening' &&
       telemetry.doorClosed === true &&
-      telemetry.doorLocked === true &&
-      telemetry.plugConnected === true
+      telemetry.doorLocked === true
     ) {
-      logger.info(`Telemetry indicates successful deposit for slot ${slotIdentifier}. Finalizing deposit session.`);
-      try {
-        const findAndUpdateDepositQuery = `
-          UPDATE deposits
-          SET
-            status = 'completed',
-            initial_charge_level = $1,
-            completed_at = NOW()
-          WHERE
-            slot_id = $2
-            AND status = 'opening' -- The session was initiated and door was opening
-            AND session_type = 'deposit'
-          RETURNING id;
-        `;
-        const depositUpdateResult = await pgClient.query(findAndUpdateDepositQuery, [chargeLevel, slotId]);
-
-        if (depositUpdateResult.rowCount > 0) {
-          const depositId = depositUpdateResult.rows[0].id;
-          logger.info(`Deposit session ${depositId} completed for slot ${slotIdentifier} via telemetry state change.`);
-        }
-      } catch (dbError) {
-        logger.error(`Failed to finalize deposit session in DB for slot ${slotIdentifier} via telemetry:`, dbError);
-      }
+      logger.info(`Telemetry transition indicates successful deposit for slot ${slotIdentifier}. Finalizing session.`);
+      await handleDepositCompletion(pgClient, boothUid, slotIdentifier, slotId, telemetry);
     }
+
+    // --- Telemetry-based Withdrawal Completion ---
+    // This is a fallback for a missed 'collection_complete' ACK. It triggers if a battery
+    // *was* present before, but *is not* present now, and the door is secure (closed again).
+    if (
+      wasBatteryInserted &&
+      telemetry.batteryInserted === false &&
+      currentDbStatus === 'occupied' && // The slot was occupied before this sync
+      telemetry.doorClosed === true &&
+      telemetry.doorLocked === true
+    ) {
+      logger.info(`Telemetry transition indicates successful withdrawal for slot ${slotIdentifier}. Finalizing session.`);
+      await handleWithdrawalCompletion(pgClient, slotIdentifier, slotId);
+    }
+
     // --- End of telemetry-based deposit completion logic ---
 
     // The main query to insert or update a booth_slot.
@@ -134,6 +209,7 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
     // If a slot is administratively disabled, its status should not be changed by telemetry updates.
     const status = currentDbStatus== 'disabled' ? 'disabled' : mapSlotStatus(slotData.status, currentDbStatus, telemetry.batteryInserted);
     const doorStatus = mapDoorStatus(telemetry.doorClosed, telemetry.doorLocked);
+    const chargeLevel = telemetry.soc || null;
 
     const result = await pgClient.query(upsertQuery, [
       boothUid,
@@ -165,28 +241,9 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
           // This is the definitive signal that a user has taken their battery.
           logger.info(`Received 'collection_complete' ACK for slot ${slotIdentifier}. Finalizing withdrawal session.`);
           try {
-            const findAndUpdateWithdrawalQuery = `
-              WITH updated_deposit AS (
-                UPDATE deposits
-                SET
-                  status = 'completed',
-                  completed_at = NOW()
-                WHERE
-                  slot_id = $1
-                  AND status = 'in_progress' -- The session must have been paid for
-                  AND session_type = 'withdrawal'
-                RETURNING id, battery_id, user_id
-              )
-              UPDATE batteries
-              SET user_id = NULL -- Disassociate the battery from the user
-              WHERE id = (SELECT battery_id FROM updated_deposit)
-              RETURNING (SELECT id FROM updated_deposit), (SELECT user_id FROM updated_deposit);
-            `;
-            const withdrawalUpdateResult = await pgClient.query(findAndUpdateWithdrawalQuery, [slotId]);
-
-            if (withdrawalUpdateResult.rowCount > 0) {
-              const { id: depositId, user_id: userId } = withdrawalUpdateResult.rows[0];
-              logger.info(`Withdrawal session ${depositId} for user ${userId} successfully completed for slot ${slotIdentifier}.`);
+            // Use the centralized handler
+            if (!await handleWithdrawalCompletion(pgClient, slotIdentifier, slotId)) {
+              logger.warn(`'collection_complete' ACK for ${slotIdentifier} received, but no 'in_progress' session was found to complete.`);
             }
           } catch (dbError) {
             logger.error(`Failed to finalize withdrawal session in DB for slot ${slotIdentifier} after 'collection_complete' ACK:`, dbError);
@@ -198,33 +255,8 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
           // This is the definitive signal that a user has successfully deposited a battery.
           logger.info(`Received 'deposit_accepted' ACK for slot ${slotIdentifier}. Finalizing deposit session.`);
           try {
-            const findAndUpdateDepositQuery = ` 
-              UPDATE deposits
-              SET
-                status = 'completed',
-                initial_charge_level = $1,
-                completed_at = NOW()
-              WHERE
-                slot_id = $2
-                AND status = 'opening' -- The session was initiated and door was opening
-                AND session_type = 'deposit'
-              RETURNING id;
-            `;
-            const depositUpdateResult = await pgClient.query(findAndUpdateDepositQuery, [chargeLevel, slotId]);
-
-            if (depositUpdateResult.rowCount > 0) {
-              const depositId = depositUpdateResult.rows[0].id;
-              logger.info(`Deposit session ${depositId} completed for slot ${slotIdentifier} with initial charge ${chargeLevel}%.`);
-
-              // Automatically send command to start charging the newly deposited battery.
-              const db = getDatabase();
-              const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
-              await commandRef.update({
-                startCharging: true,
-                stopCharging: false // Ensure mutual exclusivity
-              });
-              logger.info(`Sent 'startCharging' command to ${slotIdentifier} at booth ${boothUid} after 'deposit_accepted' ACK.`);
-
+            if (!await handleDepositCompletion(pgClient, boothUid, slotIdentifier, slotId, telemetry)) {
+              logger.warn(`'deposit_accepted' ACK for ${slotIdentifier} received, but no 'opening' session was found to complete.`);
             }
           } catch (dbError) {
             logger.error(`Failed to finalize deposit session in DB for slot ${slotIdentifier} after 'deposit_accepted' ACK:`, dbError);
@@ -293,26 +325,38 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
   }
 }
 
+// In-memory cache to hold the last known state of each booth.
+const boothStateCache = {};
+
 /**
  * Initializes the Firebase listener for the 'booths' path.
  */
 function initializeFirebaseSync() {
   const db = getDatabase();
   const boothsRef = db.ref('booths');
-
+  
   logger.info('Initializing Firebase Realtime Database sync for /booths...');
+
+  // 1. Initial data load to populate the cache.
+  boothsRef.once('value', (snapshot) => {
+    Object.assign(boothStateCache, snapshot.val());
+    logger.info('Firebase listener cache populated with initial booth states.');
+  });
 
   // Listen for changes to any child under the 'booths' path.
   boothsRef.on('child_changed', (boothSnapshot) => {
     const boothUid = boothSnapshot.key;
-    const boothData = boothSnapshot.val();
+    const boothAfter = boothSnapshot.val();
 
-    if (boothData && boothData.slots) {
+    if (boothAfter && boothAfter.slots) {
       // Iterate over each slot within the changed booth and process its update.
-      Object.entries(boothData.slots).forEach(([slotIdentifier, slotData]) => {
+      Object.entries(boothAfter.slots).forEach(([slotIdentifier, slotData]) => {
         processSlotUpdate(boothUid, slotIdentifier, slotData);
       });
     }
+
+    // CRITICAL: Update the cache with the new state *after* processing all slots.
+    boothStateCache[boothUid] = boothAfter;
   });
 }
 

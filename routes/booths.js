@@ -301,21 +301,21 @@ router.get('/my-battery-status', verifyFirebaseToken, async (req, res) => {
   const client = await pool.connect();
   try {
     // 1. Find where the user's battery is located from our database.
-    // This query now correctly finds the last successful deposit session for the user
-    // that has not yet been part of a completed withdrawal. This ignores any cancelled or failed sessions.
+    // This query finds the user's "deposit credit" - a completed deposit session
+    // that has not yet been redeemed by a withdrawal.
     const locationQuery = `
       SELECT
         bo.booth_uid AS "boothUid",
         s.id AS "slotId",
         s.slot_identifier AS "slotIdentifier",
         s.charge_level_percent AS "lastKnownChargeLevel",
-        'deposited' AS "sessionStatus" -- The status is implicitly 'deposited' if found
-      FROM batteries bat
-      JOIN booth_slots s ON bat.id = s.current_battery_id
+        d.status AS "sessionStatus" -- Will be 'completed'
+      FROM deposits d
+      JOIN booth_slots s ON d.slot_id = s.id
       JOIN booths bo ON s.booth_id = bo.id
-      WHERE bat.user_id = $1
-        AND s.status = 'occupied'
-      LIMIT 1;
+      WHERE d.user_id = $1
+        AND d.session_type = 'deposit'
+        AND d.status = 'completed'; -- 'completed' means deposited, 'redeemed' means withdrawn against.
     `;
     const locationResult = await client.query(locationQuery, [firebaseUid]);
 
@@ -398,30 +398,23 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
      * 1. Find user's battery & slot
      * ----------------------------------------------------- */
     const batteryQuery = `
+      -- Find the user's "deposit credit" and the details of the battery they deposited.
+      -- This credit is a completed deposit session that hasn't been redeemed by a withdrawal.
       SELECT
-        s.charge_level_percent AS "chargeLevel",
-        last_deposit.completed_at AS "depositCompletedAt",
-        bat.id AS "batteryId",
-        last_deposit.initial_charge_level AS "initialCharge",
+        d.id as "depositCreditId",
+        d.completed_at AS "depositCompletedAt",
+        d.initial_charge_level AS "initialCharge",
         s.id AS "slotId",
         s.slot_identifier AS "slotIdentifier",
-        bo.id AS "boothId",
-        bo.booth_uid AS "boothUid"
+        s.charge_level_percent AS "chargeLevel",
+        b.id AS "boothId",
+        b.booth_uid AS "boothUid"
       FROM deposits d
       JOIN booth_slots s ON d.slot_id = s.id
-      JOIN batteries bat ON s.current_battery_id = bat.id
-      JOIN booths bo ON s.booth_id = bo.id
-      CROSS JOIN LATERAL (
-        SELECT dep.completed_at, dep.initial_charge_level
-        FROM deposits dep
-        WHERE dep.user_id = d.user_id
-          AND dep.session_type = 'deposit'
-          AND dep.status = 'completed'
-        ORDER BY dep.completed_at DESC
-        LIMIT 1
-      ) AS last_deposit
-      WHERE bat.user_id = $1
-        AND s.status = 'occupied'
+      JOIN booths b ON d.booth_id = b.id
+      WHERE d.user_id = $1
+        AND d.session_type = 'deposit'
+        AND d.status = 'completed'; -- 'completed' means deposited, 'redeemed' means withdrawn against.
     `;
 
     const batteryRes = await client.query(batteryQuery, [firebaseUid]);
@@ -432,14 +425,18 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
 
     const {
       chargeLevel: dbChargeLevel,
-      initialCharge,
-      batteryId,
+      depositCreditId,
       depositCompletedAt,
       slotId,
       slotIdentifier,
       boothId,
       boothUid,
     } = batteryRes.rows[0];
+
+    // For pricing, we need the initial charge of the battery the user is about to take, not the one they deposited.
+    // We'll fetch this from the slot they are withdrawing from.
+    const initialChargeRes = await client.query('SELECT initial_charge_level FROM deposits WHERE slot_id = $1 AND session_type = \'deposit\' AND status = \'completed\' ORDER BY completed_at DESC LIMIT 1', [slotId]);
+    const initialCharge = initialChargeRes.rows.length > 0 ? initialChargeRes.rows[0].initial_charge_level : 0;
 
     /* -------------------------------------------------------
      * 2. Real-time SOC fetch
@@ -484,12 +481,12 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
     const sessionRes = await client.query(
       `
       INSERT INTO deposits
-        (user_id, booth_id, slot_id, battery_id, session_type, status, amount, initial_charge_level)
+        (user_id, booth_id, slot_id, session_type, status, amount, initial_charge_level, consumed_deposit_id)
       VALUES
-        ($1, $2, $3, $4, 'withdrawal', 'pending', $5, $6)
+        ($1, $2, $3, 'withdrawal', 'pending', $4, $5, $6)
       RETURNING id
       `,
-      [firebaseUid, boothId, slotId, batteryId, totalCost, chargeLevel]
+      [firebaseUid, boothId, slotId, totalCost, chargeLevel, depositCreditId]
     );
 
     const sessionId = sessionRes.rows[0].id;
