@@ -2014,4 +2014,64 @@ router.delete('/sessions/:sessionId', [verifyFirebaseToken, isAdmin], async (req
   }
 });
 
+/**
+ * POST /api/admin/sessions/cleanup
+ * @summary (System Task) Clean up old, stuck sessions.
+ * @description Finds and resolves sessions that have been stuck in a transient state for too long (e.g., 'in_progress' for more than 5 minutes). This is intended to be called by a scheduled task (cron job).
+ * @tags [Admin, System]
+ * @security
+ *   - bearerAuth: []
+ * @responses
+ *   200:
+ *     description: Cleanup task completed.
+ *   500:
+ *     description: Internal server error.
+ */
+router.post('/sessions/cleanup', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  // This logic is designed to be idempotent.
+  const STUCK_SESSION_TIMEOUT_MINUTES = 5;
+  const pool = await poolPromise;
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    // --- Find stuck 'in_progress' withdrawal sessions ---
+    const stuckWithdrawalsQuery = `
+      SELECT id, slot_id, user_id
+      FROM deposits
+      WHERE
+        session_type = 'withdrawal'
+        AND status = 'in_progress'
+        AND updated_at < NOW() - INTERVAL '${STUCK_SESSION_TIMEOUT_MINUTES} minutes'
+      FOR UPDATE; -- Lock the rows to prevent race conditions
+    `;
+    const stuckWithdrawalsRes = await client.query(stuckWithdrawalsQuery);
+
+    if (stuckWithdrawalsRes.rowCount > 0) {
+      logger.info(`Found ${stuckWithdrawalsRes.rowCount} stuck 'in_progress' withdrawal session(s) to clean up.`);
+
+      // We need the handleWithdrawalCompletion function from firebaseSync.js
+      // This is a bit of a workaround to avoid circular dependencies.
+      const { handleWithdrawalCompletion } = require('../utils/firebaseSync.js');
+
+      for (const session of stuckWithdrawalsRes.rows) {
+        logger.info(`Auto-completing stuck withdrawal session ${session.id} for user ${session.user_id}.`);
+        await handleWithdrawalCompletion(client, `slot_id_${session.slot_id}`, session.slot_id);
+      }
+    }
+
+    // You could add more cleanup logic here for other stuck states, like 'opening'.
+
+    await client.query('COMMIT');
+    res.status(200).json({ message: 'Cleanup task completed.', cleaned: stuckWithdrawalsRes.rowCount });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    logger.error('Failed to run session cleanup task:', error);
+    res.status(500).json({ error: 'Failed to run session cleanup task.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 module.exports = router;

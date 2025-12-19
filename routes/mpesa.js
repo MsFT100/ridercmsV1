@@ -2,17 +2,7 @@ const { Router } = require('express');
 const logger = require('../utils/logger');
 const { getMpesaIpWhitelist } = require('../utils/mpesa');
 const poolPromise = require('../db');
-
-// This function is defined in booths.js but we need its signature here for clarity.
-// We can't import it directly due to circular dependency issues.
-/**
- * @typedef {import('./booths.js').completePaidWithdrawal} completePaidWithdrawal
- * async function completePaidWithdrawal(client, checkoutRequestId) { ... }
- */
-
-// A bit of a workaround to avoid circular dependencies. We will require it inside the function.
-// A better long-term solution might be to move shared functions to a separate module.
-let completePaidWithdrawalFn;
+const { completePaidWithdrawal } = require('../utils/sessionUtils');
 
 const router = Router();
 
@@ -83,11 +73,7 @@ router.post('/callback', async (req, res) => {
 
     // 3️⃣ Successful payment
     if (stkCallback.ResultCode === 0) {
-      if (!completePaidWithdrawalFn) {
-        completePaidWithdrawalFn = require('./booths.js').completePaidWithdrawal;
-      }
-
-      await completePaidWithdrawalFn(client, checkoutRequestId);
+      await completePaidWithdrawal(client, checkoutRequestId);
 
       logger.info(`Payment confirmed for ${checkoutRequestId}`);
     } else {
