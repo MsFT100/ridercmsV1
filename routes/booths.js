@@ -110,6 +110,11 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (req, res) => {
         continue; // Continue to the next check in the loop (or exit if this was the only one)
       }
 
+      // If a deposit is 'opening', but the user is trying to start another one,
+      // it implies the first attempt failed without the app knowing. Block it.
+      if (session.status === 'opening' && session.session_type === 'deposit') {
+        throw new Error('ACTIVE_SESSION_IN_PROGRESS');
+      }
       if (session.status === 'in_progress') {
         throw new Error('ACTIVE_SESSION_IN_PROGRESS');
       }

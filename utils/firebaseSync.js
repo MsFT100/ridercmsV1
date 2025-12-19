@@ -4,17 +4,24 @@ const logger = require('./logger');
 
 /**
  * Maps the status from Firebase to the corresponding status in the PostgreSQL enum.
- * @param {string} firebaseStatus - The status from the Firebase slot data (e.g., 'booting', 'available').
+ * @param {string} firebaseStatus - The overall status from the Firebase slot data (e.g., 'booting', 'available').
  * @param {string} currentDbStatus - The current status of the slot in the database.
- * @param {boolean} devicePresent - Whether a device is present in the slot.
+ * @param {boolean} batteryInserted - From telemetry, indicates if a battery is physically present.
  * @returns {string} The corresponding PostgreSQL status.
  */
-function mapSlotStatus(firebaseStatus, currentDbStatus, devicePresent) {
+function mapSlotStatus(firebaseStatus, currentDbStatus, batteryInserted) {
   // This mapping can be expanded as more states are defined in the IoT device firmware.
   if (firebaseStatus === 'fault') return 'faulty';
   if (firebaseStatus === 'maintenance') return 'maintenance';
-  if (currentDbStatus === 'opening' && devicePresent) return 'opening'; // Preserve 'opening' status until deposit is confirmed via ACK.
   if (currentDbStatus === 'disabled') return 'disabled';
+
+  // If a battery is physically present, the slot should be considered 'occupied'
+  // unless it's in a transient 'opening' state for a deposit.
+  if (batteryInserted) {
+    return currentDbStatus === 'opening' ? 'opening' : 'occupied';
+  }
+
+  // If no battery is present, it's available.
   return 'available';
 }
 
@@ -57,6 +64,46 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
     const currentDbStatus = currentSlotStateRes.rowCount > 0 ? currentSlotStateRes.rows[0].status : 'unknown';
     slotId = currentSlotStateRes.rowCount > 0 ? currentSlotStateRes.rows[0].id : null;
 
+    // Correctly read telemetry data, providing default values if telemetry is missing.
+    const telemetry = slotData.telemetry || {};
+    const chargeLevel = telemetry.soc || null;
+
+    // --- Logic to complete a deposit session based on telemetry state change ---
+    // This provides resilience if the 'deposit_accepted' ACK is missed.
+    // We check if the slot was 'opening' and is now physically secured with a battery.
+    // This check MUST happen *before* we update the slot status in the DB.
+    if (
+      currentDbStatus === 'opening' &&
+      telemetry.doorClosed === true &&
+      telemetry.doorLocked === true &&
+      telemetry.plugConnected === true
+    ) {
+      logger.info(`Telemetry indicates successful deposit for slot ${slotIdentifier}. Finalizing deposit session.`);
+      try {
+        const findAndUpdateDepositQuery = `
+          UPDATE deposits
+          SET
+            status = 'completed',
+            initial_charge_level = $1,
+            completed_at = NOW()
+          WHERE
+            slot_id = $2
+            AND status = 'opening' -- The session was initiated and door was opening
+            AND session_type = 'deposit'
+          RETURNING id;
+        `;
+        const depositUpdateResult = await pgClient.query(findAndUpdateDepositQuery, [chargeLevel, slotId]);
+
+        if (depositUpdateResult.rowCount > 0) {
+          const depositId = depositUpdateResult.rows[0].id;
+          logger.info(`Deposit session ${depositId} completed for slot ${slotIdentifier} via telemetry state change.`);
+        }
+      } catch (dbError) {
+        logger.error(`Failed to finalize deposit session in DB for slot ${slotIdentifier} via telemetry:`, dbError);
+      }
+    }
+    // --- End of telemetry-based deposit completion logic ---
+
     // The main query to insert or update a booth_slot.
     // It uses a subquery to get the booth's primary key (id) from its UID.
     const upsertQuery = `
@@ -83,13 +130,10 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
       RETURNING id;
     `;
 
-    // Correctly read telemetry data, providing default values if telemetry is missing.
-    const telemetry = slotData.telemetry || {};
-    console.log("Telemetry data for slot", slotIdentifier, ":", telemetry);
+    //console.log("Telemetry data for slot", slotIdentifier, ":", telemetry);
     // If a slot is administratively disabled, its status should not be changed by telemetry updates.
-    const status = currentDbStatus== 'disabled' ? 'disabled' : mapSlotStatus(slotData.status, currentDbStatus, slotData.devicePresent);
+    const status = currentDbStatus== 'disabled' ? 'disabled' : mapSlotStatus(slotData.status, currentDbStatus, telemetry.batteryInserted);
     const doorStatus = mapDoorStatus(telemetry.doorClosed, telemetry.doorLocked);
-    const chargeLevel = telemetry.soc || null;
 
     const result = await pgClient.query(upsertQuery, [
       boothUid,
@@ -110,51 +154,6 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
       slotId = result.rows[0].id; // Get the newly created slot ID.
     }
     logger.debug(`Successfully synced slot ${slotIdentifier} for booth ${boothUid}.`);
-
-    // --- Logic to complete a deposit session based on telemetry state change ---
-    // This provides resilience if the 'deposit_accepted' ACK is missed.
-    // We check if the slot was 'opening' and is now physically secured with a battery.
-    if (
-      currentDbStatus === 'opening' &&
-      telemetry.doorClosed === true &&
-      telemetry.doorLocked === true &&
-      telemetry.plugConnected === true
-    ) {
-      logger.info(`Telemetry indicates successful deposit for slot ${slotIdentifier}. Finalizing deposit session.`);
-      try {
-        const findAndUpdateDepositQuery = `
-          UPDATE deposits
-          SET
-            status = 'completed',
-            initial_charge_level = $1,
-            completed_at = NOW()
-          WHERE
-            slot_id = $2
-            AND status = 'opening' -- The session was initiated and door was opening
-            AND session_type = 'deposit'
-          RETURNING id;
-        `;
-        const depositUpdateResult = await pgClient.query(findAndUpdateDepositQuery, [chargeLevel, slotId]);
-
-        if (depositUpdateResult.rowCount > 0) {
-          const depositId = depositUpdateResult.rows[0].id;
-          logger.info(`Deposit session ${depositId} completed for slot ${slotIdentifier} via telemetry state change.`);
-
-          // Automatically send command to start charging the newly deposited battery.
-          const db = getDatabase();
-          const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
-          await commandRef.update({
-            startCharging: true,
-            stopCharging: false // Ensure mutual exclusivity
-          });
-          logger.info(`Sent 'startCharging' command to ${slotIdentifier} at booth ${boothUid} after telemetry-confirmed deposit.`);
-
-        }
-      } catch (dbError) {
-        logger.error(`Failed to finalize deposit session in DB for slot ${slotIdentifier} via telemetry:`, dbError);
-      }
-    }
-    // --- End of telemetry-based deposit completion logic ---
 
     // --- Event-driven logic based on hardware ACK messages ---
     const ackMessage = slotData.command?.ack;
