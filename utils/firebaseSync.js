@@ -309,6 +309,18 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
           break;
         }
 
+        case 'startCharging_accepted': {
+          logger.info(`Received 'startCharging_accepted' for slot ${slotIdentifier}. Updating DB: is_charging = true.`);
+          await pgClient.query("UPDATE booth_slots SET is_charging = true WHERE id = $1", [slotId]);
+          break;
+        }
+
+        case 'stopCharging_done': {
+          logger.info(`Received 'stopCharging_done' for slot ${slotIdentifier}. Updating DB: is_charging = false.`);
+          await pgClient.query("UPDATE booth_slots SET is_charging = false WHERE id = $1", [slotId]);
+          break;
+        }
+
         case 'startCharging_rejected_safety': {
           logger.error(`CRITICAL: Received 'startCharging_rejected_safety' for slot ${slotIdentifier}. Updating DB to reflect charging is OFF.`);
           // The hardware refused to charge. This is important to reflect in our database.
@@ -317,10 +329,8 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
         }
 
         // Log informational ACKs for debugging and visibility.
-        case 'openForDeposit_sent':
         case 'openForCollection_sent':
-        case 'startCharging_accepted':
-        case 'stopCharging_done':
+        case 'openForDeposit_sent':
         case 'forceUnlock_done':
         case 'forceLock_done':
         default:

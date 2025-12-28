@@ -12,6 +12,7 @@ const poolPromise = require('./db/index.js'); // Corrected path
 const { initializeDatabase } = require('./db/init'); // Corrected path
 const { initializeFirebase } = require('./utils/firebase');
 const { initializeFirebaseSync } = require('./utils/firebaseSync');
+const { startCronJob } = require('./utils/cron-functions/hardware-cron');
 const swaggerUi = require('swagger-ui-express');
 const swaggerSpec = require('./utils/swaggerConfig');
 
@@ -31,6 +32,9 @@ initializeFirebase();
 
 // --- Initialize Firebase Realtime Database Listener ---
 initializeFirebaseSync();
+
+// --- Start Hardware Cron Jobs ---
+startCronJob();
 
 // Security check
 if (!process.env.JWT_SECRET && process.env.NODE_ENV === 'production') {
