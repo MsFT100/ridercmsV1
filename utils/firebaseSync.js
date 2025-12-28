@@ -93,8 +93,7 @@ async function handleWithdrawalCompletion(pgClient, slotIdentifier, slotId) {
       SET
         status = 'completed',
         completed_at = NOW()
-      WHERE slot_id = $1
-        AND status = 'in_progress' -- The session must have been paid for.
+      WHERE slot_id = $1 AND status IN ('in_progress', 'pending') -- The session must have been paid for or is about to be confirmed as paid.
         AND session_type = 'withdrawal'
       RETURNING id, user_id, consumed_deposit_id
     )
@@ -178,15 +177,36 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
       logger.debug(`[Withdrawal Check] slot: ${slotIdentifier}, currentDbStatus: ${currentDbStatus}, wasBatteryInserted: ${wasBatteryInserted}, batteryInserted: ${telemetry.batteryInserted}, doorClosed: ${telemetry.doorClosed}, doorLocked: ${telemetry.doorLocked}`);
     }
 
-    if (
-      wasBatteryInserted &&
+   if (
       telemetry.batteryInserted === false &&
-      currentDbStatus === 'occupied' && // The slot was occupied before this sync
       telemetry.doorClosed === true &&
       telemetry.doorLocked === true
     ) {
-      logger.info(`Telemetry transition indicates successful withdrawal for slot ${slotIdentifier}. Finalizing session.`);
-      await handleWithdrawalCompletion(pgClient, slotIdentifier, slotId);
+      const hasActiveWithdrawal = await pgClient.query(
+        `
+        SELECT 1
+        FROM deposits
+        WHERE slot_id = $1
+          AND session_type = 'withdrawal'
+          AND status IN ('pending','in_progress')
+        LIMIT 1
+        `,
+        [slotId]
+      );
+
+      if (hasActiveWithdrawal.rowCount > 0) {
+        const completed = await handleWithdrawalCompletion(
+          pgClient,
+          slotIdentifier,
+          slotId
+        );
+
+        if (completed) {
+          logger.info(
+            `Withdrawal auto-completed via invariant check for slot ${slotIdentifier}`
+          );
+        }
+      }
     }
 
     // --- End of telemetry-based deposit completion logic ---
