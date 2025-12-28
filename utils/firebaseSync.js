@@ -209,8 +209,6 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
       }
     }
 
-
-
     // --- End of telemetry-based deposit completion logic ---
 
     // The main query to insert or update a booth_slot.
