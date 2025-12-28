@@ -14,14 +14,13 @@ async function checkChargingConditions() {
   try {
     // Query for slots where:
     // 1. Telemetry indicates a safe, ready state (Battery in, Door closed & locked, Plug connected).
-    // 2. The database thinks charging is OFF (is_charging is false or null).
-    // 3. The slot is not in a maintenance or faulty state.
+    // 2. The slot is not in a maintenance or faulty state.
+    // We verify the actual relay state against Firebase real-time data.
     const query = `
       SELECT
         s.id,
         s.slot_identifier,
-        b.booth_uid,
-        s.telemetry
+        b.booth_uid
       FROM booth_slots s
       JOIN booths b ON s.booth_id = b.id
       WHERE
@@ -29,34 +28,50 @@ async function checkChargingConditions() {
         AND (s.telemetry->>'doorClosed')::boolean = true
         AND (s.telemetry->>'doorLocked')::boolean = true
         AND (s.telemetry->>'plugConnected')::boolean = true
-        AND (s.is_charging IS FALSE OR s.is_charging IS NULL)
         AND s.status NOT IN ('maintenance', 'faulty', 'disabled')
     `;
 
     const { rows } = await client.query(query);
 
     if (rows.length > 0) {
-      logger.info(`[HardwareCron] Found ${rows.length} slots ready for charging but inactive. Initiating self-healing...`);
+      // logger.info(`[HardwareCron] Found ${rows.length} candidate slots. Verifying against Firebase...`);
       
       const db = getDatabase();
 
       for (const row of rows) {
         const { id, slot_identifier, booth_uid } = row;
         
-        logger.info(`[HardwareCron] Sending 'startCharging' command to ${booth_uid}/${slot_identifier}`);
-
         try {
-          // 1. Send command to Firebase to trigger the hardware
-          await db.ref(`booths/${booth_uid}/slots/${slot_identifier}/command`).update({
-            startCharging: true,
-            stopCharging: false
-          });
+          // Fetch real-time data from Firebase to confirm status
+          const snapshot = await db.ref(`booths/${booth_uid}/slots/${slot_identifier}`).get();
+          if (!snapshot.exists()) continue;
 
-          // 2. Optimistically update DB to prevent this cron from re-triggering immediately 
-          //    before the hardware has a chance to respond with an ACK.
-          await client.query("UPDATE booth_slots SET is_charging = true WHERE id = $1", [id]);
+          const slotData = snapshot.val();
+          const telemetry = slotData.telemetry || {};
+
+          // Check conditions using real-time data
+          const isSafe = 
+            telemetry.batteryInserted === true &&
+            telemetry.doorClosed === true &&
+            telemetry.doorLocked === true &&
+            telemetry.plugConnected === true;
+
+          const isRelayOff = !telemetry.relayOn;
+
+          if (isSafe && isRelayOff) {
+            logger.info(`[HardwareCron] Slot ${booth_uid}/${slot_identifier} is safe but relay is OFF (Real-time). Sending 'startCharging'...`);
+
+            // 1. Send command to Firebase to trigger the hardware
+            await db.ref(`booths/${booth_uid}/slots/${slot_identifier}/command`).update({
+              startCharging: true,
+              
+            });
+
+            // 2. Optimistically update DB
+            await client.query("UPDATE booth_slots SET is_charging = true WHERE id = $1", [id]);
+          }
         } catch (err) {
-          logger.error(`[HardwareCron] Failed to send command to ${booth_uid}/${slot_identifier}:`, err);
+          logger.error(`[HardwareCron] Failed to process ${booth_uid}/${slot_identifier}:`, err);
         }
       }
     }
@@ -77,7 +92,7 @@ function startCronJob() {
   checkChargingConditions();
 
   // Then run every 60 seconds
-  setInterval(checkChargingConditions, 60 * 1000);
+  setInterval(checkChargingConditions, 5 * 1000);
 }
 
 module.exports = { startCronJob };
