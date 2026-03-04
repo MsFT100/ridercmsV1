@@ -506,8 +506,6 @@ function initializeFirebaseSlots() {
       stopCharging: false
     },
     devicePresent: false,
-    doorClosed: true,
-    doorLocked: true,
     events: {},
     initial_soc: 0,
     initial_voltage: 0,

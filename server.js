@@ -33,9 +33,6 @@ initializeFirebase();
 // --- Initialize Firebase Realtime Database Listener ---
 initializeFirebaseSync();
 
-// --- Start Hardware Cron Jobs ---
-startCronJob();
-
 // Security check
 if (!process.env.JWT_SECRET && process.env.NODE_ENV === 'production') {
   logger.error('FATAL ERROR: JWT_SECRET is not defined.');
@@ -176,12 +173,20 @@ app.get('/api/health', async (req, res) => {
 process.on('SIGINT', async () => {
   const pool = await poolPromise;
   logger.info('Shutting down server...');
+  if (pool.connector) {
+    pool.connector.close();
+  }
   await pool.end();
   process.exit(0);
 });
 
 // Start server
 const startServer = () => {
+  if (process.env.DB_DIALECT === 'postgres') {
+    // Start cron only after DB initialization has succeeded.
+    startCronJob();
+  }
+
   app.listen(PORT, () => {
     logger.info(`Server is running on http://localhost:${PORT}`);
   });

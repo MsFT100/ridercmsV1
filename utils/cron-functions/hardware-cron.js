@@ -8,10 +8,11 @@ const logger = require('../logger');
  * If found, it sends a 'startCharging' command to the hardware.
  */
 async function checkChargingConditions() {
-  const pool = await poolPromise;
-  const client = await pool.connect();
+  let client;
 
   try {
+    const pool = await poolPromise;
+    client = await pool.connect();
     // Query for slots where:
     // 1. Telemetry indicates a safe, ready state (Battery in, Door closed & locked, Plug connected).
     // 2. The slot is not in a maintenance or faulty state.
@@ -78,7 +79,9 @@ async function checkChargingConditions() {
   } catch (error) {
     logger.error('[HardwareCron] Error checking charging conditions:', error);
   } finally {
-    client.release();
+    if (client) {
+      client.release();
+    }
   }
 }
 
@@ -89,10 +92,16 @@ function startCronJob() {
   logger.info('[HardwareCron] Starting charging condition check cron (Interval: 1 minute).');
   
   // Run immediately on server start
-  checkChargingConditions();
+  checkChargingConditions().catch((err) => {
+    logger.error('[HardwareCron] Initial run failed:', err);
+  });
 
   // Then run every 60 seconds
-  setInterval(checkChargingConditions, 5 * 1000);
+  setInterval(() => {
+    checkChargingConditions().catch((err) => {
+      logger.error('[HardwareCron] Scheduled run failed:', err);
+    });
+  }, 5 * 1000);
 }
 
 module.exports = { startCronJob };
