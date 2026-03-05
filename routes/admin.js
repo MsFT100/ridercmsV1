@@ -1,6 +1,6 @@
 const { Router } = require('express');
-const { admin } = require('../utils/firebase');
-const logger = require('../utils/logger');
+const { admin } = require('../utils/firebase.js');
+const logger = require('../utils/logger.js');
 const { verifyFirebaseToken, isAdmin } = require('../middleware/auth');
 const { getDatabase } = require('firebase-admin/database');
 const poolPromise = require('../db');
@@ -457,8 +457,8 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
               // The battery object contains the most up-to-date info
               battery: {
                 isOccupied: slotData.battery === true || slotData.devicePresent === true,
-                chargeLevel: telemetry.soc || 0,
-                voltage: telemetry.voltage,
+                chargeLevel: telemetry.resSoc || 0,
+                voltage: telemetry.restVoltage,
                 temperature: telemetry.temperatureC,
               }
             };
@@ -507,11 +507,16 @@ function initializeFirebaseSlots() {
     },
     devicePresent: false,
     events: {},
+    final_soc: 22,
+    final_voltage: 0,
     initial_soc: 0,
     initial_voltage: 0,
     pendingCmd: false,
     rejection: {},
     relay: "OFF",
+    relayOn: false,
+    safetyReason: "",
+    shouldCharge: true,
     soc: 0,
     status: "booting", // Or 'available'
     telemetry: {
@@ -521,7 +526,9 @@ function initializeFirebaseSlots() {
       plugConnected: false,
       qr: "",
       relayOn: false,
+      restVoltage: 0,
       soc: 0,
+      status: "booting",
       temperature: 0,
       temperatureC: 0,
       timestamp: 0,

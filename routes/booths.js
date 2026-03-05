@@ -365,9 +365,6 @@ router.get('/my-battery-status', verifyFirebaseToken, async (req, res) => {
  * POST /api/booths/initiate-withdrawal
  * Called by a user's app to start the collection of their charged battery.
  */
-/**
- * POST /api/booths/initiate-withdrawal
- */
 router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
   const { uid: firebaseUid } = req.user;
   const pool = await poolPromise;

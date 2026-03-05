@@ -1,0 +1,17 @@
+// {
+//   "compilerOptions": {
+//     "target": "ES2022",
+//     "module": "commonjs",
+//     "moduleResolution": "node",
+//     "outDir": "dist",
+//     "rootDir": ".",
+//     "strict": true,
+//     "esModuleInterop": true,
+//     "resolveJsonModule": true,
+//     "skipLibCheck": true
+//   },
+//   "include": ["**/*.ts", "utils/firebaseSync.js"],
+//   "exclude": ["node_modules", "dist"]
+// }
+
+// TODO: implemnt typescript in this project. This file is just a placeholder to allow the project to compile without errors.
