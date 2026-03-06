@@ -462,7 +462,7 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
               battery: {
                 isOccupied: slotData.battery === true || slotData.devicePresent === true,
                 chargeLevel: telemetry.resSoc || 0,
-                voltage: telemetry.restVoltage,
+                voltage: telemetry.voltage,
                 temperature: telemetry.temperatureC,
               }
             };
