@@ -99,6 +99,9 @@ router.post('/users/set-role', [verifyFirebaseToken, isAdmin], async (req, res) 
  *               type: array
  *               items:
  *                 type: object
+ *                   properties:
+ *                     phoneNumber:
+ *                       type: string
  *             nextPageToken:
  *               type: string
  */
@@ -114,6 +117,7 @@ router.get('/users', [verifyFirebaseToken, isAdmin], async (req, res) => {
       uid: userRecord.uid,
       email: userRecord.email,
       displayName: userRecord.displayName,
+      phoneNumber: userRecord.phoneNumber,
       role: userRecord.customClaims?.role || 'customer', // Default to 'customer' if no role is set
       disabled: userRecord.disabled,
       creationTime: userRecord.metadata.creationTime,
