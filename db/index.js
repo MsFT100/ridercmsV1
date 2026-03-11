@@ -153,6 +153,19 @@ async function configurePool() {
     'No DB config found. Set DATABASE_URL, or DB_INSTANCE_CONNECTION_NAME/INSTANCE_CONNECTION_NAME.'
   );
 }
+// Graceful shutdown handler
+process.on('SIGTERM', async () => {
+  logger.info('SIGTERM signal received: closing HTTP server and DB pool');
+  if (pool) {
+    await pool.end();
+    logger.info('Database pool closed');
+  }
+  if (connector) {
+    connector.close();
+    logger.info('Cloud SQL Connector closed');
+  }
+  process.exit(0);
+});
 
 module.exports = (async () => {
   pool = await configurePool();
