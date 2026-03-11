@@ -89,7 +89,12 @@ async function createPoolFromCloudSql(instanceConnectionName) {
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
     database: process.env.DB_NAME,
-    max: Number(process.env.DB_POOL_MAX || 10),
+    // --- POOL SETTINGS ---
+    max: Number(process.env.DB_POOL_MAX || 5), // Keep this low for Cloud Run
+    idleTimeoutMillis: 30000,                  // Close idle clients after 30 seconds
+    connectionTimeoutMillis: 5000,             // Fail fast if the DB is unreachable
+    keepAlive: true,                           // Send TCP keep-alive packets
+    // -------------------
   });
 
   // Used by server shutdown hook when present.
