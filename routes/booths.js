@@ -7,6 +7,9 @@ const verifyApiKey = require('../middleware/verifyApiKey');
 const { initiateSTKPush, querySTKStatus } = require('../utils/mpesa'); // Import the specific function
 const { completePaidWithdrawal } = require('../utils/sessionUtils');
 
+/** Helper function to introduce a delay */
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
 const router = Router();
 
 /**
@@ -437,15 +440,32 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
     const initialCharge = initialChargeRes.rows.length > 0 ? initialChargeRes.rows[0].initial_charge_level : 0;
 
     /* -------------------------------------------------------
-     * 2. Real-time SOC fetch
+     * 2. Stop charging and fetch final SOC
      * ----------------------------------------------------- */
     const db = getDatabase();
     const slotRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}`);
+
+    // First, send the command to stop charging the battery.
+    await slotRef.child('command').update({
+      stopCharging: true,
+      startCharging: false,
+    });
+
+    // Wait for a moment to allow the hardware to stop charging and report its final state.
+    // 7 seconds is a reasonable starting point. This can be tuned.
+    await delay(7000);
+
+    // Now, fetch the latest data from Firebase to get the most accurate final SOC.
     const snapshot = await slotRef.get();
 
-    let chargeLevel = dbChargeLevel;
-    if (snapshot.exists() && snapshot.val().telemetry) {
-      chargeLevel = snapshot.val().telemetry.soc ?? chargeLevel;
+    let chargeLevel;
+    if (snapshot.exists() && snapshot.val()) {
+      const slotData = snapshot.val();
+      // Prioritize a 'final_soc' field if the hardware sets it, otherwise use the latest telemetry.
+      chargeLevel = slotData.final_soc ?? slotData.telemetry?.soc ?? dbChargeLevel;
+    } else {
+      // Fallback to the last known value from our database if Firebase is unavailable.
+      chargeLevel = dbChargeLevel;
     }
 
     /* -------------------------------------------------------
@@ -488,16 +508,6 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
     );
 
     const sessionId = sessionRes.rows[0].id;
-
-    /* -------------------------------------------------------
-     * 5. Stop charging immediately
-     * ----------------------------------------------------- */
-    await db
-      .ref(`booths/${boothUid}/slots/${slotIdentifier}/command`)
-      .update({
-        stopCharging: true,
-        startCharging: false,
-      });
 
     await client.query('COMMIT');
 
