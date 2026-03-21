@@ -344,7 +344,9 @@ router.get('/my-battery-status', verifyFirebaseToken, async (req, res) => {
 
     const firebaseData = snapshot.val();
     const realTimeCharge = firebaseData.soc || 0;
+    const lastChargeLevelSoc = lastKnownChargeLevel;
     const realTimeTelemetry = firebaseData.telemetry || null;
+  
 
     // 3. (Fire-and-forget) Update our database with the fresh data. No need to wait for this.
     client.query(
@@ -354,7 +356,7 @@ router.get('/my-battery-status', verifyFirebaseToken, async (req, res) => {
 
     // 4. Return the fresh, real-time data to the user.
     res.status(200).json({
-      boothUid, slotIdentifier, chargeLevel: realTimeCharge, sessionStatus, telemetry: realTimeTelemetry
+      boothUid, slotIdentifier, chargeLevel: realTimeCharge, lastChargeLevel: lastChargeLevelSoc, sessionStatus, telemetry: realTimeTelemetry
     });
   } catch (error) {
     logger.error(`Failed to get battery status for user ${firebaseUid}:`, error);
