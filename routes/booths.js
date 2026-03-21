@@ -462,7 +462,9 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
     if (snapshot.exists() && snapshot.val()) {
       const slotData = snapshot.val();
       // Prioritize a 'final_soc' field if the hardware sets it, otherwise use the latest telemetry.
-      chargeLevel = slotData.final_soc ?? slotData.telemetry?.soc ?? dbChargeLevel;
+      // Retuning back to soc .. 
+      // TODO: Update this later when we have a clear contract with the hardware team on how the final SOC is reported.
+      chargeLevel = slotData.soc ?? slotData.telemetry?.soc ?? dbChargeLevel;
     } else {
       // Fallback to the last known value from our database if Firebase is unavailable.
       chargeLevel = dbChargeLevel;
