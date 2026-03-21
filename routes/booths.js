@@ -656,7 +656,7 @@ router.get('/sessions/pending-withdrawal', verifyFirebaseToken, async (req, res)
     const query = `
         SELECT
             d.id AS "sessionId",
-            s.charge_level_percent AS "chargeLevel",
+            s.charge_level_percent AS "lastKnownChargeLevel",
             b.booth_uid AS "boothUid",
             s.slot_identifier AS "slotIdentifier", dep.initial_charge_level AS "initialCharge",
             dep.completed_at AS "depositCompletedAt"
@@ -683,17 +683,8 @@ router.get('/sessions/pending-withdrawal', verifyFirebaseToken, async (req, res)
 
     const session = rows[0];
 
-    // --- Real-time Data Fetch ---
-    // Fetch the most current SOC directly from Firebase to ensure accurate pricing.
-    const db = getDatabase();
-    const slotRef = db.ref(`booths/${session.boothUid}/slots/${session.slotIdentifier}`);
-    const snapshot = await slotRef.get();
-
-    let realTimeSoc = session.chargeLevel; // Fallback to DB value
-    if (snapshot.exists() && snapshot.val().telemetry) {
-      realTimeSoc = snapshot.val().telemetry.soc || realTimeSoc;
-    }
-    // --- End of Real-time Fetch ---
+    // Use the last known charge level from the database for pricing calculation.
+    const realTimeSoc = session.lastKnownChargeLevel || 0;
 
     // Re-calculate the cost on the fly, just like in initiate-withdrawal
     const settingsRes = await client.query("SELECT value FROM app_settings WHERE key = 'pricing'");
@@ -721,7 +712,7 @@ router.get('/sessions/pending-withdrawal', verifyFirebaseToken, async (req, res)
     client.query("UPDATE deposits SET amount = $1 WHERE id = $2", [totalCost, session.sessionId])
       .catch(err => logger.error(`Failed to background-update amount for session ${session.sessionId}:`, err));
 
-    res.status(200).json({
+      res.status(200).json({
       sessionId: session.sessionId,
       amount: totalCost,
       durationMinutes: chargeDurationMinutes,
