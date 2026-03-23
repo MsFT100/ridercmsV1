@@ -19,13 +19,15 @@ const verifyFirebaseToken = async (req, res, next) => {
 
   try {
     const decodedToken = await admin.auth().verifyIdToken(idToken);
-    // Attach the decoded token to the request object for use in subsequent handlers
     req.user = decodedToken;
-    next(); // Pass control to the next handler
+    next();
   } catch (error) {
-    logger.error('Authentication error: Invalid token.', error);
+    logger.error('Authentication error:', error);
     if (error.code === 'auth/id-token-expired') {
       return res.status(401).json({ error: 'Unauthorized: Token has expired.' });
+    }
+    if (error.code === 'auth/user-disabled') {
+      return res.status(403).json({ error: 'Account pending approval. Please wait for admin activation.' });
     }
     return res.status(403).json({ error: 'Unauthorized: Invalid token.' });
   }
