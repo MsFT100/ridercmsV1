@@ -176,6 +176,14 @@ const initializeDatabase = async () => {
     // Add 'notes' column to 'deposits'
     await runAlteration('deposits', 'notes', 'ALTER TABLE deposits ADD COLUMN notes TEXT;', "Added 'notes' column to 'deposits' table.");
 
+    // Add 'fcm_token' column to 'users'
+    await runAlteration(
+      'users',
+      'fcm_token',
+      'ALTER TABLE users ADD COLUMN fcm_token TEXT;',
+      "Added 'fcm_token' column to 'users' table."
+    );
+
     // Add 'consumed_deposit_id' column to 'deposits'
     await runAlteration(
       'deposits',

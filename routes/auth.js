@@ -337,6 +337,48 @@ router.get('/profile', verifyFirebaseToken, async (req, res) => {
 });
 
 /**
+ * POST /api/auth/fcm-token
+ * Save or clear the current user's FCM token for push notifications.
+ */
+router.post('/fcm-token', verifyFirebaseToken, async (req, res) => {
+  const { uid } = req.user;
+  const { token } = req.body;
+
+  if (token !== null && token !== undefined && typeof token !== 'string') {
+    return res.status(400).json({ error: 'token must be a string or null.' });
+  }
+
+  const normalizedToken = typeof token === 'string' ? token.trim() : null;
+  const valueToSave = normalizedToken ? normalizedToken : null;
+
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      'UPDATE users SET fcm_token = $1, updated_at = NOW() WHERE user_id = $2 RETURNING user_id',
+      [valueToSave, uid]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'User profile not found.' });
+    }
+
+    logger.info(`FCM token ${valueToSave ? 'saved' : 'cleared'} for user ${uid}.`);
+    return res.status(200).json({
+      message: valueToSave ? 'FCM token saved.' : 'FCM token cleared.',
+    });
+  } catch (error) {
+    logger.error(`Failed to update FCM token for user ${uid}:`, error);
+    return res.status(500).json({
+      error: 'Failed to update FCM token.',
+      details: error.message,
+    });
+  } finally {
+    client.release();
+  }
+});
+
+/**
  * POST /api/auth/profile/picture
  * Updates the current user's profile picture.
  * Expects a multipart/form-data request with a single file field named 'profileImage'.

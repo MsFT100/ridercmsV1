@@ -1,4 +1,5 @@
 const { getDatabase } = require('firebase-admin/database');
+const { admin } = require('./firebase');
 const logger = require('./logger');
 
 /**
@@ -15,7 +16,7 @@ async function completePaidWithdrawal(client, checkoutRequestId) {
   try {
     // 1. Find and lock the specific session row to prevent race conditions.
     const sessionRes = await client.query(
-      `SELECT d.id, d.status, b.booth_uid, s.slot_identifier
+      `SELECT d.id, d.status, d.user_id, d.amount, b.booth_uid, s.slot_identifier
        FROM deposits d
        JOIN booth_slots s ON d.slot_id = s.id
        JOIN booths b ON s.booth_id = b.id
@@ -30,7 +31,13 @@ async function completePaidWithdrawal(client, checkoutRequestId) {
       return false;
     }
 
-    const { id: sessionId, booth_uid: boothUid, slot_identifier: slotIdentifier } = sessionRes.rows[0];
+    const {
+      id: sessionId,
+      user_id: userId,
+      amount,
+      booth_uid: boothUid,
+      slot_identifier: slotIdentifier,
+    } = sessionRes.rows[0];
 
     // 2. Atomically update the status from 'pending' to 'in_progress'.
     await client.query("UPDATE deposits SET status = 'in_progress' WHERE id = $1", [sessionId]);
@@ -44,6 +51,43 @@ async function completePaidWithdrawal(client, checkoutRequestId) {
       openForCollection: true,
       openForDeposit: false,
     });
+
+    // 4. Best-effort user push notification for successful payment.
+    // Notification failures should not block payment completion.
+    try {
+      const userRes = await client.query(
+        'SELECT fcm_token FROM users WHERE user_id = $1 LIMIT 1',
+        [userId]
+      );
+      const fcmToken = userRes.rows[0]?.fcm_token;
+
+      if (fcmToken) {
+        const formattedAmount = Number(amount || 0).toFixed(2);
+        await admin.messaging().send({
+          token: fcmToken,
+          notification: {
+            title: 'Payment successful',
+            body: `KES ${formattedAmount} received. Your battery is ready for collection.`,
+          },
+          data: {
+            type: 'payment_success',
+            checkoutRequestId: String(checkoutRequestId),
+            sessionId: String(sessionId),
+            amount: String(formattedAmount),
+          },
+          android: {
+            priority: 'high',
+          },
+        });
+        logger.info(`Sent payment success push notification for session ${sessionId} (user ${userId}).`);
+      } else {
+        logger.info(`No FCM token on file for user ${userId}; skipping payment success push.`);
+      }
+    } catch (pushError) {
+      logger.warn(
+        `Payment success push failed for checkout ${checkoutRequestId}: ${pushError?.message || pushError}`
+      );
+    }
 
     logger.info(`Sent 'openForCollection' command to ${slotIdentifier} at booth ${boothUid} for checkout ID ${checkoutRequestId}.`);
     return true;
