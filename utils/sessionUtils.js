@@ -42,15 +42,7 @@ async function completePaidWithdrawal(client, checkoutRequestId) {
     // 2. Atomically update the status from 'pending' to 'in_progress'.
     await client.query("UPDATE deposits SET status = 'in_progress' WHERE id = $1", [sessionId]);
 
-    // 3. The session was successfully updated. Now send the hardware command.
-    const db = getDatabase();
-    const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
-    await commandRef.update({
-      stopCharging: true,
-      startCharging: false,
-      openForCollection: true,
-      openForDeposit: false,
-    });
+    // 3. Command is no longer sent here. User must scan the booth to trigger release.
 
     // 4. Best-effort user push notification for successful payment.
     // Notification failures should not block payment completion.
@@ -67,7 +59,7 @@ async function completePaidWithdrawal(client, checkoutRequestId) {
           token: fcmToken,
           notification: {
             title: 'Payment successful',
-            body: `KES ${formattedAmount} received. Your battery is ready for collection.`,
+            body: `KES ${formattedAmount} received. Please scan the QR code on the booth to collect your battery.`,
           },
           data: {
             type: 'payment_success',
@@ -89,7 +81,7 @@ async function completePaidWithdrawal(client, checkoutRequestId) {
       );
     }
 
-    logger.info(`Sent 'openForCollection' command to ${slotIdentifier} at booth ${boothUid} for checkout ID ${checkoutRequestId}.`);
+    logger.info(`Payment confirmed for session ${sessionId}. Waiting for user to scan and release battery.`);
     return true;
   } catch (error) {
     logger.error(`Error in completePaidWithdrawal for checkout ID ${checkoutRequestId}:`, error);

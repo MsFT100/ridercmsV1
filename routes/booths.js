@@ -1029,4 +1029,73 @@ router.post('/report-problem', verifyFirebaseToken, async (req, res) => {
   }
 });
 
+/**
+ * POST /api/booths/release-battery
+ * @summary Release a paid battery after physical verification (scanning QR)
+ * @description Triggered when a user scans a booth QR code after having paid for a withdrawal.
+ * Verifies that the user has a paid session for this specific booth and then opens the slot.
+ * @tags [Booths]
+ * @security
+ *   - bearerAuth: []
+ * @requestBody
+ *   required: true
+ *   content:
+ *     application/json:
+ *       schema:
+ *         type: object
+ *         required: [boothUid]
+ *         properties:
+ *           boothUid:
+ *             type: string
+ * @responses
+ *   200:
+ *     description: Battery released successfully.
+ *   404:
+ *     description: No paid session found for this booth.
+ *   500:
+ *     description: Internal server error.
+ */
+router.post('/release-battery', verifyFirebaseToken, async (req, res) => {
+  const { boothUid } = req.body;
+  const { uid: firebaseUid } = req.user;
+
+  if (!boothUid) {
+    return res.status(400).json({ error: 'boothUid is required.' });
+  }
+
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    // Find the paid withdrawal session that matches this user and this booth.
+    const sessionRes = await client.query(
+      `SELECT d.id, s.slot_identifier
+       FROM deposits d
+       JOIN booths b ON d.booth_id = b.id
+       JOIN booth_slots s ON d.slot_id = s.id
+       WHERE d.user_id = $1 AND b.booth_uid = $2 AND d.session_type = 'withdrawal' AND d.status = 'in_progress'
+       LIMIT 1`,
+      [firebaseUid, boothUid]
+    );
+
+    if (sessionRes.rowCount === 0) {
+      return res.status(404).json({ error: 'No paid withdrawal session found for this booth. Please ensure you have paid.' });
+    }
+
+    const { slot_identifier: slotIdentifier } = sessionRes.rows[0];
+    const db = getDatabase();
+    await db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`).update({
+      openForCollection: true,
+      openForDeposit: false,
+    });
+
+    logger.info(`User ${firebaseUid} verified at booth ${boothUid}. Battery released from slot ${slotIdentifier}.`);
+    res.status(200).json({ message: `Battery released. Please collect it from slot ${slotIdentifier}.`, slotIdentifier });
+  } catch (error) {
+    logger.error(`Failed to release battery for user ${firebaseUid}:`, error);
+    res.status(500).json({ error: 'Failed to release battery.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 module.exports = router;
