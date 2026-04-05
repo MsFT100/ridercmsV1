@@ -652,30 +652,28 @@ router.post('/sessions/:sessionId/pay', verifyFirebaseToken, async (req, res) =>
  * GET /api/booths/sessions/pending-withdrawal
  * @summary Get details of a user's pending withdrawal session
  * @description Returns the session details using the LOCKED amount and SOC from the database.
- */
-router.get('/sessions/pending-withdrawal', verifyFirebaseToken, async (req, res) => {
+ */router.get('/sessions/pending-withdrawal', verifyFirebaseToken, async (req, res) => {
   const { uid: firebaseUid } = req.user;
   const pool = await poolPromise;
   const client = await pool.connect();
 
   try {
-    // 1. Fetch the session using the amount and initial_charge_level stored at initiation.
     const query = `
         SELECT
             d.id AS "sessionId",
             d.amount AS "lockedAmount",
-            d.initial_charge_level AS "initialCharge",
+            d.initial_charge_level AS "finalSocAtWithdrawal", -- SOC when they hit withdraw
             d.created_at AS "sessionCreatedAt",
-            s.charge_level_percent AS "currentSlotSoc",
+            s.charge_level_percent AS "currentLiveSoc",
             b.booth_uid AS "boothUid",
             s.slot_identifier AS "slotIdentifier",
-            dep.completed_at AS "depositCompletedAt"
+            dep.completed_at AS "depositCompletedAt",
+            dep.initial_charge_level AS "startingSocAtDeposit" -- ADDED THIS
         FROM deposits d
         JOIN booth_slots s ON d.slot_id = s.id
         JOIN booths b ON d.booth_id = b.id
-        -- Link back to the original deposit credit for metadata
         CROSS JOIN LATERAL (
-            SELECT completed_at
+            SELECT completed_at, initial_charge_level -- ADDED initial_charge_level here
             FROM deposits
             WHERE id = d.consumed_deposit_id
             LIMIT 1
@@ -695,21 +693,22 @@ router.get('/sessions/pending-withdrawal', verifyFirebaseToken, async (req, res)
 
     const session = rows[0];
 
-    // 2. Calculate duration for the UI
     const chargeDurationMs = new Date() - new Date(session.depositCompletedAt);
     const chargeDurationMinutes = Math.round(chargeDurationMs / 60000);
 
-    const socGained = Math.max(0, parseFloat(session.initialCharge) - parseFloat(session.startingSocAtDeposit));
+    // Now startingSocAtDeposit exists, so the math won't return NaN/null
+    const socGained = Math.max(0, 
+      parseFloat(session.finalSocAtWithdrawal || 0) - parseFloat(session.startingSocAtDeposit || 0)
+    ).toFixed(1);
 
-    // 3. Return the response using the DB 'lockedAmount'
-    // This prevents the "refresh to get a cheaper price" exploit.
     res.status(200).json({
       sessionId: session.sessionId,
-      amount: parseFloat(session.lockedAmount), // The price is now fixed
+      amount: parseFloat(session.lockedAmount || 0),
       durationMinutes: chargeDurationMinutes,
-      soc: socGained,
-      socAtInitiation: parseFloat(session.initialCharge),
-      currentBoothSoc: parseFloat(session.currentSlotSoc),
+      soc: parseFloat(socGained),
+      socAtInitiation: parseFloat(session.startingSocAtDeposit),
+      socAtWithdrawal: parseFloat(session.finalSocAtWithdrawal),
+      currentBoothSoc: parseFloat(session.currentLiveSoc),
       boothUid: session.boothUid,
       slotIdentifier: session.slotIdentifier,
       depositCompletedAt: session.depositCompletedAt
