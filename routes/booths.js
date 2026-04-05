@@ -648,33 +648,45 @@ router.post('/sessions/:sessionId/pay', verifyFirebaseToken, async (req, res) =>
  *   500:
  *     description: Internal server error.
  */
+/**
+ * GET /api/booths/sessions/pending-withdrawal
+ * @summary Get details of a user's pending withdrawal session
+ * @description Returns the session details using the LOCKED amount and SOC from the database.
+ */
 router.get('/sessions/pending-withdrawal', verifyFirebaseToken, async (req, res) => {
   const { uid: firebaseUid } = req.user;
   const pool = await poolPromise;
   const client = await pool.connect();
+
   try {
+    // 1. Fetch the session using the amount and initial_charge_level stored at initiation.
     const query = `
         SELECT
             d.id AS "sessionId",
-            s.charge_level_percent AS "lastKnownChargeLevel",
+            d.amount AS "lockedAmount",
+            d.initial_charge_level AS "initialCharge",
+            d.created_at AS "sessionCreatedAt",
+            s.charge_level_percent AS "currentSlotSoc",
             b.booth_uid AS "boothUid",
-            s.slot_identifier AS "slotIdentifier", dep.initial_charge_level AS "initialCharge",
+            s.slot_identifier AS "slotIdentifier",
             dep.completed_at AS "depositCompletedAt"
         FROM deposits d
         JOIN booth_slots s ON d.slot_id = s.id
-        JOIN booths b ON s.booth_id = b.id
-        -- Find the user's most recent completed deposit that happened *before* this withdrawal was created.
+        JOIN booths b ON d.booth_id = b.id
+        -- Link back to the original deposit credit for metadata
         CROSS JOIN LATERAL (
-            SELECT initial_charge_level, completed_at
+            SELECT completed_at
             FROM deposits
-            WHERE user_id = d.user_id AND session_type = 'deposit' AND status = 'completed' AND completed_at < d.created_at
-            ORDER BY completed_at DESC
+            WHERE id = d.consumed_deposit_id
             LIMIT 1
         ) AS dep
-        WHERE d.user_id = $1 AND d.session_type = 'withdrawal' AND d.status = 'pending'
+        WHERE d.user_id = $1 
+          AND d.session_type = 'withdrawal' 
+          AND d.status = 'pending'
         ORDER BY d.created_at DESC
         LIMIT 1;
     `;
+    
     const { rows } = await client.query(query, [firebaseUid]);
 
     if (rows.length === 0) {
@@ -683,59 +695,31 @@ router.get('/sessions/pending-withdrawal', verifyFirebaseToken, async (req, res)
 
     const session = rows[0];
 
-    // Use the last known charge level from the database for pricing calculation.
-    const realTimeSoc = session.lastKnownChargeLevel || 0;
-
-    // Re-calculate the cost on the fly, just like in initiate-withdrawal
-    const settingsRes = await client.query("SELECT value FROM app_settings WHERE key = 'pricing'");
-    if (settingsRes.rows.length === 0) {
-      throw new Error('Pricing settings are not configured in the database.');
-    }
-    const pricingRules = settingsRes.rows[0].value;
-    console.log('Pricing rules fetched for pending withdrawal cost recalculation:', pricingRules);
-    const baseSwapFee = pricingRules.base_swap_fee || 0;
-    console.log('Base swap fee:', baseSwapFee);
-    const costPerChargePercent = pricingRules.cost_per_charge_percent || 0;
-    console.log('Cost per charge percent:', costPerChargePercent);
-
-    // Calculate duration and energy delivered
-
+    // 2. Calculate duration for the UI
     const chargeDurationMs = new Date() - new Date(session.depositCompletedAt);
     const chargeDurationMinutes = Math.round(chargeDurationMs / 60000);
-    const chargeAdded = Math.max(0, parseFloat(realTimeSoc) - parseFloat(session.initialCharge));
 
-    const chargingCost = chargeAdded * parseFloat(costPerChargePercent || 0);
-    const totalCost = parseFloat(Math.max(baseSwapFee, chargingCost).toFixed(2));
-
-    // Update the amount in the database for the eventual payment.
-    // This is a "fire-and-forget" update; we don't need to wait for it.
-    client.query("UPDATE deposits SET amount = $1 WHERE id = $2", [totalCost, session.sessionId])
-      .catch(err => logger.error(`Failed to background-update amount for session ${session.sessionId}:`, err));
-
-      res.status(200).json({
+    // 3. Return the response using the DB 'lockedAmount'
+    // This prevents the "refresh to get a cheaper price" exploit.
+    res.status(200).json({
       sessionId: session.sessionId,
-      amount: totalCost,
+      amount: parseFloat(session.lockedAmount), // The price is now fixed
       durationMinutes: chargeDurationMinutes,
-      pricingRules: pricingRules,
-      baseSwapFee: parseFloat(baseSwapFee),
-      costPerChargePercent: parseFloat(costPerChargePercent),
-      soc: parseFloat(chargeAdded),
-      initialCharge: parseFloat(session.initialCharge),
+      socAtInitiation: parseFloat(session.initialCharge),
+      currentBoothSoc: parseFloat(session.currentSlotSoc),
+      boothUid: session.boothUid,
+      slotIdentifier: session.slotIdentifier,
       depositCompletedAt: session.depositCompletedAt
     });
+
   } catch (error) {
-    logger.error(`Failed to get pending withdrawal session for user ${firebaseUid}:`, error);
+    logger.error(`Failed to get pending withdrawal for user ${firebaseUid}:`, error);
     res.status(500).json({ error: 'Failed to retrieve pending session.', details: error.message });
   } finally {
     client.release();
   }
 });
 
-/**
- * GET /api/booths/withdrawal-status/:checkoutRequestId
- * @summary Poll for withdrawal payment status
- * Called by the frontend to poll for the status of a withdrawal payment.
- */
 router.get('/withdrawal-status/:checkoutRequestId', verifyFirebaseToken, async (req, res) => {
   const { checkoutRequestId } = req.params;
   const { uid: firebaseUid } = req.user;
