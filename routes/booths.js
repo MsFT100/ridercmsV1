@@ -699,12 +699,15 @@ router.get('/sessions/pending-withdrawal', verifyFirebaseToken, async (req, res)
     const chargeDurationMs = new Date() - new Date(session.depositCompletedAt);
     const chargeDurationMinutes = Math.round(chargeDurationMs / 60000);
 
+    const socGained = Math.max(0, parseFloat(session.initialCharge) - parseFloat(session.startingSocAtDeposit));
+
     // 3. Return the response using the DB 'lockedAmount'
     // This prevents the "refresh to get a cheaper price" exploit.
     res.status(200).json({
       sessionId: session.sessionId,
       amount: parseFloat(session.lockedAmount), // The price is now fixed
       durationMinutes: chargeDurationMinutes,
+      soc: socGained,
       socAtInitiation: parseFloat(session.initialCharge),
       currentBoothSoc: parseFloat(session.currentSlotSoc),
       boothUid: session.boothUid,
