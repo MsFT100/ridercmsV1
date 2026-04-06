@@ -183,6 +183,7 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (req, res) => {
 
     const db = getDatabase();
     let assignedSlot = null;
+    let assignedSlotData = null;
 
     // 3. Verify + atomically reserve slot
     for (const potentialSlot of potentialSlotsRes.rows) {
@@ -211,6 +212,7 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (req, res) => {
 
       if (slotReserveRes.rowCount > 0) {
         assignedSlot = slotReserveRes.rows[0];
+        assignedSlotData = snapshot.val();
         break;
       }
     }
@@ -230,8 +232,8 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (req, res) => {
       });
 
     // After reading Firebase snapshot for the slot 
-    const telemetry = snapshot.val()?.telemetry || {};
-    const socAtDeposit = telemetry.soc ?? snapshot.val()?.soc ?? null;
+    const telemetry = assignedSlotData?.telemetry || {};
+    const socAtDeposit = telemetry.soc ?? assignedSlotData?.soc ?? null;
 
     // 5. Create deposit session
     await client.query(
