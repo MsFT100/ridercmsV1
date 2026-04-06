@@ -464,9 +464,9 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
     let chargeLevel;
     if (snapshot.exists() && snapshot.val()) {
       const slotData = snapshot.val();
-      // Prioritize telemetry.soc as it's typically the most real-time and accurate reading from the device.
-      // Fallback to the top-level 'soc' field, then to the last known charge level from the database.
-      chargeLevel = slotData.telemetry?.soc ?? slotData.soc;
+      // Prioritize a 'final_soc' field if the hardware sets it, otherwise use the latest telemetry.
+      // Retuning back to soc .. 
+      chargeLevel = slotData.telemetry.soc || slotData.soc; // Fallback to DB if Firebase doesn't have the data.
     } else {
       // Fallback to the last known value from our database if Firebase is unavailable.
       chargeLevel = dbChargeLevel;
@@ -508,7 +508,7 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
         ($1, $2, $3, 'withdrawal', 'pending', $4, $5, $6)
       RETURNING id
       `,
-      [firebaseUid, boothId, slotId, totalCost, depositCreditId]
+      [firebaseUid, boothId, slotId, totalCost, chargeLevel, depositCreditId]
     );
 
     const sessionId = sessionRes.rows[0].id;
@@ -529,7 +529,6 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
       amount: totalCost,
       soc: parseFloat(socGained.toFixed(1)),
       initialCharge: parseFloat(userOriginalSoc),
-      socAtWithdrawal: parseFloat(chargeLevel.toFixed(1)), // Add the actual SOC at withdrawal
       depositCompletedAt,
       durationMinutes: chargeDurationMinutes,
     });
