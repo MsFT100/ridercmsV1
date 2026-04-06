@@ -519,7 +519,10 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
     // Calculate gain relative to what the user dropped off (matches the refresh logic)
     const socGained = Math.max(0, parseFloat(chargeLevel) - parseFloat(userOriginalSoc));
 
-    
+      
+    const chargeDurationMs = new Date() - new Date(depositCompletedAt);
+    const chargeDurationMinutes = Math.round(chargeDurationMs / 60000);
+
 
     return res.status(200).json({
       message: 'Withdrawal session created. Please confirm cost before payment.',
@@ -528,6 +531,7 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
       soc: parseFloat(socGained.toFixed(1)),
       initialCharge: parseFloat(userOriginalSoc),
       depositCompletedAt,
+      durationMinutes: chargeDurationMinutes,
     });
   } catch (error) {
     await client.query('ROLLBACK');
