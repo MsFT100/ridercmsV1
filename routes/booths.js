@@ -231,17 +231,11 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (req, res) => {
         openForCollection: false,
       });
 
-    // After reading Firebase snapshot for the slot 
-    const telemetry = assignedSlotData?.telemetry || {};
-    const socAtDeposit = telemetry.soc ?? assignedSlotData?.soc ?? null;
-
     // 5. Create deposit session
     await client.query(
-      `
-      INSERT INTO deposits (user_id, booth_id, slot_id, session_type, status, initial_charge_level)
-      VALUES ($1, $2, $3, 'deposit', 'opening', $4)
-      `,
-      [firebaseUid, boothId, slotId, socAtDeposit]
+      `INSERT INTO deposits (user_id, booth_id, slot_id, session_type, status)
+      VALUES ($1, $2, $3, 'deposit', 'opening')`,
+      [firebaseUid, boothId, slotId]
     );
 
     await client.query('COMMIT');
@@ -470,9 +464,12 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
     let chargeLevel;
     if (snapshot.exists() && snapshot.val()) {
       const slotData = snapshot.val();
-      // Prioritize a 'final_soc' field if the hardware sets it, otherwise use the latest telemetry.
-      // Retuning back to soc .. 
-      chargeLevel = slotData.telemetry.soc || slotData.soc; // Fallback to DB if Firebase doesn't have the data.
+      // Prioritize telemetry SOC, but guard against temporary '0' fluctuations 
+      // that often happen right after stopping a charge.
+      const telemetrySoc = slotData.telemetry?.soc;
+      chargeLevel = (telemetrySoc !== undefined && telemetrySoc !== 0) 
+        ? telemetrySoc 
+        : (slotData.soc || dbChargeLevel);
     } else {
       // Fallback to the last known value from our database if Firebase is unavailable.
       chargeLevel = dbChargeLevel;
