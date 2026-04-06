@@ -519,6 +519,8 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
     // Calculate gain relative to what the user dropped off (matches the refresh logic)
     const socGained = Math.max(0, parseFloat(chargeLevel) - parseFloat(userOriginalSoc));
 
+    
+
     return res.status(200).json({
       message: 'Withdrawal session created. Please confirm cost before payment.',
       sessionId: sessionId,
