@@ -10,6 +10,136 @@ const { completePaidWithdrawal } = require('../utils/sessionUtils');
 /** Helper function to introduce a delay */
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+const getEnvInt = (name, fallback) => {
+  const parsed = Number.parseInt(process.env[name], 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const WITHDRAWAL_SOC_CONFIG = {
+  relayOffTimeoutMs: getEnvInt('WITHDRAWAL_RELAY_OFF_TIMEOUT_MS', 45000),
+  pollIntervalMs: getEnvInt('WITHDRAWAL_SOC_POLL_INTERVAL_MS', 2000),
+  sampleCount: Math.max(1, getEnvInt('WITHDRAWAL_SOC_SAMPLE_COUNT', 4)),
+};
+
+function normalizeSoc(rawSoc) {
+  const parsed = Number(rawSoc);
+  if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 100) {
+    return null;
+  }
+  return parsed;
+}
+
+function extractValidSoc(slotData, fallbackSoc = null) {
+  const telemetrySoc = normalizeSoc(slotData?.telemetry?.soc);
+  if (telemetrySoc !== null) {
+    return telemetrySoc;
+  }
+
+  const topLevelSoc = normalizeSoc(slotData?.soc);
+  if (topLevelSoc !== null) {
+    return topLevelSoc;
+  }
+
+  return normalizeSoc(fallbackSoc);
+}
+
+function isRelayOff(slotData) {
+  if (!slotData || typeof slotData !== 'object') {
+    return false;
+  }
+
+  const ack = slotData?.command?.ack;
+  if (typeof ack === 'string' && ack.includes('stopCharging_done')) {
+    return true;
+  }
+
+  if (typeof slotData?.telemetry?.relayOn === 'boolean') {
+    return slotData.telemetry.relayOn === false;
+  }
+
+  if (typeof slotData?.relayOn === 'boolean') {
+    return slotData.relayOn === false;
+  }
+
+  if (typeof slotData?.relay === 'string') {
+    return slotData.relay.trim().toUpperCase() === 'OFF';
+  }
+
+  return false;
+}
+
+async function captureSettledSocAfterStopCharging(slotRef, boothUid, slotIdentifier, fallbackSoc) {
+  const relayOffTimeoutMs = WITHDRAWAL_SOC_CONFIG.relayOffTimeoutMs;
+  const pollIntervalMs = WITHDRAWAL_SOC_CONFIG.pollIntervalMs;
+  const sampleCount = WITHDRAWAL_SOC_CONFIG.sampleCount;
+
+  let relayOffDetected = false;
+  let lastSlotData = null;
+
+  const relayWaitStartedAt = Date.now();
+
+  try {
+    while (Date.now() - relayWaitStartedAt < relayOffTimeoutMs) {
+      const snapshot = await slotRef.get();
+      if (snapshot.exists() && snapshot.val()) {
+        lastSlotData = snapshot.val();
+        if (isRelayOff(lastSlotData)) {
+          relayOffDetected = true;
+          break;
+        }
+      }
+
+      await delay(pollIntervalMs);
+    }
+  } catch (error) {
+    logger.warn(
+      `Failed while waiting for relay-off state on ${boothUid}/${slotIdentifier}. Falling back to DB SOC.`,
+      error
+    );
+    return extractValidSoc(lastSlotData, fallbackSoc) ?? 0;
+  }
+
+  if (!relayOffDetected) {
+    logger.warn(
+      `Relay-off was not observed within ${relayOffTimeoutMs}ms for ${boothUid}/${slotIdentifier}. Capturing best available SOC sample.`
+    );
+  }
+
+  const socSamples = [];
+  for (let i = 0; i < sampleCount; i += 1) {
+    if (i > 0) {
+      await delay(pollIntervalMs);
+    }
+
+    try {
+      const sampleSnapshot = await slotRef.get();
+      if (sampleSnapshot.exists() && sampleSnapshot.val()) {
+        lastSlotData = sampleSnapshot.val();
+      }
+    } catch (sampleError) {
+      logger.warn(
+        `SOC sample ${i + 1}/${sampleCount} failed for ${boothUid}/${slotIdentifier}. Continuing with available data.`,
+        sampleError
+      );
+    }
+
+    const sampledSoc = extractValidSoc(lastSlotData);
+    if (sampledSoc !== null) {
+      socSamples.push(sampledSoc);
+    }
+  }
+
+  const selectedSoc = socSamples.length > 0
+    ? Math.max(...socSamples) // Use highest sample to avoid transient low dips right after stopCharging.
+    : (extractValidSoc(lastSlotData, fallbackSoc) ?? 0);
+
+  logger.info(
+    `Final SOC capture for ${boothUid}/${slotIdentifier}: relayOffDetected=${relayOffDetected}, samples=[${socSamples.join(', ')}], selected=${selectedSoc}.`
+  );
+
+  return selectedSoc;
+}
+
 const router = Router();
 
 /**
@@ -454,26 +584,14 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
       startCharging: false,
     });
 
-    // Wait for a moment to allow the hardware to stop charging and report its final state.
-    // 20 seconds is a reasonable starting point. This can be tuned.
-    await delay(20000);
-
-    // Now, fetch the latest data from Firebase to get the most accurate final SOC.
-    const snapshot = await slotRef.get();
-
-    let chargeLevel;
-    if (snapshot.exists() && snapshot.val()) {
-      const slotData = snapshot.val();
-      // Prioritize telemetry SOC, but guard against temporary '0' fluctuations 
-      // that often happen right after stopping a charge.
-      const telemetrySoc = slotData.telemetry?.soc;
-      chargeLevel = (telemetrySoc !== undefined && telemetrySoc !== 0) 
-        ? telemetrySoc 
-        : (slotData.soc || dbChargeLevel);
-    } else {
-      // Fallback to the last known value from our database if Firebase is unavailable.
-      chargeLevel = dbChargeLevel;
-    }
+    // Capture SOC only after charging has actually stopped, then sample multiple times
+    // to avoid storing a temporary low fluctuation.
+    const chargeLevel = await captureSettledSocAfterStopCharging(
+      slotRef,
+      boothUid,
+      slotIdentifier,
+      dbChargeLevel
+    );
 
     /* -------------------------------------------------------
      * 3. Pricing

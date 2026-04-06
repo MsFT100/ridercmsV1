@@ -151,7 +151,7 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
     // --- Telemetry-based Deposit Completion ---
     // This is our most reliable fallback. It triggers if a battery *was not* present before,
     // but *is* present now, and the door is secure. This detects the transition.
-    console.log("Current DB status for slot", slotIdentifier, ":", currentDbStatus);
+    //rsconsole.log("Current DB status for slot", slotIdentifier, ":", currentDbStatus);
     if (currentDbStatus === 'opening') {
       logger.debug(`[Deposit Check] slot: ${slotIdentifier}, currentDbStatus: ${currentDbStatus}, wasBatteryInserted: ${wasBatteryInserted}, batteryInserted: ${telemetry.batteryInserted}, doorClosed: ${telemetry.doorClosed}, doorLocked: ${telemetry.doorLocked}`);
     }
