@@ -434,12 +434,13 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
       slotIdentifier,
       boothId,
       boothUid,
+      initialCharge: userOriginalSoc, // This is the user's original drop-off SOC
     } = batteryRes.rows[0];
 
     // For pricing, we need the initial charge of the battery the user is about to take, not the one they deposited.
     // We'll fetch this from the slot they are withdrawing from.
     const initialChargeRes = await client.query('SELECT initial_charge_level FROM deposits WHERE slot_id = $1 AND session_type = \'deposit\' AND status = \'completed\' ORDER BY completed_at DESC LIMIT 1', [slotId]);
-    const initialCharge = initialChargeRes.rows.length > 0 ? initialChargeRes.rows[0].initial_charge_level : 0;
+    const slotInitialSoc = initialChargeRes.rows.length > 0 ? initialChargeRes.rows[0].initial_charge_level : 0;
 
     /* -------------------------------------------------------
      * 2. Stop charging and fetch final SOC
@@ -454,8 +455,8 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
     });
 
     // Wait for a moment to allow the hardware to stop charging and report its final state.
-    // 7 seconds is a reasonable starting point. This can be tuned.
-    await delay(7000);
+    // 20 seconds is a reasonable starting point. This can be tuned.
+    await delay(20000);
 
     // Now, fetch the latest data from Firebase to get the most accurate final SOC.
     const snapshot = await slotRef.get();
@@ -487,12 +488,12 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
     const baseSwapFee = pricingRules.base_swap_fee;
     const costPerChargePercent = pricingRules.cost_per_charge_percent;
 
-    const chargeAdded = Math.max(
+    const chargeAddedToBattery = Math.max(
       0,
-      parseFloat(chargeLevel) - parseFloat(initialCharge)
+      parseFloat(chargeLevel) - parseFloat(slotInitialSoc)
     );
 
-    const chargeComponent = chargeAdded * parseFloat(costPerChargePercent || 0);
+    const chargeComponent = chargeAddedToBattery * parseFloat(costPerChargePercent || 0);
     const totalCost = parseFloat(
       Math.max(baseSwapFee, chargeComponent).toFixed(2)
     );
@@ -515,12 +516,15 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
 
     await client.query('COMMIT');
 
+    // Calculate gain relative to what the user dropped off (matches the refresh logic)
+    const socGained = Math.max(0, parseFloat(chargeLevel) - parseFloat(userOriginalSoc));
+
     return res.status(200).json({
       message: 'Withdrawal session created. Please confirm cost before payment.',
       sessionId: sessionId,
       amount: totalCost,
-      soc: chargeAdded,
-      initialCharge: parseFloat(initialCharge),
+      soc: parseFloat(socGained.toFixed(1)),
+      initialCharge: parseFloat(userOriginalSoc),
       depositCompletedAt,
     });
   } catch (error) {
