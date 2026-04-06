@@ -7,18 +7,9 @@ const verifyApiKey = require('../middleware/verifyApiKey');
 const { initiateSTKPush, querySTKStatus } = require('../utils/mpesa'); // Import the specific function
 const { completePaidWithdrawal } = require('../utils/sessionUtils');
 
-/** Helper function to introduce a delay */
-const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
-
 const getEnvInt = (name, fallback) => {
   const parsed = Number.parseInt(process.env[name], 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-};
-
-const WITHDRAWAL_SOC_CONFIG = {
-  relayOffTimeoutMs: getEnvInt('WITHDRAWAL_RELAY_OFF_TIMEOUT_MS', 45000),
-  pollIntervalMs: getEnvInt('WITHDRAWAL_SOC_POLL_INTERVAL_MS', 2000),
-  sampleCount: Math.max(1, getEnvInt('WITHDRAWAL_SOC_SAMPLE_COUNT', 4)),
 };
 
 function normalizeSoc(rawSoc) {
@@ -41,11 +32,6 @@ function extractValidSoc(slotData, fallbackSoc = null) {
   }
 
   return normalizeSoc(fallbackSoc);
-}
-
-function getTelemetryTimestamp(slotData) {
-  const parsed = Number(slotData?.telemetry?.timestamp);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
 function isRelayOff(slotData) {
@@ -73,123 +59,39 @@ function isRelayOff(slotData) {
   return false;
 }
 
-async function captureSettledSocAfterStopCharging(
-  slotRef,
-  boothUid,
-  slotIdentifier,
-  fallbackSoc,
-  baselineTelemetryTimestamp = null
-) {
-  const relayOffTimeoutMs = WITHDRAWAL_SOC_CONFIG.relayOffTimeoutMs;
-  const pollIntervalMs = WITHDRAWAL_SOC_CONFIG.pollIntervalMs;
-  const sampleCount = WITHDRAWAL_SOC_CONFIG.sampleCount;
-
-  let relayOffDetected = false;
-  let freshTelemetryDetected = baselineTelemetryTimestamp === null;
-  let lastSlotData = null;
-
-  const relayWaitStartedAt = Date.now();
-
-  try {
-    while (Date.now() - relayWaitStartedAt < relayOffTimeoutMs) {
-      const snapshot = await slotRef.get();
-      if (snapshot.exists() && snapshot.val()) {
-        lastSlotData = snapshot.val();
-        const telemetryTimestamp = getTelemetryTimestamp(lastSlotData);
-        if (
-          !freshTelemetryDetected &&
-          telemetryTimestamp !== null &&
-          telemetryTimestamp > baselineTelemetryTimestamp
-        ) {
-          freshTelemetryDetected = true;
-        }
-
-        if (isRelayOff(lastSlotData)) {
-          relayOffDetected = true;
-          // If telemetry includes a timestamp, prefer a fresh frame after stopCharging
-          // so we don't lock to a stale pre-stop SOC.
-          if (
-            freshTelemetryDetected ||
-            telemetryTimestamp === null ||
-            baselineTelemetryTimestamp === null
-          ) {
-            break;
-          }
-        }
-      }
-
-      await delay(pollIntervalMs);
-    }
-  } catch (error) {
-    logger.warn(
-      `Failed while waiting for relay-off state on ${boothUid}/${slotIdentifier}. Falling back to DB SOC.`,
-      error
-    );
-    return extractValidSoc(lastSlotData, fallbackSoc) ?? 0;
-  }
-
-  if (!relayOffDetected) {
-    logger.warn(
-      `Relay-off was not observed within ${relayOffTimeoutMs}ms for ${boothUid}/${slotIdentifier}. Capturing best available SOC sample.`
-    );
-  } else if (!freshTelemetryDetected) {
-    logger.warn(
-      `Relay-off detected but telemetry timestamp did not advance after stopCharging for ${boothUid}/${slotIdentifier}. Capturing best available SOC sample.`
-    );
-  }
-
-  const freshSocSamples = [];
-  const allSocSamples = [];
-  const sampleDebug = [];
-  for (let i = 0; i < sampleCount; i += 1) {
-    if (i > 0) {
-      await delay(pollIntervalMs);
-    }
-
-    try {
-      const sampleSnapshot = await slotRef.get();
-      if (sampleSnapshot.exists() && sampleSnapshot.val()) {
-        lastSlotData = sampleSnapshot.val();
-      }
-    } catch (sampleError) {
-      logger.warn(
-        `SOC sample ${i + 1}/${sampleCount} failed for ${boothUid}/${slotIdentifier}. Continuing with available data.`,
-        sampleError
-      );
-    }
-
-    const sampledTimestamp = getTelemetryTimestamp(lastSlotData);
-    const sampledSoc = extractValidSoc(lastSlotData);
-    const isFreshSample =
-      baselineTelemetryTimestamp === null ||
-      sampledTimestamp === null ||
-      sampledTimestamp > baselineTelemetryTimestamp;
-
-    sampleDebug.push(
-      `${i + 1}:${sampledSoc !== null ? sampledSoc : 'null'}@${sampledTimestamp !== null ? sampledTimestamp : 'na'}${isFreshSample ? ':fresh' : ':stale'}`
-    );
-
-    if (sampledSoc !== null) {
-      allSocSamples.push(sampledSoc);
-      if (isFreshSample) {
-        freshSocSamples.push(sampledSoc);
-      }
-    }
-  }
-
-  const candidateSamples = freshSocSamples.length > 0 ? freshSocSamples : allSocSamples;
-  const selectedSoc = candidateSamples.length > 0
-    ? Math.max(...candidateSamples) // Use highest sample to avoid transient low dips right after stopCharging.
-    : (extractValidSoc(lastSlotData, fallbackSoc) ?? 0);
-
-  logger.info(
-    `Final SOC capture for ${boothUid}/${slotIdentifier}: relayOffDetected=${relayOffDetected}, freshTelemetryDetected=${freshTelemetryDetected}, baselineTs=${baselineTelemetryTimestamp ?? 'na'}, samples=[${sampleDebug.join(' | ')}], selected=${selectedSoc}.`
-  );
-
-  return selectedSoc;
-}
-
 const router = Router();
+
+const WITHDRAWAL_BATTERY_QUERY = `
+  -- Find the user's "deposit credit" and the details of the battery they deposited.
+  -- This credit is a completed deposit session that hasn't been redeemed by a withdrawal.
+  SELECT
+    d.id as "depositCreditId",
+    d.completed_at AS "depositCompletedAt",
+    d.initial_charge_level AS "initialCharge",
+    s.id AS "slotId",
+    s.slot_identifier AS "slotIdentifier",
+    s.charge_level_percent AS "chargeLevel",
+    b.id AS "boothId",
+    b.booth_uid AS "boothUid"
+  FROM deposits d
+  JOIN booth_slots s ON d.slot_id = s.id
+  JOIN booths b ON d.booth_id = b.id
+  WHERE d.user_id = $1
+    AND d.session_type = 'deposit'
+    AND d.status = 'completed' -- 'completed' means deposited, 'redeemed' means withdrawn against.
+  ORDER BY d.completed_at DESC
+  LIMIT 1;
+`;
+
+async function getWithdrawalBatteryContext(client, firebaseUid) {
+  const batteryRes = await client.query(WITHDRAWAL_BATTERY_QUERY, [firebaseUid]);
+
+  if (batteryRes.rows.length === 0) {
+    throw new Error('NO_DEPOSITED_BATTERY');
+  }
+
+  return batteryRes.rows[0];
+}
 
 /**
  * GET /api/booths
@@ -546,6 +448,102 @@ router.get('/my-battery-status', verifyFirebaseToken, async (req, res) => {
 });
 
 /**
+ * POST /api/booths/stop-charging
+ * Allows the app to stop charging first, then wait before creating a withdrawal session.
+ */
+router.post('/stop-charging', verifyFirebaseToken, async (req, res) => {
+  const { uid: firebaseUid } = req.user;
+  const pool = await poolPromise;
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    // Serialize per-user actions to avoid racing with initiate-withdrawal.
+    await client.query(
+      'SELECT id FROM users WHERE user_id = $1 FOR UPDATE',
+      [firebaseUid]
+    );
+
+    const existingSessionRes = await client.query(
+      `
+      SELECT 1
+      FROM deposits
+      WHERE user_id = $1
+        AND status IN ('pending', 'opening', 'in_progress')
+      LIMIT 1
+      `,
+      [firebaseUid]
+    );
+
+    if (existingSessionRes.rows.length > 0) {
+      throw new Error('ACTIVE_SESSION_EXISTS');
+    }
+
+    const batteryContext = await getWithdrawalBatteryContext(client, firebaseUid);
+    const {
+      chargeLevel: dbChargeLevel,
+      slotIdentifier,
+      boothUid,
+    } = batteryContext;
+
+    const db = getDatabase();
+    const slotRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}`);
+    const snapshot = await slotRef.get();
+    const slotData = snapshot.exists() && snapshot.val() ? snapshot.val() : null;
+
+    const socAtStopRequest = extractValidSoc(slotData, dbChargeLevel);
+    const relayAlreadyOff = isRelayOff(slotData);
+
+    await slotRef.child('command').update({
+      stopCharging: true,
+      startCharging: false,
+    });
+
+    await client.query('COMMIT');
+
+    const recommendedWaitSeconds = getEnvInt('WITHDRAWAL_STOP_WAIT_SECONDS', 60);
+    return res.status(200).json({
+      message: relayAlreadyOff
+        ? 'Charging is already off. You can continue to withdrawal.'
+        : 'Stop charging command sent. Wait before initiating withdrawal.',
+      boothUid,
+      slotIdentifier,
+      socAtStopRequest: socAtStopRequest !== null ? Number(socAtStopRequest.toFixed(1)) : null,
+      relayAlreadyOff,
+      recommendedWaitSeconds,
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+
+    if (error.message === 'ACTIVE_SESSION_EXISTS') {
+      return res.status(409).json({
+        error: 'Active session exists',
+        message: 'You already have an active session. Complete it before stopping charge.',
+      });
+    }
+
+    if (error.message === 'NO_DEPOSITED_BATTERY') {
+      return res.status(404).json({
+        error: 'No deposited battery',
+        message: 'You do not have a battery currently deposited.',
+      });
+    }
+
+    logger.error(
+      `Failed to stop charging for user ${firebaseUid}:`,
+      error
+    );
+    return res.status(500).json({
+      error: 'Failed to stop charging.',
+      details: error.message,
+    });
+  } finally {
+    client.release();
+  }
+});
+
+/**
  * POST /api/booths/initiate-withdrawal
  * Called by a user's app to start the collection of their charged battery.
  */
@@ -579,32 +577,7 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
     /* -------------------------------------------------------
      * 1. Find user's battery & slot
      * ----------------------------------------------------- */
-    const batteryQuery = `
-      -- Find the user's "deposit credit" and the details of the battery they deposited.
-      -- This credit is a completed deposit session that hasn't been redeemed by a withdrawal.
-      SELECT
-        d.id as "depositCreditId",
-        d.completed_at AS "depositCompletedAt",
-        d.initial_charge_level AS "initialCharge",
-        s.id AS "slotId",
-        s.slot_identifier AS "slotIdentifier",
-        s.charge_level_percent AS "chargeLevel",
-        b.id AS "boothId",
-        b.booth_uid AS "boothUid"
-      FROM deposits d
-      JOIN booth_slots s ON d.slot_id = s.id
-      JOIN booths b ON d.booth_id = b.id
-      WHERE d.user_id = $1
-        AND d.session_type = 'deposit'
-        AND d.status = 'completed'; -- 'completed' means deposited, 'redeemed' means withdrawn against.
-    `;
-
-    const batteryRes = await client.query(batteryQuery, [firebaseUid]);
-
-    if (batteryRes.rows.length === 0) {
-      throw new Error('You do not have a battery currently deposited.');
-    }
-
+    const batteryContext = await getWithdrawalBatteryContext(client, firebaseUid);
     const {
       chargeLevel: dbChargeLevel,
       depositCreditId,
@@ -614,7 +587,7 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
       boothId,
       boothUid,
       initialCharge: userOriginalSoc, // This is the user's original drop-off SOC
-    } = batteryRes.rows[0];
+    } = batteryContext;
 
     // For pricing, we need the initial charge of the battery the user is about to take, not the one they deposited.
     // We'll fetch this from the slot they are withdrawing from.
@@ -622,31 +595,18 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
     const slotInitialSoc = initialChargeRes.rows.length > 0 ? initialChargeRes.rows[0].initial_charge_level : 0;
 
     /* -------------------------------------------------------
-     * 2. Stop charging and fetch final SOC
+     * 2. Capture final SOC after stop-charging phase
      * ----------------------------------------------------- */
     const db = getDatabase();
     const slotRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}`);
+    const snapshot = await slotRef.get();
+    const slotData = snapshot.exists() && snapshot.val() ? snapshot.val() : null;
 
-    // Snapshot before stopping charge so we can confirm a fresh telemetry frame after the stop command.
-    const preStopSnapshot = await slotRef.get();
-    const preStopSlotData = preStopSnapshot.exists() && preStopSnapshot.val() ? preStopSnapshot.val() : null;
-    const baselineTelemetryTimestamp = getTelemetryTimestamp(preStopSlotData);
+    if (slotData && !isRelayOff(slotData)) {
+      throw new Error('CHARGING_STILL_ACTIVE');
+    }
 
-    // First, send the command to stop charging the battery.
-    await slotRef.child('command').update({
-      stopCharging: true,
-      startCharging: false,
-    });
-
-    // Capture SOC only after charging has actually stopped, then sample multiple times
-    // to avoid storing a temporary low fluctuation.
-    const chargeLevel = await captureSettledSocAfterStopCharging(
-      slotRef,
-      boothUid,
-      slotIdentifier,
-      dbChargeLevel,
-      baselineTelemetryTimestamp
-    );
+    const chargeLevel = extractValidSoc(slotData, dbChargeLevel) ?? 0;
 
     /* -------------------------------------------------------
      * 3. Pricing
@@ -714,6 +674,20 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
         error: 'Active session exists',
         message:
           'You already have an active session. Complete it before withdrawing.',
+      });
+    }
+
+    if (error.message === 'NO_DEPOSITED_BATTERY') {
+      return res.status(404).json({
+        error: 'No deposited battery',
+        message: 'You do not have a battery currently deposited.',
+      });
+    }
+
+    if (error.message === 'CHARGING_STILL_ACTIVE') {
+      return res.status(409).json({
+        error: 'Charging still active',
+        message: 'Charging is still active for this slot. Call /api/booths/stop-charging and wait before initiating withdrawal.',
       });
     }
 
