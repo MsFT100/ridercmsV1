@@ -461,7 +461,7 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
               // The battery object contains the most up-to-date info
               battery: {
                 isOccupied: slotData.battery === true || slotData.devicePresent === true,
-                chargeLevel: telemetry.resSoc || 0,
+                chargeLevel: telemetry.soc || slotData.soc || 0,
                 voltage: telemetry.voltage,
                 temperature: telemetry.temperatureC,
               }

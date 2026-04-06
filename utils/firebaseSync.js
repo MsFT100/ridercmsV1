@@ -37,6 +37,23 @@ function mapDoorStatus(doorClosed, doorLocked) {
   return 'open';
 }
 
+function normalizeSoc(rawSoc) {
+  const parsed = Number(rawSoc);
+  if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 100) {
+    return null;
+  }
+  return parsed;
+}
+
+function getChargeSocFromTelemetry(telemetry) {
+  const soc = normalizeSoc(telemetry?.soc);
+  if (soc !== null) {
+    return soc;
+  }
+
+  return null;
+}
+
 /**
  * A robust function to find and complete a deposit session.
  * This can be triggered by telemetry changes or an explicit ACK from the hardware.
@@ -47,7 +64,7 @@ function mapDoorStatus(doorClosed, doorLocked) {
  * @param {object} telemetry - The latest telemetry data for the slot.
  */
 async function handleDepositCompletion(pgClient, boothUid, slotIdentifier, slotId, telemetry) {
-  const chargeLevel = telemetry.soc || null;
+  const chargeLevel = getChargeSocFromTelemetry(telemetry);
   const findAndUpdateDepositQuery = `
     UPDATE deposits
     SET
@@ -241,7 +258,7 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
     // If a slot is administratively disabled, its status should not be changed by telemetry updates.
     const status = currentDbStatus== 'disabled' ? 'disabled' : mapSlotStatus(slotData.status, currentDbStatus, telemetry.batteryInserted);
     const doorStatus = mapDoorStatus(telemetry.doorClosed, telemetry.doorLocked);
-    const chargeLevel = telemetry.soc || null;
+    const chargeLevel = getChargeSocFromTelemetry(telemetry);
 
     const result = await pgClient.query(upsertQuery, [
       boothUid,

@@ -43,6 +43,11 @@ function extractValidSoc(slotData, fallbackSoc = null) {
   return normalizeSoc(fallbackSoc);
 }
 
+function getTelemetryTimestamp(slotData) {
+  const parsed = Number(slotData?.telemetry?.timestamp);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
 function isRelayOff(slotData) {
   if (!slotData || typeof slotData !== 'object') {
     return false;
@@ -68,12 +73,19 @@ function isRelayOff(slotData) {
   return false;
 }
 
-async function captureSettledSocAfterStopCharging(slotRef, boothUid, slotIdentifier, fallbackSoc) {
+async function captureSettledSocAfterStopCharging(
+  slotRef,
+  boothUid,
+  slotIdentifier,
+  fallbackSoc,
+  baselineTelemetryTimestamp = null
+) {
   const relayOffTimeoutMs = WITHDRAWAL_SOC_CONFIG.relayOffTimeoutMs;
   const pollIntervalMs = WITHDRAWAL_SOC_CONFIG.pollIntervalMs;
   const sampleCount = WITHDRAWAL_SOC_CONFIG.sampleCount;
 
   let relayOffDetected = false;
+  let freshTelemetryDetected = baselineTelemetryTimestamp === null;
   let lastSlotData = null;
 
   const relayWaitStartedAt = Date.now();
@@ -83,9 +95,26 @@ async function captureSettledSocAfterStopCharging(slotRef, boothUid, slotIdentif
       const snapshot = await slotRef.get();
       if (snapshot.exists() && snapshot.val()) {
         lastSlotData = snapshot.val();
+        const telemetryTimestamp = getTelemetryTimestamp(lastSlotData);
+        if (
+          !freshTelemetryDetected &&
+          telemetryTimestamp !== null &&
+          telemetryTimestamp > baselineTelemetryTimestamp
+        ) {
+          freshTelemetryDetected = true;
+        }
+
         if (isRelayOff(lastSlotData)) {
           relayOffDetected = true;
-          break;
+          // If telemetry includes a timestamp, prefer a fresh frame after stopCharging
+          // so we don't lock to a stale pre-stop SOC.
+          if (
+            freshTelemetryDetected ||
+            telemetryTimestamp === null ||
+            baselineTelemetryTimestamp === null
+          ) {
+            break;
+          }
         }
       }
 
@@ -103,9 +132,15 @@ async function captureSettledSocAfterStopCharging(slotRef, boothUid, slotIdentif
     logger.warn(
       `Relay-off was not observed within ${relayOffTimeoutMs}ms for ${boothUid}/${slotIdentifier}. Capturing best available SOC sample.`
     );
+  } else if (!freshTelemetryDetected) {
+    logger.warn(
+      `Relay-off detected but telemetry timestamp did not advance after stopCharging for ${boothUid}/${slotIdentifier}. Capturing best available SOC sample.`
+    );
   }
 
-  const socSamples = [];
+  const freshSocSamples = [];
+  const allSocSamples = [];
+  const sampleDebug = [];
   for (let i = 0; i < sampleCount; i += 1) {
     if (i > 0) {
       await delay(pollIntervalMs);
@@ -123,18 +158,32 @@ async function captureSettledSocAfterStopCharging(slotRef, boothUid, slotIdentif
       );
     }
 
+    const sampledTimestamp = getTelemetryTimestamp(lastSlotData);
     const sampledSoc = extractValidSoc(lastSlotData);
+    const isFreshSample =
+      baselineTelemetryTimestamp === null ||
+      sampledTimestamp === null ||
+      sampledTimestamp > baselineTelemetryTimestamp;
+
+    sampleDebug.push(
+      `${i + 1}:${sampledSoc !== null ? sampledSoc : 'null'}@${sampledTimestamp !== null ? sampledTimestamp : 'na'}${isFreshSample ? ':fresh' : ':stale'}`
+    );
+
     if (sampledSoc !== null) {
-      socSamples.push(sampledSoc);
+      allSocSamples.push(sampledSoc);
+      if (isFreshSample) {
+        freshSocSamples.push(sampledSoc);
+      }
     }
   }
 
-  const selectedSoc = socSamples.length > 0
-    ? Math.max(...socSamples) // Use highest sample to avoid transient low dips right after stopCharging.
+  const candidateSamples = freshSocSamples.length > 0 ? freshSocSamples : allSocSamples;
+  const selectedSoc = candidateSamples.length > 0
+    ? Math.max(...candidateSamples) // Use highest sample to avoid transient low dips right after stopCharging.
     : (extractValidSoc(lastSlotData, fallbackSoc) ?? 0);
 
   logger.info(
-    `Final SOC capture for ${boothUid}/${slotIdentifier}: relayOffDetected=${relayOffDetected}, samples=[${socSamples.join(', ')}], selected=${selectedSoc}.`
+    `Final SOC capture for ${boothUid}/${slotIdentifier}: relayOffDetected=${relayOffDetected}, freshTelemetryDetected=${freshTelemetryDetected}, baselineTs=${baselineTelemetryTimestamp ?? 'na'}, samples=[${sampleDebug.join(' | ')}], selected=${selectedSoc}.`
   );
 
   return selectedSoc;
@@ -473,7 +522,7 @@ router.get('/my-battery-status', verifyFirebaseToken, async (req, res) => {
     }
 
     const firebaseData = snapshot.val();
-    const realTimeCharge = firebaseData.soc || 0;
+    const realTimeCharge = extractValidSoc(firebaseData, lastKnownChargeLevel) ?? 0;
     const lastChargeLevelSoc = lastKnownChargeLevel;
     const realTimeTelemetry = firebaseData.telemetry || null;
   
@@ -578,6 +627,11 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
     const db = getDatabase();
     const slotRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}`);
 
+    // Snapshot before stopping charge so we can confirm a fresh telemetry frame after the stop command.
+    const preStopSnapshot = await slotRef.get();
+    const preStopSlotData = preStopSnapshot.exists() && preStopSnapshot.val() ? preStopSnapshot.val() : null;
+    const baselineTelemetryTimestamp = getTelemetryTimestamp(preStopSlotData);
+
     // First, send the command to stop charging the battery.
     await slotRef.child('command').update({
       stopCharging: true,
@@ -590,7 +644,8 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
       slotRef,
       boothUid,
       slotIdentifier,
-      dbChargeLevel
+      dbChargeLevel,
+      baselineTelemetryTimestamp
     );
 
     /* -------------------------------------------------------
