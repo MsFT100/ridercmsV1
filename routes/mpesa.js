@@ -6,6 +6,33 @@ const { completePaidWithdrawal } = require('../utils/sessionUtils');
 
 const router = Router();
 
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+function isPoolConnectTimeoutError(error) {
+  return String(error?.message || '').includes('timeout exceeded when trying to connect');
+}
+
+async function acquireClientWithRetry(pool, maxAttempts = 3) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await pool.connect();
+    } catch (error) {
+      const isTimeout = isPoolConnectTimeoutError(error);
+      if (!isTimeout || attempt === maxAttempts) {
+        throw error;
+      }
+
+      const backoffMs = attempt * 250;
+      logger.warn(
+        `M-Pesa callback DB connect timeout (attempt ${attempt}/${maxAttempts}). Retrying in ${backoffMs}ms.`
+      );
+      await sleep(backoffMs);
+    }
+  }
+
+  throw new Error('Failed to acquire database client after retries.');
+}
+
 /**
  * POST /api/mpesa/callback
  * This is the callback URL that M-Pesa will post to after an STK push transaction.
@@ -27,9 +54,10 @@ router.post('/callback', async (req, res) => {
   res.status(200).json({ ResultCode: 0, ResultDesc: 'Accepted' });
 
   const pool = await poolPromise;
-  const client = await pool.connect();
+  let client = null;
 
   try {
+    client = await acquireClientWithRetry(pool);
     await client.query('BEGIN');
 
     // 1️⃣ Persist raw callback (audit trail)
@@ -72,7 +100,7 @@ router.post('/callback', async (req, res) => {
     }
 
     // 3️⃣ Successful payment
-    if (stkCallback.ResultCode === 0) {
+    if (Number(stkCallback.ResultCode) === 0) {
       await completePaidWithdrawal(client, checkoutRequestId);
 
       logger.info(`Payment confirmed for ${checkoutRequestId}`);
@@ -95,10 +123,14 @@ router.post('/callback', async (req, res) => {
 
     await client.query('COMMIT');
   } catch (error) {
-    await client.query('ROLLBACK');
+    if (client) {
+      await client.query('ROLLBACK');
+    }
     logger.error('Error processing M-Pesa callback:', error);
   } finally {
-    client.release();
+    if (client) {
+      client.release();
+    }
   }
 });
 
