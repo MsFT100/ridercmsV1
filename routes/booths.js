@@ -502,7 +502,7 @@ router.post('/stop-charging', verifyFirebaseToken, async (req, res) => {
 
     await client.query('COMMIT');
 
-    const recommendedWaitSeconds = getEnvInt('WITHDRAWAL_STOP_WAIT_SECONDS', 60);
+    const recommendedWaitSeconds = getEnvInt('WITHDRAWAL_STOP_WAIT_SECONDS', 25);
     return res.status(200).json({
       message: relayAlreadyOff
         ? 'Charging is already off. You can continue to withdrawal.'
