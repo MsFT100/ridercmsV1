@@ -2,6 +2,63 @@ const { getDatabase } = require('firebase-admin/database');
 const pool = require('../db');
 const logger = require('./logger');
 
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+function isPoolConnectTimeoutError(error) {
+  return String(error?.message || '').includes('timeout exceeded when trying to connect');
+}
+
+async function acquirePgClientWithRetry(dbPool, boothUid, slotIdentifier, maxAttempts = 3) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await dbPool.connect();
+    } catch (error) {
+      const isTimeout = isPoolConnectTimeoutError(error);
+      if (!isTimeout || attempt === maxAttempts) {
+        throw error;
+      }
+
+      const backoffMs = attempt * 250;
+      logger.warn(
+        `Pool connect timeout for ${boothUid}/${slotIdentifier} (attempt ${attempt}/${maxAttempts}). Retrying in ${backoffMs}ms.`
+      );
+      await sleep(backoffMs);
+    }
+  }
+
+  throw new Error('Failed to acquire database client after retries.');
+}
+
+function hasSlotChanged(slotBefore, slotAfter) {
+  if (!slotBefore) return true;
+  try {
+    return JSON.stringify(slotBefore) !== JSON.stringify(slotAfter);
+  } catch {
+    // If serialization fails for any reason, fail safe and process the update.
+    return true;
+  }
+}
+
+// Serialize sync work per booth to avoid pool storms during bursty hardware updates.
+const boothSyncQueues = new Map();
+
+function enqueueBoothSync(boothUid, task) {
+  const previousTask = boothSyncQueues.get(boothUid) || Promise.resolve();
+  const nextTask = previousTask
+    .catch(() => {})
+    .then(task)
+    .catch((error) => {
+      logger.error(`[FirebaseSync] Booth queue task failed for ${boothUid}:`, error);
+    })
+    .finally(() => {
+      if (boothSyncQueues.get(boothUid) === nextTask) {
+        boothSyncQueues.delete(boothUid);
+      }
+    });
+
+  boothSyncQueues.set(boothUid, nextTask);
+}
+
 /**
  * Maps the status from Firebase to the corresponding status in the PostgreSQL enum.
  * @param {string} firebaseStatus - The overall status from the Firebase slot data (e.g., 'booting', 'available').
@@ -141,7 +198,7 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
   const slotBefore = boothStateCache[boothUid]?.slots?.[slotIdentifier];
 
   const dbPool = await pool;
-  const pgClient = await dbPool.connect();
+  const pgClient = await acquirePgClientWithRetry(dbPool, boothUid, slotIdentifier);
   let slotId = null;
   try {
     // First, get the current status of the slot from our database.
@@ -407,15 +464,24 @@ function initializeFirebaseSync() {
     const boothUid = boothSnapshot.key;
     const boothAfter = boothSnapshot.val();
 
-    if (boothAfter && boothAfter.slots) {
-      // Iterate over each slot within the changed booth and process its update.
-      Object.entries(boothAfter.slots).forEach(([slotIdentifier, slotData]) => {
-        processSlotUpdate(boothUid, slotIdentifier, slotData);
-      });
-    }
+    enqueueBoothSync(boothUid, async () => {
+      const boothBefore = boothStateCache[boothUid] || {};
+      const beforeSlots = boothBefore.slots || {};
+      const afterSlots = boothAfter?.slots || {};
 
-    // CRITICAL: Update the cache with the new state *after* processing all slots.
-    boothStateCache[boothUid] = boothAfter;
+      if (boothAfter && boothAfter.slots) {
+        // Process only changed slots and do it sequentially to reduce pool pressure.
+        for (const [slotIdentifier, slotData] of Object.entries(afterSlots)) {
+          if (!hasSlotChanged(beforeSlots[slotIdentifier], slotData)) {
+            continue;
+          }
+          await processSlotUpdate(boothUid, slotIdentifier, slotData);
+        }
+      }
+
+      // Update cache after processing to keep before/after diffing accurate.
+      boothStateCache[boothUid] = boothAfter;
+    });
   });
 }
 

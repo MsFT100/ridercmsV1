@@ -13,6 +13,11 @@ function parseBoolean(value) {
   return null;
 }
 
+function parsePositiveInt(value, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 function getInstanceConnectionName() {
   const instanceFromLegacy = process.env.INSTANCE_CONNECTION_NAME;
   const instanceFromDb = process.env.DB_INSTANCE_CONNECTION_NAME;
@@ -46,11 +51,21 @@ function createPoolFromDatabaseUrl(connectionString) {
   const needsSslByDefault = Boolean(connectionString)
     && (connectionString.includes('render.com') || connectionString.includes('google'));
   const enableSsl = sslFromEnv === null ? needsSslByDefault : sslFromEnv;
+  const poolMax = parsePositiveInt(process.env.DB_POOL_MAX, 10);
+  const idleTimeoutMillis = parsePositiveInt(process.env.DB_POOL_IDLE_TIMEOUT_MS, 30000);
+  const connectionTimeoutMillis = parsePositiveInt(process.env.DB_POOL_CONNECTION_TIMEOUT_MS, 15000);
 
   logger.info('Configuring database connection via DATABASE_URL.');
+  logger.info(
+    `DB pool settings: max=${poolMax}, idleTimeoutMillis=${idleTimeoutMillis}, connectionTimeoutMillis=${connectionTimeoutMillis}`
+  );
   return new Pool({
     connectionString,
     ssl: enableSsl ? { rejectUnauthorized: false } : false,
+    max: poolMax,
+    idleTimeoutMillis,
+    connectionTimeoutMillis,
+    keepAlive: true,
   });
 }
 
@@ -84,16 +99,24 @@ async function createPoolFromCloudSql(instanceConnectionName) {
     ipType: process.env.DB_IP_TYPE || 'PUBLIC',
   });
 
+  const poolMax = parsePositiveInt(process.env.DB_POOL_MAX, 5);
+  const idleTimeoutMillis = parsePositiveInt(process.env.DB_POOL_IDLE_TIMEOUT_MS, 30000);
+  const connectionTimeoutMillis = parsePositiveInt(process.env.DB_POOL_CONNECTION_TIMEOUT_MS, 15000);
+
+  logger.info(
+    `DB pool settings: max=${poolMax}, idleTimeoutMillis=${idleTimeoutMillis}, connectionTimeoutMillis=${connectionTimeoutMillis}`
+  );
+
   const cloudSqlPool = new Pool({
     ...clientOpts,
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
     database: process.env.DB_NAME,
     // --- POOL SETTINGS ---
-    max: Number(process.env.DB_POOL_MAX || 5), // Keep this low for Cloud Run
-    idleTimeoutMillis: 30000,                  // Close idle clients after 30 seconds
-    connectionTimeoutMillis: 5000,             // Fail fast if the DB is unreachable
-    keepAlive: true,                           // Send TCP keep-alive packets
+    max: poolMax,                   // Keep this controlled for Cloud Run.
+    idleTimeoutMillis,              // Close idle clients after configured timeout.
+    connectionTimeoutMillis,        // Avoid false-positive timeouts during brief bursts.
+    keepAlive: true,                // Send TCP keep-alive packets.
     // -------------------
   });
 
