@@ -906,7 +906,8 @@ router.get('/withdrawal-status/:checkoutRequestId', verifyFirebaseToken, async (
     }
 
     // --- Self-Healing Logic for Stuck Pending Transactions ---
-    const PENDING_TIMEOUT_SECONDS = parseInt(process.env.MPESA_PENDING_TIMEOUT_SECONDS, 10) || 45;
+    // M-Pesa STK push timeout is typically 60 seconds. We wait slightly longer to allow for callback latency.
+    const PENDING_TIMEOUT_SECONDS = parseInt(process.env.MPESA_PENDING_TIMEOUT_SECONDS, 10) || 80;
     const secondsSinceStart = (new Date() - new Date(startedAt)) / 1000;
 
     // If it has been pending for less than the timeout, just tell the client to keep polling.
@@ -926,10 +927,12 @@ router.get('/withdrawal-status/:checkoutRequestId', verifyFirebaseToken, async (
         await completePaidWithdrawal(client, checkoutRequestId);
         return res.status(200).json({ paymentStatus: 'paid' });
       } else {
-        // The payment failed or is still processing according to M-Pesa. Mark it as failed to stop polling.
-        logger.warn(`M-Pesa query for ${checkoutRequestId} indicates failure: ${ResultDesc}. Marking session as failed.`);
-        await client.query("UPDATE deposits SET status = 'failed' WHERE id = $1 AND status = 'pending'", [sessionId]);
-        return res.status(200).json({ paymentStatus: 'failed', reason: ResultDesc });
+        // IMPORTANT: We do NOT mark the session as failed in the DB based on a query result.
+        // M-Pesa queries often return non-zero codes while the transaction is still technically 
+        // waiting for user input or Safaricom's internal sync is lagging. 
+        // We rely on the definitive Callback (webhook) to handle actual failures.
+        logger.warn(`M-Pesa query for ${checkoutRequestId} returned non-success code: ${ResultCode} (${ResultDesc}). Keeping status as pending.`);
+        return res.status(200).json({ paymentStatus: 'pending', reason: ResultDesc });
       }
     } catch (mpesaError) {
       logger.error(`Self-healing failed to query M-Pesa for ${checkoutRequestId}:`, mpesaError.response?.data || mpesaError.message);
