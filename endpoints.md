@@ -109,6 +109,72 @@ Marks a user's phone number as verified after a successful OTP flow on the clien
 - **Error Responses:**
   - `401`: Unauthorized (invalid token).
 
+### `POST /auth/google/sync`
+
+Creates or updates the PostgreSQL user row for a Firebase Google sign-in account. New rows are stored with `status: "inactive"` until the profile is completed.
+
+- **Auth:** Firebase Bearer token
+- **Headers:** `Authorization: Bearer <firebase_id_token>`
+- **Request Body:**
+
+    ```json
+    {
+      "uid": "firebase_uid"
+    }
+    ```
+
+- **Success Response (200):**
+
+    ```json
+    {
+      "message": "Google user synced successfully.",
+      "user": {
+        "id": "firebase_uid",
+        "email": "user@example.com",
+        "name": "John Doe",
+        "phoneNumber": null,
+        "role": "user",
+        "status": "inactive",
+        "phoneVerified": false,
+        "profileImageUrl": "https://..."
+      }
+    }
+    ```
+
+### `POST /auth/google/complete-profile`
+
+Completes a synced Google user's backend profile by saving their phone number and activating the user record.
+
+- **Auth:** Firebase Bearer token
+- **Headers:** `Authorization: Bearer <firebase_id_token>`
+- **Request Body:**
+
+    ```json
+    {
+      "uid": "firebase_uid",
+      "phoneNumber": "+15551234567",
+      "name": "John Doe"
+    }
+    ```
+
+- **Success Response (200):**
+
+    ```json
+    {
+      "message": "Profile completed successfully.",
+      "user": {
+        "id": "firebase_uid",
+        "email": "user@example.com",
+        "name": "John Doe",
+        "phoneNumber": "+15551234567",
+        "role": "user",
+        "status": "active",
+        "phoneVerified": false,
+        "profileImageUrl": "https://..."
+      }
+    }
+    ```
+
 ---
 
 ## 2. Booths & Swapping (`/booths`)

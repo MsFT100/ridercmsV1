@@ -7,6 +7,25 @@ const uploadToGcsMiddleware = require('../middleware/upload');
 const axios = require('axios'); // For making HTTP requests to Google's reCAPTCHA service
 const router = Router();
 
+function getFirebaseProviderIds(decodedToken, userRecord) {
+  const tokenProviders = decodedToken.firebase && decodedToken.firebase.identities
+    ? Object.keys(decodedToken.firebase.identities)
+    : [];
+  const recordProviders = userRecord && Array.isArray(userRecord.providerData)
+    ? userRecord.providerData.map((provider) => provider.providerId)
+    : [];
+
+  return new Set([...tokenProviders, ...recordProviders]);
+}
+
+function isGoogleSignIn(decodedToken, userRecord) {
+  return getFirebaseProviderIds(decodedToken, userRecord).has('google.com');
+}
+
+function normalizeString(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
 /**
  * Verifies a Google reCAPTCHA v3 token.
  * @param {string} token The reCAPTCHA token from the client.
@@ -259,6 +278,150 @@ router.post('/verify-phone', async (req, res) => {
   } catch (error) {
     logger.error('Error verifying phone auth token:', error);
     res.status(401).json({ error: 'Unauthorized. Invalid or expired token.' });
+  }
+});
+
+/**
+ * POST /api/auth/google/sync
+ * Syncs a Firebase Google sign-in user into PostgreSQL as inactive.
+ */
+router.post('/google/sync', verifyFirebaseToken, async (req, res) => {
+  const { uid, email, name, picture } = req.user;
+  const requestedUid = normalizeString(req.body.uid);
+
+  if (requestedUid && requestedUid !== uid) {
+    return res.status(403).json({ error: 'The supplied uid does not match the authenticated user.' });
+  }
+
+  try {
+    const userRecord = await admin.auth().getUser(uid);
+
+    if (!isGoogleSignIn(req.user, userRecord)) {
+      return res.status(400).json({ error: 'This endpoint is only for Google sign-in users.' });
+    }
+
+    const resolvedEmail = userRecord.email || email;
+    if (!resolvedEmail) {
+      return res.status(400).json({ error: 'Google account email is required to sync this user.' });
+    }
+
+    const resolvedName = userRecord.displayName || name || resolvedEmail.split('@')[0];
+    const resolvedPhotoUrl = userRecord.photoURL || picture || null;
+    const defaultRole = 'user';
+
+    await admin.auth().setCustomUserClaims(uid, {
+      ...(userRecord.customClaims || {}),
+      role: userRecord.customClaims && userRecord.customClaims.role ? userRecord.customClaims.role : defaultRole,
+    });
+
+    const pool = await poolPromise;
+    const pgClient = await pool.connect();
+    try {
+      const userRes = await pgClient.query(
+        `INSERT INTO users (user_id, email, name, phone, role, status, profile_image_url, phone_verified)
+         VALUES ($1, $2, $3, NULL, $4, 'inactive', $5, false)
+         ON CONFLICT (user_id) DO UPDATE SET
+           email = EXCLUDED.email,
+           name = COALESCE(NULLIF(users.name, ''), EXCLUDED.name),
+           profile_image_url = COALESCE(users.profile_image_url, EXCLUDED.profile_image_url),
+           role = COALESCE(users.role, EXCLUDED.role),
+           updated_at = NOW()
+         RETURNING user_id as "id", email, name, phone as "phoneNumber", role, status,
+           phone_verified as "phoneVerified", profile_image_url as "profileImageUrl"`,
+        [uid, resolvedEmail, resolvedName, defaultRole, resolvedPhotoUrl]
+      );
+
+      logger.info(`Google sign-in user synced to database: ${resolvedEmail} (UID: ${uid}).`);
+      return res.status(200).json({
+        message: 'Google user synced successfully.',
+        user: userRes.rows[0],
+      });
+    } finally {
+      pgClient.release();
+    }
+  } catch (error) {
+    logger.error(`Error syncing Google user ${uid}:`, error);
+    if (error.code === '23505') {
+      return res.status(409).json({ error: 'A user with this email or phone already exists.' });
+    }
+    return res.status(500).json({ error: 'Failed to sync Google user.', details: error.message });
+  }
+});
+
+/**
+ * POST /api/auth/google/complete-profile
+ * Completes a previously synced Google user's backend profile.
+ */
+router.post('/google/complete-profile', verifyFirebaseToken, async (req, res) => {
+  const { uid } = req.user;
+  const requestedUid = normalizeString(req.body.uid);
+  const phoneNumber = normalizeString(req.body.phoneNumber || req.body.phone);
+  const name = normalizeString(req.body.name);
+
+  if (!requestedUid) {
+    return res.status(400).json({ error: 'uid is required.' });
+  }
+  if (requestedUid !== uid) {
+    return res.status(403).json({ error: 'The supplied uid does not match the authenticated user.' });
+  }
+  if (!phoneNumber) {
+    return res.status(400).json({ error: 'phoneNumber is required.' });
+  }
+
+  try {
+    const userRecord = await admin.auth().getUser(uid);
+
+    if (!isGoogleSignIn(req.user, userRecord)) {
+      return res.status(400).json({ error: 'This endpoint is only for Google sign-in users.' });
+    }
+
+    const firebaseUpdates = {};
+    if (name) firebaseUpdates.displayName = name;
+    if (!userRecord.phoneNumber || userRecord.phoneNumber !== phoneNumber) {
+      firebaseUpdates.phoneNumber = phoneNumber;
+    }
+
+    if (Object.keys(firebaseUpdates).length > 0) {
+      await admin.auth().updateUser(uid, firebaseUpdates);
+    }
+
+    const pool = await poolPromise;
+    const pgClient = await pool.connect();
+    try {
+      const userRes = await pgClient.query(
+        `UPDATE users
+         SET phone = $1,
+             name = COALESCE(NULLIF($2, ''), name),
+             status = 'active',
+             phone_verified = CASE WHEN phone = $1 THEN phone_verified ELSE false END,
+             updated_at = NOW()
+         WHERE user_id = $3
+         RETURNING user_id as "id", email, name, phone as "phoneNumber", role, status,
+           phone_verified as "phoneVerified", profile_image_url as "profileImageUrl"`,
+        [phoneNumber, name, uid]
+      );
+
+      if (userRes.rows.length === 0) {
+        return res.status(404).json({ error: 'Google user has not been synced yet.' });
+      }
+
+      logger.info(`Google user profile completed for UID: ${uid}.`);
+      return res.status(200).json({
+        message: 'Profile completed successfully.',
+        user: userRes.rows[0],
+      });
+    } finally {
+      pgClient.release();
+    }
+  } catch (error) {
+    logger.error(`Error completing Google profile for ${uid}:`, error);
+    if (error.code === 'auth/invalid-phone-number') {
+      return res.status(400).json({ error: 'The phone number is not valid. Please use E.164 format (e.g., +15551234567).' });
+    }
+    if (error.code === 'auth/phone-number-already-exists' || error.code === '23505') {
+      return res.status(409).json({ error: 'That phone number is already in use.' });
+    }
+    return res.status(500).json({ error: 'Failed to complete profile.', details: error.message });
   }
 });
 
