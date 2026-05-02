@@ -934,7 +934,9 @@ router.get('/withdrawal-status/:checkoutRequestId', verifyFirebaseToken, async (
         return res.status(200).json({ paymentStatus: 'pending', reason: ResultDesc });
       }
     } catch (mpesaError) {
-      logger.error(`Self-healing failed to query M-Pesa for ${checkoutRequestId}:`, mpesaError.response?.data || mpesaError.message);
+      const errorData = mpesaError.response?.data;
+      const errorDetail = errorData ? (errorData.errorMessage || JSON.stringify(errorData)) : mpesaError.message;
+      logger.error(`Self-healing failed to query M-Pesa for ${checkoutRequestId}: ${errorDetail}`);
       // Don't fail the session; just tell the client to keep trying.
       return res.status(200).json({ paymentStatus: 'pending' });
     }

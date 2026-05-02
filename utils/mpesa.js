@@ -11,7 +11,35 @@ const MPESA_CONFIG = {
   passkey: process.env.MPESA_PASSKEY,
   baseUrl: process.env.MPESA_BASE_URL, // e.g., "https://your-ngrok-url.io"
   apiUrl: 'https://api.safaricom.co.ke',
+  timeout: 15000,
 };
+
+/**
+ * @typedef {Object} MpesaCallbackItem
+ * @property {string} Name - The name of the metadata item (e.g., 'Amount', 'MpesaReceiptNumber').
+ * @property {string|number} [Value] - The value associated with the item.
+ */
+
+/**
+ * @typedef {Object} MpesaCallbackMetadata
+ * @property {MpesaCallbackItem[]} Item - Array of metadata items returned on success.
+ */
+
+/**
+ * @typedef {Object} MpesaSTKCallback
+ * @property {string} MerchantRequestID - Unique Merchant Request ID.
+ * @property {string} CheckoutRequestID - Unique Checkout Request ID.
+ * @property {number} ResultCode - 0 for success, any other value for failure.
+ * @property {string} ResultDesc - Description of the result.
+ * @property {MpesaCallbackMetadata} [CallbackMetadata] - Metadata included only on success.
+ */
+
+/**
+ * @typedef {Object} MpesaCallbackPayload
+ * @description The structure of the request body sent by Safaricom to the callback URL.
+ * @property {Object} Body
+ * @property {MpesaSTKCallback} Body.stkCallback
+ */
 
 /**
  * Returns an array of whitelisted M-Pesa IP addresses.
@@ -22,7 +50,10 @@ const getMpesaIpWhitelist = () => {
   // These are example IPs. You should get the official list from Safaricom documentation.
   // It's better to store this in environment variables for flexibility.
   // e.g., MPESA_WHITELISTED_IPS="196.201.214.200,196.201.214.206"
-  return process.env.MPESA_WHITELISTED_IPS?.split(',') || [];
+  return (process.env.MPESA_WHITELISTED_IPS || '')
+    .split(',')
+    .map(ip => ip.trim())
+    .filter(Boolean);
 };
 
 // --- In-memory cache for the M-Pesa access token ---
@@ -52,7 +83,13 @@ const getAccessToken = async () => {
 
 // Lipa Na Mpesa STK Push
 const initiateSTKPush = async (options) => {
-  const { phone, amount, accountRef, transactionDesc } = options;
+  const { phone, amount, accountReference = '', transactionDesc = '' } = options;
+
+  // Safaricom strict character limits:
+  // AccountReference: Max 12 chars
+  // TransactionDesc: Max 13 chars
+  const safeAccountRef = String(accountReference).substring(0, 12);
+  const safeDesc = String(transactionDesc).substring(0, 13);
 
   // Sanity check for amount
   if (amount < 1) {
@@ -74,12 +111,13 @@ const initiateSTKPush = async (options) => {
     PartyB: MPESA_CONFIG.shortCode,
     PhoneNumber: `254${phone.slice(-9)}`,
     CallBackURL: `${MPESA_CONFIG.baseUrl}/api/mpesa/callback`,
-    AccountReference: accountRef,
-    TransactionDesc: transactionDesc,
+    AccountReference: safeAccountRef,
+    TransactionDesc: safeDesc,
   };
 
   return axios.post(`${MPESA_CONFIG.apiUrl}/mpesa/stkpush/v1/processrequest`, payload, {
     headers: { Authorization: `Bearer ${token}` },
+    timeout: MPESA_CONFIG.timeout,
   });
 };
 
@@ -117,6 +155,7 @@ const querySTKStatus = async (checkoutRequestId) => {
 
   return axios.post(`${MPESA_CONFIG.apiUrl}/mpesa/stkpushquery/v1/query`, payload, {
     headers: { Authorization: `Bearer ${token}` },
+    timeout: MPESA_CONFIG.timeout,
   });
 };
 
@@ -138,7 +177,22 @@ const initiateB2CPayout = async (driverPhone, amount, remarks) => {
 
   return axios.post(`${MPESA_CONFIG.apiUrl}/mpesa/b2c/v1/paymentrequest`, payload, {
     headers: { Authorization: `Bearer ${token}` },
+    timeout: MPESA_CONFIG.timeout,
   });
 };
 
-module.exports = { initiateSTKPush, initiateB2CPayout, querySTKStatus, getMpesaIpWhitelist };
+/**
+ * Parses the M-Pesa CallbackMetadata array into a flat object.
+ * @param {MpesaCallbackMetadata} metadata - The metadata object from the M-Pesa callback.
+ * @returns {Object.<string, string|number>} A flat object of key-value pairs.
+ */
+const parseMetadata = (metadata) => {
+  if (!metadata || !Array.isArray(metadata.Item)) return {};
+
+  return metadata.Item.reduce((acc, item) => {
+    acc[item.Name] = item.Value;
+    return acc;
+  }, {});
+};
+
+module.exports = { initiateSTKPush, initiateB2CPayout, querySTKStatus, getMpesaIpWhitelist, parseMetadata };
