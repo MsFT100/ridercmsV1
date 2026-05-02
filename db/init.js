@@ -238,6 +238,26 @@ const initializeDatabase = async () => {
     await client.query(createUpdateTimestampFunction);
     await Promise.all([ 'users', 'mpesa_callbacks', 'app_settings', 'booths', 'batteries', 'booth_slots', 'deposits', 'problem_reports'].map(applyTrigger));
 
+    // --- Performance Indexes ---
+    // Speeds up the weekly cleanup of old cancelled sessions.
+    await client.query("CREATE INDEX IF NOT EXISTS idx_deposits_status_updated_at ON deposits (status, updated_at);");
+
+    // Speeds up queries involving the JSONB 'telemetry' column in booth_slots,
+    // particularly for `->>` operations used in hardware-cron for charging conditions.
+    await client.query("CREATE INDEX IF NOT EXISTS idx_booth_slots_telemetry_gin ON booth_slots USING GIN (telemetry);");
+
+    // Speeds up user-facing lookups (e.g., "does this user have an active session?")
+    await client.query("CREATE INDEX IF NOT EXISTS idx_deposits_user_status_type ON deposits (user_id, status, session_type);");
+
+    // Speeds up hardware sync and dashboard lateral joins (e.g., "find session for this slot")
+    await client.query("CREATE INDEX IF NOT EXISTS idx_deposits_slot_status_type ON deposits (slot_id, status, session_type);");
+
+    // Speeds up revenue and swap volume trends in the admin dashboard
+    await client.query("CREATE INDEX IF NOT EXISTS idx_deposits_completed_at ON deposits (completed_at) WHERE status = 'completed';");
+
+    // Speeds up transaction history sorting
+    await client.query("CREATE INDEX IF NOT EXISTS idx_deposits_started_at ON deposits (started_at DESC);");
+
     // --- Populate default settings if they don't exist ---
     const defaultSettings = [
       {

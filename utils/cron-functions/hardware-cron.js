@@ -86,6 +86,28 @@ async function checkChargingConditions() {
 }
 
 /**
+ * Purges cancelled sessions older than 30 days.
+ * This runs weekly to keep the database size manageable.
+ */
+async function runWeeklyCleanup() {
+  let client;
+  try {
+    const pool = await poolPromise;
+    client = await pool.connect();
+    const result = await client.query(
+      "DELETE FROM deposits WHERE status = 'cancelled' AND updated_at < NOW() - INTERVAL '30 days'"
+    );
+    if (result.rowCount > 0) {
+      logger.info(`[CleanupCron] Weekly purge completed: Removed ${result.rowCount} old cancelled sessions.`);
+    }
+  } catch (error) {
+    logger.error('[CleanupCron] Error running weekly cleanup:', error);
+  } finally {
+    if (client) client.release();
+  }
+}
+
+/**
  * Starts the cron job interval.
  */
 function startCronJob() {
@@ -96,12 +118,24 @@ function startCronJob() {
     logger.error('[HardwareCron] Initial run failed:', err);
   });
 
+  // Run cleanup once on startup, then every week.
+  runWeeklyCleanup().catch((err) => {
+    logger.error('[CleanupCron] Initial cleanup failed:', err);
+  });
+
   // Then run every 60 seconds
   setInterval(() => {
     checkChargingConditions().catch((err) => {
       logger.error('[HardwareCron] Scheduled run failed:', err);
     });
   }, 5 * 1000);
+
+  // Schedule weekly cleanup (7 days = 604,800,000 ms)
+  setInterval(() => {
+    runWeeklyCleanup().catch((err) => {
+      logger.error('[CleanupCron] Scheduled cleanup failed:', err);
+    });
+  }, 7 * 24 * 60 * 60 * 1000);
 }
 
 module.exports = { startCronJob };

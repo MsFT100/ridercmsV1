@@ -22,6 +22,7 @@ const authRoutes = require('./routes/auth');
 const adminRoutes = require('./routes/admin');
 const boothRoutes = require('./routes/booths');
 const mpesaRoutes = require('./routes/mpesa');
+const statsRoutes = require('./routes/stats');
 
 
 const app = express();
@@ -137,6 +138,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/booths', boothRoutes);
 app.use('/api/mpesa', mpesaRoutes);
+app.use('/api/stats', statsRoutes);
 
 
 // Health check

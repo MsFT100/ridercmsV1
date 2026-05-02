@@ -2070,10 +2070,22 @@ router.post('/sessions/cleanup', [verifyFirebaseToken, isAdmin], async (req, res
       }
     }
 
-    // You could add more cleanup logic here for other stuck states, like 'opening'.
+    // --- Purge old cancelled sessions ---
+    // This keeps the database size manageable by removing sessions that were never completed.
+    const purgeResult = await client.query(
+      "DELETE FROM deposits WHERE status = 'cancelled' AND updated_at < NOW() - INTERVAL '30 days'"
+    );
+
+    if (purgeResult.rowCount > 0) {
+      logger.info(`[SystemCleanup] Purged ${purgeResult.rowCount} cancelled sessions older than 30 days.`);
+    }
 
     await client.query('COMMIT');
-    res.status(200).json({ message: 'Cleanup task completed.', cleaned: stuckWithdrawalsRes.rowCount });
+    res.status(200).json({ 
+      message: 'Cleanup task completed.', 
+      stuckResolved: stuckWithdrawalsRes.rowCount,
+      cancelledPurged: purgeResult.rowCount 
+    });
   } catch (error) {
     await client.query('ROLLBACK');
     logger.error('Failed to run session cleanup task:', error);

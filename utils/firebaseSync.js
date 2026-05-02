@@ -341,6 +341,9 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
     const ackMessage = slotData.command?.ack;
 
     if (ackMessage) {
+      const db = getDatabase();
+      const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
+
       // Use a switch to handle different ACK messages from the hardware.
       switch (ackMessage) {
         case 'collection_complete': {
@@ -351,6 +354,8 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
             if (!await handleWithdrawalCompletion(pgClient, slotIdentifier, slotId)) {
               logger.warn(`'collection_complete' ACK for ${slotIdentifier} received, but no 'in_progress' session was found to complete.`);
             }
+            // Clear command and ACK to stop hardware reporting
+            await commandRef.update({ openForCollection: false, ack: "" });
           } catch (dbError) {
             logger.error(`Failed to finalize withdrawal session in DB for slot ${slotIdentifier} after 'collection_complete' ACK:`, dbError);
           }
@@ -364,6 +369,8 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
             if (!await handleDepositCompletion(pgClient, boothUid, slotIdentifier, slotId, telemetry)) {
               logger.warn(`'deposit_accepted' ACK for ${slotIdentifier} received, but no 'opening' session was found to complete.`);
             }
+            // Clear command and ACK
+            await commandRef.update({ openForDeposit: false, ack: "" });
           } catch (dbError) {
             logger.error(`Failed to finalize deposit session in DB for slot ${slotIdentifier} after 'deposit_accepted' ACK:`, dbError);
           }
@@ -382,6 +389,8 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
           if (failQueryResult.rowCount > 0) {
             logger.info(`Session ${failQueryResult.rows[0].id} marked as 'failed' due to collection issue.`);
           }
+          // Reset command state
+          await commandRef.update({ openForCollection: false, ack: "" });
           break;
         }
 
@@ -400,33 +409,54 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
           if (cancelQueryResult.rowCount > 0) {
             logger.info(`Session ${cancelQueryResult.rows[0].id} marked as 'cancelled' due to deposit failure.`);
           }
+          // Explicitly ensure the slot is marked available if the deposit failed
+          await pgClient.query("UPDATE booth_slots SET status = 'available' WHERE id = $1", [slotId]);
+          // Reset command state
+          await commandRef.update({ openForDeposit: false, ack: "" });
           break;
         }
 
         case 'startCharging_accepted': {
           logger.info(`Received 'startCharging_accepted' for slot ${slotIdentifier}. Updating DB: is_charging = true.`);
           await pgClient.query("UPDATE booth_slots SET is_charging = true WHERE id = $1", [slotId]);
+          await commandRef.update({ startCharging: false, ack: "" });
           break;
         }
 
         case 'stopCharging_done': {
           logger.info(`Received 'stopCharging_done' for slot ${slotIdentifier}. Updating DB: is_charging = false.`);
           await pgClient.query("UPDATE booth_slots SET is_charging = false WHERE id = $1", [slotId]);
+          await commandRef.update({ stopCharging: false, ack: "" });
           break;
         }
 
+        case 'resume_blocked_safety':
         case 'startCharging_rejected_safety': {
-          logger.error(`CRITICAL: Received 'startCharging_rejected_safety' for slot ${slotIdentifier}. Updating DB to reflect charging is OFF.`);
+          logger.error(`CRITICAL: Received '${ackMessage}' for slot ${slotIdentifier}. Updating DB to reflect charging is OFF.`);
           // The hardware refused to charge. This is important to reflect in our database.
           await pgClient.query("UPDATE booth_slots SET is_charging = false WHERE id = $1", [slotId]);
+
+          // Update any active session on this slot with a note about the safety block.
+          await pgClient.query(
+            `UPDATE deposits 
+             SET notes = COALESCE(notes, '') || '\n[' || NOW() || '] Hardware Safety Block: ' || $1
+             WHERE slot_id = $2 AND status NOT IN ('completed', 'failed', 'cancelled', 'redeemed')`,
+            [ackMessage, slotId]
+          );
+
+          await commandRef.update({ startCharging: false, ack: "" });
           break;
         }
 
         // Log informational ACKs for debugging and visibility.
         case 'openForCollection_sent':
         case 'openForDeposit_sent':
+        case 'forceUnlock_pulsed':
         case 'forceUnlock_done':
         case 'forceLock_done':
+          logger.debug(`Hardware signal: ${ackMessage} for slot ${slotIdentifier}.`);
+          break;
+
         default:
           logger.debug(`Received unhandled ACK '${ackMessage}' for slot ${slotIdentifier}. No action taken.`);
           break;

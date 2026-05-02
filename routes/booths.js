@@ -185,7 +185,7 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (req, res) => {
       // We cancel it and proceed with the current request to find a fresh, verified slot.
       // This prevents re-assigning a slot that may have become invalid.
       if (session.status === 'opening' && session.session_type === 'deposit') {
-        logger.warn(`Cancelling stale 'opening' session ${session.id} for user ${firebaseUid} due to new deposit request.`);
+        logger.warn(`Cancelling stale 'opening' session ${session.id} for user ${firebaseUid} on slot ${session.slot_identifier} due to new deposit request.`);
         await client.query("UPDATE deposits SET status = 'cancelled' WHERE id = $1", [session.id]);
         if (session.slot_id) {
           await client.query("UPDATE booth_slots SET status = 'available' WHERE id = $1", [session.slot_id]);
@@ -219,10 +219,9 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (req, res) => {
             "UPDATE booth_slots SET status = 'available' WHERE id = $1",
             [session.slot_id]
           );
-          // After cleanup, force the user to retry to ensure a clean state.
-          // This prevents the code from proceeding with stale data.
-          throw new Error('STALE_SESSION_CLEANED');
         }
+        // Instead of throwing, we continue the loop to find a fresh slot for the user immediately.
+        continue; 
       }
 
       // 🔧 FIX 3: Block if a withdrawal is pending
