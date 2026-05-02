@@ -393,7 +393,7 @@ router.post('/google/complete-profile', verifyFirebaseToken, async (req, res) =>
          SET phone = $1,
              name = COALESCE(NULLIF($2, ''), name),
              status = 'active',
-             phone_verified = CASE WHEN phone = $1 THEN phone_verified ELSE false END,
+             phone_verified = CASE WHEN phone != $1 THEN false ELSE phone_verified END,
              updated_at = NOW()
          WHERE user_id = $3
          RETURNING user_id as "id", email, name, phone as "phoneNumber", role, status,
