@@ -416,6 +416,13 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
           break;
         }
 
+        case 'charging_resumed': {
+          logger.info(`Received 'charging_resumed' for slot ${slotIdentifier}. Updating DB: is_charging = true.`);
+          await pgClient.query("UPDATE booth_slots SET is_charging = true WHERE id = $1", [slotId]);
+          await commandRef.update({ ack: "" });
+          break;
+        }
+
         case 'startCharging_accepted': {
           logger.info(`Received 'startCharging_accepted' for slot ${slotIdentifier}. Updating DB: is_charging = true.`);
           await pgClient.query("UPDATE booth_slots SET is_charging = true WHERE id = $1", [slotId]);
