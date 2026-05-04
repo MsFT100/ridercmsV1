@@ -331,6 +331,10 @@ router.post('/google/sync', verifyFirebaseToken, async (req, res) => {
         [uid, resolvedEmail, resolvedName, defaultRole, resolvedPhotoUrl]
       );
 
+      // Keep Firebase Auth disabled state aligned with DB approval status.
+      const shouldDisable = userRes.rows[0].status !== 'active';
+      await admin.auth().updateUser(uid, { disabled: shouldDisable });
+
       logger.info(`Google sign-in user synced to database: ${resolvedEmail} (UID: ${uid}).`);
       return res.status(200).json({
         message: 'Google user synced successfully.',
@@ -375,24 +379,16 @@ router.post('/google/complete-profile', verifyFirebaseToken, async (req, res) =>
       return res.status(400).json({ error: 'This endpoint is only for Google sign-in users.' });
     }
 
-    const firebaseUpdates = {};
-    if (name) firebaseUpdates.displayName = name;
-    if (!userRecord.phoneNumber || userRecord.phoneNumber !== phoneNumber) {
-      firebaseUpdates.phoneNumber = phoneNumber;
-    }
-
-    if (Object.keys(firebaseUpdates).length > 0) {
-      await admin.auth().updateUser(uid, firebaseUpdates);
-    }
-
     const pool = await poolPromise;
     const pgClient = await pool.connect();
     try {
+      await pgClient.query('BEGIN');
+
       const userRes = await pgClient.query(
         `UPDATE users
          SET phone = $1,
              name = COALESCE(NULLIF($2, ''), name),
-             status = 'active',
+             status = 'inactive',
              phone_verified = CASE WHEN phone != $1 THEN false ELSE phone_verified END,
              updated_at = NOW()
          WHERE user_id = $3
@@ -402,14 +398,35 @@ router.post('/google/complete-profile', verifyFirebaseToken, async (req, res) =>
       );
 
       if (userRes.rows.length === 0) {
+        await pgClient.query('ROLLBACK');
         return res.status(404).json({ error: 'Google user has not been synced yet.' });
       }
+
+      // Keep Google users pending admin approval after profile completion.
+      const firebaseUpdates = { disabled: true };
+      if (name) firebaseUpdates.displayName = name;
+      if (!userRecord.phoneNumber || userRecord.phoneNumber !== phoneNumber) {
+        firebaseUpdates.phoneNumber = phoneNumber;
+      }
+
+      if (Object.keys(firebaseUpdates).length > 0) {
+        await admin.auth().updateUser(uid, firebaseUpdates);
+      }
+
+      await pgClient.query('COMMIT');
 
       logger.info(`Google user profile completed for UID: ${uid}.`);
       return res.status(200).json({
         message: 'Profile completed successfully.',
         user: userRes.rows[0],
       });
+    } catch (transactionError) {
+      try {
+        await pgClient.query('ROLLBACK');
+      } catch (rollbackError) {
+        logger.error(`Rollback failed while completing Google profile for ${uid}:`, rollbackError);
+      }
+      throw transactionError;
     } finally {
       pgClient.release();
     }

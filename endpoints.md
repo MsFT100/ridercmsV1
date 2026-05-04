@@ -143,7 +143,7 @@ Creates or updates the PostgreSQL user row for a Firebase Google sign-in account
 
 ### `POST /auth/google/complete-profile`
 
-Completes a synced Google user's backend profile by saving their phone number and activating the user record.
+Completes a synced Google user's backend profile by saving their phone number while keeping the user record pending approval (`inactive`).
 
 - **Auth:** Firebase Bearer token
 - **Headers:** `Authorization: Bearer <firebase_id_token>`
@@ -168,7 +168,7 @@ Completes a synced Google user's backend profile by saving their phone number an
         "name": "John Doe",
         "phoneNumber": "+15551234567",
         "role": "user",
-        "status": "active",
+        "status": "inactive",
         "phoneVerified": false,
         "profileImageUrl": "https://..."
       }
