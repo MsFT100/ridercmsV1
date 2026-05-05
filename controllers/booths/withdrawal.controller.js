@@ -376,7 +376,8 @@ router.post('/sessions/:sessionId/pay', verifyFirebaseToken, async (req, res) =>
  * GET /api/booths/sessions/pending-withdrawal
  * @summary Get details of a user's pending withdrawal session
  * @description Returns the session details using the LOCKED amount and SOC from the database.
- */router.get('/sessions/pending-withdrawal', verifyFirebaseToken, async (req, res) => {
+ */
+router.get('/sessions/pending-withdrawal', verifyFirebaseToken, async (req, res) => {
   const { uid: firebaseUid } = req.user;
   const pool = await poolPromise;
   const client = await pool.connect();

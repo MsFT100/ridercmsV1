@@ -326,6 +326,18 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
       telemetry,
     ]);
 
+    // --- Safety/Policy Precautions ---
+    // If a charging command is requested in Firebase but the slot status in our database
+    // (the source of truth for business logic) forbids it, proactively clear the command.
+    if (slotData.command?.startCharging === true && (currentDbStatus === 'disabled' || currentDbStatus === 'faulty')) {
+      logger.warn(`[FirebaseSync] Revoking manual startCharging command for ${boothUid}/${slotIdentifier} because slot status is '${currentDbStatus}'.`);
+      const db = getDatabase();
+      await db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`).update({
+        startCharging: false,
+        ack: "rejected_policy_state"
+      });
+    }
+
     if (result.rowCount === 0) {
       // This can happen if the booth_uid doesn't exist in the `booths` table yet.
       logger.warn(`Could not sync slot ${slotIdentifier}. Booth with UID ${boothUid} not found in the database.`);
@@ -346,6 +358,26 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
 
       // Use a switch to handle different ACK messages from the hardware.
       switch (ackMessage) {
+        case 'openForCollection_pulsed': {
+          // The hardware has successfully energized the solenoid.
+          logger.info(`Received 'openForCollection_pulsed' for slot ${slotIdentifier}. Recording attempt.`);
+          try {
+            // Update the session notes so the user/admin can see that an attempt occurred.
+            await pgClient.query(
+              `UPDATE deposits 
+               SET notes = COALESCE(notes, '') || '\n[' || NOW() || '] Hardware pulsed solenoid for collection.'
+               WHERE slot_id = $1 AND status = 'in_progress' AND session_type = 'withdrawal'`,
+              [slotId]
+            );
+            // IMPORTANT: Clear the command and ACK. By setting openForCollection back to false,
+            // we allow the app to re-issue the command, which the hardware will see as a fresh trigger.
+            await commandRef.update({ openForCollection: false, ack: "" });
+          } catch (dbError) {
+            logger.error(`Failed to log hardware pulse for ${slotIdentifier}:`, dbError);
+          }
+          break;
+        }
+
         case 'collection_complete': {
           // This is the definitive signal that a user has taken their battery.
           logger.info(`Received 'collection_complete' ACK for slot ${slotIdentifier}. Finalizing withdrawal session.`);
@@ -458,6 +490,8 @@ async function processSlotUpdate(boothUid, slotIdentifier, slotData) {
         // Log informational ACKs for debugging and visibility.
         case 'openForCollection_sent':
         case 'openForDeposit_sent':
+        case 'openForCollection_pulsed':
+        case 'startCharging_pulsed':
         case 'forceUnlock_pulsed':
         case 'forceUnlock_done':
         case 'forceLock_done':

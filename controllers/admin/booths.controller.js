@@ -813,6 +813,41 @@ router.post('/booths/:boothUid/slots/:slotIdentifier/command', [verifyFirebaseTo
     updates[key] = value;
   }
 
+  // --- Manual Start Charging Precautions ---
+  // Before sending the command to hardware, verify that the slot is in a state
+  // that allows charging (active, battery present, and associated with a session).
+  if (updates.startCharging === true) {
+    const pool = await poolPromise;
+    const pgClient = await pool.connect();
+    try {
+      const verifyRes = await pgClient.query(`
+        SELECT s.status, s.current_battery_id,
+               EXISTS(SELECT 1 FROM deposits d WHERE d.slot_id = s.id AND d.status = 'completed' AND d.session_type = 'deposit') as "hasSession"
+        FROM booth_slots s
+        JOIN booths b ON s.booth_id = b.id
+        WHERE b.booth_uid = $1 AND s.slot_identifier = $2
+      `, [boothUid, slotIdentifier]);
+
+      if (verifyRes.rowCount === 0) {
+        return res.status(404).json({ error: 'Slot not found in database record.' });
+      }
+
+      const { status, current_battery_id, hasSession } = verifyRes.rows[0];
+
+      if (status === 'disabled' || status === 'faulty') {
+        return res.status(400).json({ error: `Manual charging blocked: Slot is currently ${status}.` });
+      }
+      if (!current_battery_id) {
+        return res.status(400).json({ error: 'Manual charging blocked: No battery detected in this slot.' });
+      }
+      if (!hasSession) {
+        return res.status(400).json({ error: 'Manual charging blocked: No active deposit session found for this battery.' });
+      }
+    } finally {
+      pgClient.release();
+    }
+  }
+
   // --- Mutual Exclusivity Logic ---
   // Ensure that lock and unlock commands are not simultaneously true.
   if (updates.forceLock === true) {
