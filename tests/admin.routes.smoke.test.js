@@ -68,6 +68,7 @@ describe('Admin Routes Smoke Test', () => {
     { method: 'POST', path: '/booths/:boothUid/slots/:slotIdentifier/status' },
     { method: 'POST', path: '/booths/:boothUid/slots/:slotIdentifier/command' },
     { method: 'GET', path: '/booths/:boothUid' },
+    { method: 'GET', path: '/booths/:boothUid/slots/:slotIdentifier' },
     { method: 'POST', path: '/booths/:boothUid/reset-slots' },
 
     { method: 'GET', path: '/problem-reports' },

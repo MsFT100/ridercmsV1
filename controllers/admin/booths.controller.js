@@ -981,6 +981,106 @@ router.get('/booths/:boothUid', [verifyFirebaseToken, isAdmin], async (req, res)
 });
 
 /**
+ * GET /api/admin/booths/:boothUid/slots/:slotIdentifier
+ * @summary Get details of a single slot in a booth
+ * @description Retrieves detailed information about a specific slot, including its current state in the database, real-time data from Firebase, and any active user session (deposit or withdrawal) with the user's name.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @parameters
+ *   - in: path
+ *     name: boothUid
+ *     required: true
+ *     schema:
+ *       type: string
+ *     description: The UID of the booth containing the slot.
+ *   - in: path
+ *     name: slotIdentifier
+ *     required: true
+ *     schema:
+ *       type: string
+ *     description: The identifier of the slot to retrieve (e.g., slot001).
+ * @responses
+ *   200:
+ *     description: Details of the slot and its active session.
+ *   404:
+ *     description: Slot not found.
+ *   500:
+ *     description: Internal server error.
+ */
+router.get('/booths/:boothUid/slots/:slotIdentifier', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const { boothUid, slotIdentifier } = req.params;
+
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    // 1. Get slot details from PostgreSQL
+    const slotQuery = `
+      SELECT
+        s.id as "slotId",
+        s.slot_identifier as "identifier",
+        s.status as "status",
+        s.door_status as "doorStatus",
+        s.charge_level_percent as "chargeLevel",
+        s.is_charging as "isCharging",
+        s.last_seen_at as "lastSeenAt",
+        b.name as "boothName",
+        bat.battery_uid as "batteryUid"
+      FROM booth_slots s
+      JOIN booths b ON s.booth_id = b.id
+      LEFT JOIN batteries bat ON s.current_battery_id = bat.id
+      WHERE b.booth_uid = $1 AND s.slot_identifier = $2;
+    `;
+    const slotRes = await client.query(slotQuery, [boothUid, slotIdentifier]);
+
+    if (slotRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Slot not found.' });
+    }
+    const slotInfo = slotRes.rows[0];
+
+    // 2. Find any active (non-terminal) session for this slot and join with user details.
+    const activeSessionQuery = `
+      SELECT
+        d.id as "sessionId",
+        d.session_type as "sessionType",
+        d.status as "sessionStatus",
+        d.amount,
+        d.created_at as "createdAt",
+        u.name as "userName",
+        u.email as "userEmail",
+        u.user_id as "userId"
+      FROM deposits d
+      JOIN users u ON d.user_id = u.user_id
+      WHERE d.slot_id = $1
+        AND d.status IN ('pending', 'opening', 'in_progress')
+      ORDER BY d.created_at DESC
+      LIMIT 1;
+    `;
+    const sessionRes = await client.query(activeSessionQuery, [slotInfo.slotId]);
+    const activeSession = sessionRes.rows[0] || null;
+
+    // 3. Fetch real-time data from Firebase for comparison and debugging.
+    const db = getDatabase();
+    const slotRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}`);
+    const snapshot = await slotRef.get();
+    const realTimeData = snapshot.exists() ? snapshot.val() : null;
+
+    res.status(200).json({
+      boothUid,
+      slot: slotInfo,
+      activeSession: activeSession,
+      realTimeData: realTimeData
+    });
+
+  } catch (error) {
+    logger.error(`Failed to get slot details for ${boothUid}/${slotIdentifier}:`, error);
+    res.status(500).json({ error: 'Failed to retrieve slot details.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
  * POST /api/admin/booths/:boothUid/reset-slots
  * @summary Reset one or all slots in a booth to their default state.
  * @description Resets slot data in both PostgreSQL and Firebase to a default, 'available' state. This is a powerful maintenance tool. If `slotIdentifier` is provided in the body, only that slot is reset. Otherwise, all slots in the booth are reset.
