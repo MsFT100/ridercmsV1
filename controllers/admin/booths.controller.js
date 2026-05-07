@@ -58,12 +58,22 @@ router.get('/booths', [verifyFirebaseToken, isAdmin], async (req, res) => {
         b.booth_uid, b.name, b.location_address, b.status, b.created_at, b.updated_at, b.latitude, b.longitude,
         s.slot_identifier, s.status as slot_status, s.door_status, s.charge_level_percent as slot_charge_level,
         bat.battery_uid,
+        u.name AS user_name,
         COUNT(*) OVER() as total_booths
       FROM (
         SELECT * FROM booths ORDER BY created_at DESC LIMIT $1 OFFSET $2
       ) b
       LEFT JOIN booth_slots s ON b.id = s.booth_id
       LEFT JOIN batteries bat ON s.current_battery_id = bat.id
+      -- Find the user from the most recent completed deposit in each slot to identify current renter
+      LEFT JOIN LATERAL (
+        SELECT d.user_id
+        FROM deposits d
+        WHERE d.slot_id = s.id AND d.session_type = 'deposit' AND d.status = 'completed'
+        ORDER BY d.completed_at DESC
+        LIMIT 1
+      ) last_deposit ON true
+      LEFT JOIN users u ON last_deposit.user_id = u.user_id
       ORDER BY b.created_at DESC, s.slot_identifier;
     `;
 
@@ -99,7 +109,8 @@ router.get('/booths', [verifyFirebaseToken, isAdmin], async (req, res) => {
           status: row.slot_status,
           doorStatus: row.door_status,
           chargeLevel: row.slot_charge_level,
-          batteryUid: row.battery_uid
+          batteryUid: row.battery_uid,
+          userName: row.user_name
         });
         booth.slotCount++;
       }
