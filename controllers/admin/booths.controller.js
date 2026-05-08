@@ -873,6 +873,59 @@ router.post('/booths/:boothUid/slots/:slotIdentifier/command', [verifyFirebaseTo
   }
   if (updates.forceUnlock === true) {
     updates.forceLock = false;
+
+    // --- Auto-complete stuck withdrawal sessions on Force Unlock ---
+    // If an admin is force-unlocking, it often implies a manual intervention for a withdrawal.
+    // We resolve the last 'in_progress' withdrawal session for this slot to keep the DB in sync.
+    const pool = await poolPromise;
+    const pgClient = await pool.connect();
+    try {
+      await pgClient.query('BEGIN');
+
+      const updateResult = await pgClient.query(`
+        UPDATE deposits
+        SET
+          status = 'completed',
+          completed_at = NOW(),
+          notes = COALESCE(notes, '') || '\n[' || NOW() || '] Session force-completed by admin via manual unlock command.'
+        WHERE id = (
+          SELECT d.id
+          FROM deposits d
+          JOIN booth_slots s ON d.slot_id = s.id
+          JOIN booths b ON s.booth_id = b.id
+          WHERE b.booth_uid = $1
+            AND s.slot_identifier = $2
+            AND d.session_type = 'withdrawal'
+            AND d.status = 'in_progress'
+          ORDER BY d.created_at DESC
+          LIMIT 1
+        )
+        RETURNING id;
+      `, [boothUid, slotIdentifier]);
+
+      // Also reset the slot status to 'available' and remove the battery link.
+      // This ensures the slot is immediately ready for the next user.
+      await pgClient.query(`
+        UPDATE booth_slots
+        SET 
+          status = 'available',
+          current_battery_id = NULL,
+          updated_at = NOW()
+        WHERE slot_identifier = $2 
+          AND booth_id = (SELECT id FROM booths WHERE booth_uid = $1)
+      `, [boothUid, slotIdentifier]);
+
+      await pgClient.query('COMMIT');
+
+      if (updateResult.rowCount > 0) {
+        logger.info(`Admin (UID: ${req.user.uid}) force-unlocked slot ${slotIdentifier}. Withdrawal session ${updateResult.rows[0].id} was auto-completed and slot reset to available.`);
+      }
+    } catch (dbError) {
+      await pgClient.query('ROLLBACK');
+      logger.error(`Failed to auto-complete session during forceUnlock for ${slotIdentifier}:`, dbError);
+    } finally {
+      pgClient.release();
+    }
   }
 
   // Ensure that start and stop charging commands are not simultaneously true.
