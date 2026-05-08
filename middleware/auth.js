@@ -6,6 +6,10 @@ const logger = require('../utils/logger');
  * If the token is valid, it attaches the decoded token to `req.user`.
  *
  * Expects the token to be in the format: `Authorization: Bearer <token>`
+ * @param {import('express').Request} req - Express request object.
+ * @param {import('express').Response} res - Express response object.
+ * @param {import('express').NextFunction} next - Express next middleware function.
+ * @returns {Promise<void|import('express').Response>} Returns nothing on success, or an error response.
  */
 const verifyFirebaseToken = async (req, res, next) => {
   const authHeader = req.headers.authorization;
@@ -36,6 +40,10 @@ const verifyFirebaseToken = async (req, res, next) => {
 /**
  * Middleware to verify if the authenticated user has the 'admin' role.
  * This should be used AFTER `verifyFirebaseToken`.
+ * @param {import('express').Request} req - Express request object.
+ * @param {import('express').Response} res - Express response object.
+ * @param {import('express').NextFunction} next - Express next middleware function.
+ * @returns {void|import('express').Response} Returns nothing on success, or an error response.
  */
 const isAdmin = (req, res, next) => {
   // `verifyFirebaseToken` should have already run and attached the user object.

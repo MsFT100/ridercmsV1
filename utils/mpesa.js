@@ -1,7 +1,7 @@
+// @ts-check
 // utils/mpesa.js
 const axios = require('axios');
 const logger = require('./logger'); // Import logger for warnings
-const crypto = require('crypto');
 require('dotenv').config();
 
 const MPESA_CONFIG = {
@@ -15,18 +15,18 @@ const MPESA_CONFIG = {
 };
 
 /**
- * @typedef {Object} MpesaCallbackItem
+ * @typedef {object} MpesaCallbackItem
  * @property {string} Name - The name of the metadata item (e.g., 'Amount', 'MpesaReceiptNumber').
  * @property {string|number} [Value] - The value associated with the item.
  */
 
 /**
- * @typedef {Object} MpesaCallbackMetadata
+ * @typedef {object} MpesaCallbackMetadata
  * @property {MpesaCallbackItem[]} Item - Array of metadata items returned on success.
  */
 
 /**
- * @typedef {Object} MpesaSTKCallback
+ * @typedef {object} MpesaSTKCallback
  * @property {string} MerchantRequestID - Unique Merchant Request ID.
  * @property {string} CheckoutRequestID - Unique Checkout Request ID.
  * @property {number} ResultCode - 0 for success, any other value for failure.
@@ -35,16 +35,16 @@ const MPESA_CONFIG = {
  */
 
 /**
- * @typedef {Object} MpesaCallbackPayload
+ * @typedef {object} MpesaCallbackPayload
  * @description The structure of the request body sent by Safaricom to the callback URL.
- * @property {Object} Body
- * @property {MpesaSTKCallback} Body.stkCallback
+ * @property {object} Body - The main body of the callback.
+ * @property {MpesaSTKCallback} Body.stkCallback - The STK callback information.
  */
 
 /**
  * Returns an array of whitelisted M-Pesa IP addresses.
  * In a real-world scenario, these should be managed carefully.
- * @returns {string[]}
+ * @returns {string[]} An array of whitelisted IP addresses.
  */
 const getMpesaIpWhitelist = () => {
   // These are example IPs. You should get the official list from Safaricom documentation.
@@ -184,7 +184,7 @@ const initiateB2CPayout = async (driverPhone, amount, remarks) => {
 /**
  * Parses the M-Pesa CallbackMetadata array into a flat object.
  * @param {MpesaCallbackMetadata} metadata - The metadata object from the M-Pesa callback.
- * @returns {Object.<string, string|number>} A flat object of key-value pairs.
+ * @returns {Record<string, string|number>} A flat object of key-value pairs.
  */
 const parseMetadata = (metadata) => {
   if (!metadata || !Array.isArray(metadata.Item)) return {};
@@ -195,4 +195,4 @@ const parseMetadata = (metadata) => {
   }, {});
 };
 
-module.exports = { initiateSTKPush, initiateB2CPayout, querySTKStatus, getMpesaIpWhitelist, parseMetadata };
+module.exports = { initiateSTKPush, initiateB2CPayout, querySTKStatus, getMpesaIpWhitelist, parseMetadata, MPESA_CONFIG };

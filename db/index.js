@@ -5,6 +5,11 @@ const logger = require('../utils/logger');
 let pool;
 const connector = new Connector();
 
+/**
+ * Parses a string value into a boolean.
+ * @param {string} value - The value to parse.
+ * @returns {boolean|null} The parsed boolean value, or null if it cannot be parsed.
+ */
 function parseBoolean(value) {
   if (typeof value !== 'string') return null;
   const normalized = value.trim().toLowerCase();
@@ -13,11 +18,21 @@ function parseBoolean(value) {
   return null;
 }
 
+/**
+ * Parses a string value into a positive integer.
+ * @param {string|number} value - The value to parse.
+ * @param {number} fallback - The fallback value if parsing fails.
+ * @returns {number} The parsed positive integer or the fallback.
+ */
 function parsePositiveInt(value, fallback) {
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+/**
+ * Gets the Cloud SQL instance connection name from environment variables.
+ * @returns {string|undefined} The instance connection name.
+ */
 function getInstanceConnectionName() {
   const instanceFromLegacy = process.env.INSTANCE_CONNECTION_NAME;
   const instanceFromDb = process.env.DB_INSTANCE_CONNECTION_NAME;
@@ -32,10 +47,19 @@ function getInstanceConnectionName() {
   return instanceFromLegacy || instanceFromDb;
 }
 
+/**
+ * Gets the database connection mode from environment variables.
+ * @returns {string} The connection mode ('auto', 'database_url', or 'cloudsql_connector').
+ */
 function getConnectionMode() {
   return (process.env.DB_CONNECTION_MODE || 'auto').toLowerCase();
 }
 
+/**
+ * Validates the format of a Cloud SQL instance connection name.
+ * @param {string} instanceConnectionName - The connection name to validate.
+ * @throws {Error} If the format is invalid.
+ */
 function validateInstanceConnectionName(instanceConnectionName) {
   const parts = String(instanceConnectionName).split(':');
   if (parts.length !== 3 || parts.some((part) => !part.trim())) {
@@ -46,6 +70,11 @@ function validateInstanceConnectionName(instanceConnectionName) {
   }
 }
 
+/**
+ * Creates a PostgreSQL connection pool from a connection string.
+ * @param {string} connectionString - The DATABASE_URL connection string.
+ * @returns {Pool} The configured PostgreSQL connection pool.
+ */
 function createPoolFromDatabaseUrl(connectionString) {
   const sslFromEnv = parseBoolean(process.env.DB_SSL);
   const needsSslByDefault = Boolean(connectionString)
@@ -69,6 +98,11 @@ function createPoolFromDatabaseUrl(connectionString) {
   });
 }
 
+/**
+ * Checks if a given error is related to Cloud SQL authentication.
+ * @param {Error|string} err - The error to check.
+ * @returns {boolean} True if it's a Cloud SQL auth error.
+ */
 function isCloudSqlAuthError(err) {
   const message = String(err && err.message ? err.message : err);
   return (
@@ -78,6 +112,12 @@ function isCloudSqlAuthError(err) {
   );
 }
 
+/**
+ * Wraps a Cloud SQL error with more helpful context if it's an auth error.
+ * @param {Error} err - The original error.
+ * @param {string} instanceConnectionName - The connection name being used.
+ * @returns {Error} The original or enhanced error.
+ */
 function wrapCloudSqlError(err, instanceConnectionName) {
   if (!isCloudSqlAuthError(err)) return err;
 
@@ -90,6 +130,11 @@ function wrapCloudSqlError(err, instanceConnectionName) {
   return enhanced;
 }
 
+/**
+ * Creates a PostgreSQL connection pool using the Cloud SQL Connector.
+ * @param {string} instanceConnectionName - The Cloud SQL instance connection name.
+ * @returns {Promise<Pool>} The configured PostgreSQL connection pool.
+ */
 async function createPoolFromCloudSql(instanceConnectionName) {
   validateInstanceConnectionName(instanceConnectionName);
   logger.info(`Configuring database connection via Google Cloud SQL Connector for "${instanceConnectionName}".`);
@@ -125,6 +170,10 @@ async function createPoolFromCloudSql(instanceConnectionName) {
   return cloudSqlPool;
 }
 
+/**
+ * Configures and returns a database pool based on environment settings.
+ * @returns {Promise<Pool>} The configured database pool.
+ */
 async function configurePool() {
   const mode = getConnectionMode();
   const connectionString = process.env.DATABASE_URL;

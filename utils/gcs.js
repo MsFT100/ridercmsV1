@@ -13,7 +13,6 @@ const bucket = GCS_BUCKET_NAME ? storage.bucket(GCS_BUCKET_NAME) : null;
 
 /**
  * Uploads a file buffer to Google Cloud Storage.
- *
  * @param {Buffer} buffer The file buffer to upload.
  * @param {string} originalname The original name of the file.
  * @param {string} destinationFolder The folder within the bucket to upload to (e.g., 'profile-pictures').

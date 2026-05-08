@@ -4,7 +4,7 @@ Files included:
 - app.js
 - package.json
 - src/env.js (fill placeholders with your keys)
-- src/fireba se.js
+- src/firebase.js
 - src/mpesa.js
 - src/routes.js
 

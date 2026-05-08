@@ -170,8 +170,30 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
 
     const db = getDatabase();
 
-    // 2. Fetch real-time data from Firebase for each booth.
-    const boothStatusPromises = boothsFromDb.map(async (booth) => {
+    // --- Optimization: Group results by booth ---
+    // The DB query returns one row per slot. We group them here to avoid 
+    // calling Firebase multiple times for the same booth UID.
+    const groupedBooths = boothsFromDb.reduce((acc, row) => {
+      if (!acc[row.booth_uid]) {
+        acc[row.booth_uid] = {
+          details: {
+            booth_uid: row.booth_uid,
+            name: row.name,
+            location_address: row.location_address,
+            status: row.status,
+            updated_at: row.updated_at
+          },
+          slotUserMap: {}
+        };
+      }
+      if (row.slot_identifier) {
+        acc[row.booth_uid].slotUserMap[row.slot_identifier] = row.user_name;
+      }
+      return acc;
+    }, {});
+
+    // 2. Fetch real-time data from Firebase for each unique booth.
+    const boothStatusPromises = Object.values(groupedBooths).map(async ({ details: booth, slotUserMap }) => {
       const boothRef = db.ref(`booths/${booth.booth_uid}`);
       const snapshot = await boothRef.get();
 
@@ -179,7 +201,6 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
         boothUid: booth.booth_uid,
         name: booth.name,
         location: booth.location_address,
-        status: booth.status, // The overall status from our DB
         // Use the live status from Firebase if available, otherwise fallback to DB status.
         status: snapshot.exists() && snapshot.val().status
           ? snapshot.val().status
@@ -191,14 +212,6 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
       if (snapshot.exists()) {
         const firebaseBooth = snapshot.val();
         if (firebaseBooth.slots) {
-          // Create a map of slotIdentifier -> userName for this booth for easy lookup.
-          const slotUserNameMap = boothsFromDb
-            .filter(row => row.booth_uid === booth.booth_uid && row.slot_identifier)
-            .reduce((acc, row) => {
-              acc[row.slot_identifier] = row.user_name;
-              return acc;
-            }, {});
-
           // Map over the slots from Firebase to get the most real-time data.
           boothData.slots = Object.entries(firebaseBooth.slots).map(([slotIdentifier, slotData]) => {
             const telemetry = slotData.telemetry || {};
@@ -210,7 +223,7 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
               doorStatus: telemetry.doorLocked ? 'locked' : (telemetry.doorClosed ? 'closed' : 'open'),
               relayState: telemetry.relayOn ? 'ON' : 'OFF',
               isCharging: isCharging,
-              userName: slotUserNameMap[slotIdentifier] || null, // Add user's name here
+              userName: slotUserMap[slotIdentifier] || null, // Add user's name here
               telemetry: telemetry,
               // The battery object contains the most up-to-date info
               battery: {
@@ -230,12 +243,9 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
       return boothData;
     });
 
-    // Consolidate the results into a unique list of booths, as the initial DB query can have multiple rows per booth.
-    const uniqueBooths = (await Promise.all(boothStatusPromises)).filter((booth, index, self) =>
-      index === self.findIndex((b) => b.boothUid === booth.boothUid)
-    );
-
-    res.status(200).json(uniqueBooths);
+    // 3. Resolve all promises and return the unique booth list.
+    const results = await Promise.all(boothStatusPromises);
+    res.status(200).json(results);
   } catch (error) {
     logger.error('Failed to get booths status for admin:', error);
     res.status(500).json({ error: 'Failed to retrieve booths status.', details: error.message });
@@ -832,8 +842,8 @@ router.post('/booths/:boothUid/slots/:slotIdentifier/command', [verifyFirebaseTo
     const pgClient = await pool.connect();
     try {
       const verifyRes = await pgClient.query(`
-        SELECT s.status, s.current_battery_id,
-               EXISTS(SELECT 1 FROM deposits d WHERE d.slot_id = s.id AND d.status = 'completed' AND d.session_type = 'deposit') as "hasSession"
+        SELECT s.status,
+               EXISTS(SELECT 1 FROM deposits d WHERE d.slot_id = s.id AND d.status IN ('opening', 'completed') AND d.session_type = 'deposit') as "hasSession"
         FROM booth_slots s
         JOIN booths b ON s.booth_id = b.id
         WHERE b.booth_uid = $1 AND s.slot_identifier = $2
@@ -843,13 +853,10 @@ router.post('/booths/:boothUid/slots/:slotIdentifier/command', [verifyFirebaseTo
         return res.status(404).json({ error: 'Slot not found in database record.' });
       }
 
-      const { status, current_battery_id, hasSession } = verifyRes.rows[0];
+      const { status, hasSession } = verifyRes.rows[0];
 
       if (status === 'disabled' || status === 'faulty') {
         return res.status(400).json({ error: `Manual charging blocked: Slot is currently ${status}.` });
-      }
-      if (!current_battery_id) {
-        return res.status(400).json({ error: 'Manual charging blocked: No battery detected in this slot.' });
       }
       if (!hasSession) {
         return res.status(400).json({ error: 'Manual charging blocked: No active deposit session found for this battery.' });
@@ -1137,7 +1144,9 @@ router.post('/booths/:boothUid/reset-slots', [verifyFirebaseToken, isAdmin], asy
     if (boothRes.rows.length === 0) {
       return res.status(404).json({ error: `Booth with UID ${boothUid} not found.` });
     }
-    const boothId = boothRes.rows[0].id;
+
+    const booth = boothRes.rows[0];
+    const boothId = booth.id;
 
     // 2. Find and terminate any active user sessions in the slot(s) being reset.
     // An active session is one that is not already in a terminal state (failed, cancelled, or a completed withdrawal).

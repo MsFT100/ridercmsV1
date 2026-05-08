@@ -14,8 +14,9 @@ const upload = multer({
 /**
  * Middleware to handle a single file upload and stream it to GCS.
  * The public URL of the uploaded file will be attached to `req.file.gcsUrl`.
- * @param {string} fieldName The name of the form field for the file (e.g., 'profileImage').
- * @param {string} destinationFolder The GCS folder to upload into (e.g., 'profile-pictures').
+ * @param {string} fieldName - The name of the form field for the file (e.g., 'profileImage').
+ * @param {string} destinationFolder - The GCS folder to upload into (e.g., 'profile-pictures').
+ * @returns {import('express').RequestHandler} The middleware function.
  */
 const uploadToGcsMiddleware = (fieldName, destinationFolder) => (req, res, next) => {
   upload.single(fieldName)(req, res, async (err) => {

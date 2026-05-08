@@ -1,0 +1,29 @@
+{
+  "env": {
+    "node": true,
+    "es2022": true,
+    "jest": true
+  },
+  "extends": [
+    "eslint:recommended",
+    "plugin:jsdoc/recommended"
+  ],
+  "parser": "@typescript-eslint/parser",
+  "parserOptions": {
+    "ecmaVersion": "latest",
+    "sourceType": "script",
+    "project": "./tsconfig.json"
+  },
+  "plugins": [
+    "jsdoc",
+    "@typescript-eslint"
+  ],
+  "rules": {
+    "jsdoc/no-undefined-types": "off",
+    "no-unused-vars": "off",
+    "@typescript-eslint/no-unused-vars": ["warn"],
+    "jsdoc/check-tag-names": ["warn", {
+      "definedTags": ["swagger", "tags", "security", "parameters", "responses", "requestBody"]
+    }]
+  }
+}

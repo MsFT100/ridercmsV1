@@ -46,6 +46,11 @@ const options = {
   ],
 };
 
+/**
+ * Parses a JSDoc block from an admin controller to extract OpenAPI metadata.
+ * @param {string} docBlock - The JSDoc comment block to parse.
+ * @returns {object} An object containing summary, description, tags, security, and responses.
+ */
 function parseAdminDocBlock(docBlock) {
   const lines = docBlock
     .split('\n')
@@ -164,6 +169,11 @@ function parseAdminDocBlock(docBlock) {
   return metadata;
 }
 
+/**
+ * Normalizes a route path into an OpenAPI-compliant path.
+ * @param {string} routePath - The original Express route path.
+ * @returns {string} The formatted OpenAPI path string.
+ */
 function toOpenApiPath(routePath) {
   const fullPath = routePath.startsWith('/api/')
     ? routePath
@@ -171,6 +181,11 @@ function toOpenApiPath(routePath) {
   return fullPath.replace(/:([A-Za-z0-9_]+)/g, '{$1}');
 }
 
+/**
+ * Extracts path parameters from an OpenAPI path string.
+ * @param {string} openApiPath - The OpenAPI path string (e.g., /users/{id}).
+ * @returns {object[]} An array of OpenAPI parameter objects.
+ */
 function getPathParameters(openApiPath) {
   const params = [...openApiPath.matchAll(/\{([A-Za-z0-9_]+)\}/g)].map((match) => ({
     in: 'path',
@@ -182,6 +197,10 @@ function getPathParameters(openApiPath) {
   return params;
 }
 
+/**
+ * Scans admin controllers to dynamically build OpenAPI path definitions.
+ * @returns {object} A record of OpenAPI paths and operations.
+ */
 function buildAdminPathsFromControllers() {
   const controllersDir = path.join(projectRoot, 'controllers', 'admin');
   if (!fs.existsSync(controllersDir)) {

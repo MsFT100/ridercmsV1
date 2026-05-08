@@ -1,3 +1,4 @@
+// @ts-check
 const { Router } = require('express');
 const poolPromise = require('../db');
 const logger = require('../utils/logger');
@@ -68,7 +69,7 @@ router.post('/callback', async (req, res) => {
     return res.status(200).json({ ResultCode: 0, ResultDesc: "Accepted" });
   }
 
-  const { MerchantRequestID, CheckoutRequestID, ResultCode, ResultDesc } = stkCallback;
+  const { CheckoutRequestID, ResultCode, ResultDesc } = stkCallback;
 
   logger.info(`[MpesaCallback] Processing Result for CheckoutID: ${CheckoutRequestID} | Code: ${ResultCode} (${ResultDesc})`);
 
@@ -78,7 +79,7 @@ router.post('/callback', async (req, res) => {
   // Flatten the metadata for easier access (e.g., Receipt Number, Amount)
   const metadata = parseMetadata(stkCallback.CallbackMetadata);
   const receiptNumber = metadata.MpesaReceiptNumber || 'N/A';
-  const transactionAmount = metadata.Amount || 0;
+  const transactionAmount = metadata.Amount !== undefined ? metadata.Amount : 'N/A';
 
   try {
     await client.query('BEGIN');

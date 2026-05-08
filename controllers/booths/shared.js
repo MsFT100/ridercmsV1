@@ -3,6 +3,11 @@ const getEnvInt = (name, fallback) => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 };
 
+/**
+ * Normalizes a State of Charge (SoC) value.
+ * @param {number|string} rawSoc - The raw SoC value to normalize.
+ * @returns {number|null} The normalized SoC as a number, or null if invalid.
+ */
 function normalizeSoc(rawSoc) {
   const parsed = Number(rawSoc);
   if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 100) {
@@ -11,6 +16,12 @@ function normalizeSoc(rawSoc) {
   return parsed;
 }
 
+/**
+ * Extracts a valid State of Charge (SoC) from slot data.
+ * @param {object} slotData - The slot data object containing telemetry or top-level SoC.
+ * @param {number|string|null} [fallbackSoc] - A fallback SoC value if none is found in slotData.
+ * @returns {number|null} The valid SoC found, or null.
+ */
 function extractValidSoc(slotData, fallbackSoc = null) {
   const telemetrySoc = normalizeSoc(slotData?.telemetry?.soc);
   if (telemetrySoc !== null) {
@@ -25,6 +36,11 @@ function extractValidSoc(slotData, fallbackSoc = null) {
   return normalizeSoc(fallbackSoc);
 }
 
+/**
+ * Determines if the relay is off for a given slot.
+ * @param {object} slotData - The slot data object.
+ * @returns {boolean} True if the relay is confirmed to be off, false otherwise.
+ */
 function isRelayOff(slotData) {
   if (!slotData || typeof slotData !== 'object') {
     return false;
@@ -72,6 +88,12 @@ const WITHDRAWAL_BATTERY_QUERY = `
   LIMIT 1;
 `;
 
+/**
+ * Gets the battery context for a withdrawal based on the user's last completed deposit.
+ * @param {object} client - The database client.
+ * @param {string} firebaseUid - The Firebase UID of the user.
+ * @returns {Promise<object>} The battery context object.
+ */
 async function getWithdrawalBatteryContext(client, firebaseUid) {
   const batteryRes = await client.query(WITHDRAWAL_BATTERY_QUERY, [firebaseUid]);
 

@@ -7,6 +7,12 @@ const uploadToGcsMiddleware = require('../middleware/upload');
 const axios = require('axios'); // For making HTTP requests to Google's reCAPTCHA service
 const router = Router();
 
+/**
+ * Extracts unique authentication provider IDs for a user from their token and record.
+ * @param {object} decodedToken - The decoded Firebase ID token.
+ * @param {import('firebase-admin/auth').UserRecord} userRecord - The Firebase user record.
+ * @returns {Set<string>} A set of provider IDs (e.g., 'password', 'google.com').
+ */
 function getFirebaseProviderIds(decodedToken, userRecord) {
   const tokenProviders = decodedToken.firebase && decodedToken.firebase.identities
     ? Object.keys(decodedToken.firebase.identities)
@@ -18,10 +24,21 @@ function getFirebaseProviderIds(decodedToken, userRecord) {
   return new Set([...tokenProviders, ...recordProviders]);
 }
 
+/**
+ * Checks if the user signed in with Google.
+ * @param {object} decodedToken - The decoded Firebase ID token.
+ * @param {import('firebase-admin/auth').UserRecord} userRecord - The Firebase user record.
+ * @returns {boolean} True if Google sign-in was used.
+ */
 function isGoogleSignIn(decodedToken, userRecord) {
   return getFirebaseProviderIds(decodedToken, userRecord).has('google.com');
 }
 
+/**
+ * Normalizes a string by trimming it, or returns an empty string if not a string.
+ * @param {any} value - The value to normalize.
+ * @returns {string} The normalized string.
+ */
 function normalizeString(value) {
   return typeof value === 'string' ? value.trim() : '';
 }

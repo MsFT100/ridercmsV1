@@ -1,4 +1,3 @@
-const { getDatabase } = require('firebase-admin/database');
 const { admin } = require('./firebase');
 const logger = require('./logger');
 
@@ -16,7 +15,7 @@ async function completePaidWithdrawal(client, checkoutRequestId) {
   try {
     // 1. Find and lock the specific session row to prevent race conditions.
     const sessionRes = await client.query(
-      `SELECT d.id, d.status, d.user_id, d.amount, b.booth_uid, s.slot_identifier
+      `SELECT d.id, d.status, d.user_id, d.amount
        FROM deposits d
        JOIN booth_slots s ON d.slot_id = s.id
        JOIN booths b ON s.booth_id = b.id
@@ -35,8 +34,6 @@ async function completePaidWithdrawal(client, checkoutRequestId) {
       id: sessionId,
       user_id: userId,
       amount,
-      booth_uid: boothUid,
-      slot_identifier: slotIdentifier,
     } = sessionRes.rows[0];
 
     // 2. Atomically update the status from 'pending' to 'in_progress'.

@@ -30,6 +30,9 @@ if (!uid) {
   process.exit(1);
 }
 
+/**
+ *
+ */
 async function run() {
   const targetRole = 'admin';
   let pool;

@@ -22,6 +22,7 @@ const verifyAdmin = (req, res, next) => {
         req.user = decoded; // Attach decoded admin info to the request
         next();
     } catch (err) {
+        logger.error('Admin verification failed:', err);
         return res.status(401).json({ error: 'Unauthorized: Invalid token.' });
     }
 };

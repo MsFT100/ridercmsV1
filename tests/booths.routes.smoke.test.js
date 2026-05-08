@@ -19,9 +19,18 @@ jest.mock('../utils/logger', () => ({
 
 const boothsRouter = require('../routes/booths');
 
+/**
+ * Collects all routes from an Express router.
+ * @param {import('express').Router} router - The Express router to inspect.
+ * @returns {any[]} An array of route objects with method, path, and middlewareNames.
+ */
 function collectRoutes(router) {
   const routes = [];
 
+  /**
+   * Recursively walks the router stack to find all routes.
+   * @param {any[]} stack - The router stack.
+   */
   function walk(stack) {
     for (const layer of stack) {
       if (layer.route) {
@@ -54,6 +63,7 @@ describe('Booths Routes Smoke Test', () => {
 
   const expectedRoutes = [
     { method: 'GET', path: '/' },
+    { method: 'GET', path: '/:boothUid/slots/:slotIdentifier' },
     { method: 'POST', path: '/initiate-deposit' },
     { method: 'GET', path: '/my-battery-status' },
     { method: 'POST', path: '/stop-charging' },

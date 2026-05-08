@@ -4,6 +4,9 @@ const logger = require('./logger');
 
 let isInitialized = false;
 
+/**
+ *
+ */
 function initializeFirebase() {
   if (isInitialized) {
     return;

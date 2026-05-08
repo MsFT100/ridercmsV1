@@ -51,15 +51,12 @@ const scenarios = [
  * This logic should be kept in sync with the backend endpoint.
  * @param {number} initialCharge - The battery's charge percentage at the start.
  * @param {number} finalCharge - The battery's charge percentage at the end.
- * @param {number} durationMinutes - The total duration of the session in minutes.
  * @returns {object} A detailed breakdown of the calculated cost.
  */
-function calculateCost(initialCharge, finalCharge, durationMinutes) {
+function calculateCost(initialCharge, finalCharge) {
   const {
     base_swap_fee: baseSwapFee,
     cost_per_charge_percent: costPerChargePercent,
-    overtime_penalty_per_minute: overtimePenaltyPerMin,
-    grace_period_minutes: gracePeriodMinutes,
   } = pricingRules;
 
   // Perform the same calculation as in the backend
@@ -76,12 +73,15 @@ function calculateCost(initialCharge, finalCharge, durationMinutes) {
   };
 }
 
+/**
+ *
+ */
 function runSimulations() {
   console.log('Running cost calculation simulations...\n');
 
   for (const scenario of scenarios) {
     console.log(`--- Testing: ${scenario.description} ---`);
-    const calculation = calculateCost(scenario.initialCharge, scenario.finalCharge, scenario.durationMinutes);
+    const calculation = calculateCost(scenario.initialCharge, scenario.finalCharge);
     console.log(JSON.stringify(calculation, null, 2));
     console.log('\n');
   }

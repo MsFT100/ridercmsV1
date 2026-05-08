@@ -15,6 +15,7 @@
     "firebase-admin": "^13.6.0",
     "morgan": "^1.10.1",
     "multer": "^2.0.2",
+    "node-cron": "^4.2.1",
     "pg": "^8.16.3",
     "swagger-jsdoc": "^6.2.8",
     "swagger-ui-express": "^5.0.1",
@@ -26,7 +27,9 @@
     "dev": "nodemon server.js",
     "test": "jest",
     "test:booths-smoke": "jest tests/booths.routes.smoke.test.js",
-    "test:admin-smoke": "jest tests/admin.routes.smoke.test.js"
+    "test:admin-smoke": "jest tests/admin.routes.smoke.test.js",
+    "build:types": "tsc --declaration --emitDeclarationOnly --allowJs --outDir ./types utils/types.js",
+    "lint": "eslint ."
   },
   "devDependencies": {
     "@types/cookie-parser": "^1.4.10",
@@ -36,6 +39,10 @@
     "@types/morgan": "^1.9.10",
     "@types/multer": "^2.0.0",
     "@types/node": "^25.3.3",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "eslint": "^8.57.0",
+    "eslint-plugin-jsdoc": "^48.0.0",
     "jest": "^30.1.3",
     "nodemon": "^3.1.10",
     "pg-mem": "^3.0.5",

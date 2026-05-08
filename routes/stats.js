@@ -8,11 +8,21 @@ const router = Router();
 const MAX_DAYS = 90;
 const DEFAULT_DAYS = 7;
 
+/**
+ * Parses a value to an integer, returning 0 if invalid.
+ * @param {any} value - The value to parse.
+ * @returns {number} The parsed integer.
+ */
 function toInt(value) {
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+/**
+ * Parses the 'days' query parameter, enforcing limits.
+ * @param {any} value - The raw value from the query string.
+ * @returns {number} The validated number of days.
+ */
 function parseDays(value) {
   const parsed = Number.parseInt(value, 10);
   if (!Number.isFinite(parsed)) {
@@ -21,6 +31,11 @@ function parseDays(value) {
   return Math.min(Math.max(parsed, 1), MAX_DAYS);
 }
 
+/**
+ * Determines the statistics scope (me vs all) based on query and user role.
+ * @param {import('express').Request} req - The Express request.
+ * @returns {{scope: string}|{error: string}} The scope object or an error message.
+ */
 function getScope(req) {
   const requestedScope = String(req.query.scope || 'me').toLowerCase();
   const isAdmin = req.user?.role === 'admin';
@@ -39,6 +54,11 @@ function getScope(req) {
   return { scope: 'me' };
 }
 
+/**
+ * Validates and normalizes the sessionType query parameter.
+ * @param {import('express').Request} req - The Express request.
+ * @returns {{sessionType: string}|{error: string}} The sessionType object or an error message.
+ */
 function getSessionType(req) {
   const rawSessionType = req.query.sessionType;
   if (rawSessionType === undefined) {
@@ -53,6 +73,16 @@ function getSessionType(req) {
   return { sessionType };
 }
 
+/**
+ * Builds SQL WHERE/AND clauses and values for session filtering.
+ * @param {object} root0 - Filter parameters.
+ * @param {string} root0.scope - 'me' or 'all'.
+ * @param {string} root0.sessionType - 'all', 'deposit', or 'withdrawal'.
+ * @param {string} root0.uid - The authenticated user's UID.
+ * @param {string} [root0.alias] - The table alias in the SQL query.
+ * @param {number} [root0.startIndex] - The starting index for SQL parameters ($1, $2, etc.).
+ * @returns {{whereClause: string, andClause: string, values: any[]}} The generated SQL clauses and parameters.
+ */
 function buildFilter({ scope, sessionType, uid, alias = 'd', startIndex = 1 }) {
   const conditions = [];
   const values = [];

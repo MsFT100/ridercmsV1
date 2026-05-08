@@ -1,6 +1,5 @@
 const winston = require('winston');
 const path = require('path');
-const streamTransport = require('./logStreamTransport');
 require('winston-daily-rotate-file');
 
 const isProduction = process.env.NODE_ENV === 'production';

@@ -1,3 +1,4 @@
+// @ts-check
 // --- Load Environment Variables ---
 // This must be at the very top to ensure `process.env` is populated before other modules.
 const path = require('path');
@@ -112,7 +113,9 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Use morgan for HTTP request logging, piped through our winston logger
-app.use(morgan('combined', { stream: logger.stream }));
+// We cast morgan to 'any' to bypass a known mismatch between Morgan's base HTTP types 
+// and the specific Express 5 Request/Response types used in app.use.
+app.use(/** @type {any} */ (morgan)('combined', { stream: logger.stream }));
 
 // --- API Documentation (Swagger) ---
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));

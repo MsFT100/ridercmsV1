@@ -46,6 +46,9 @@ if (!envFilePath) {
 // Instantiates a client
 const client = new SecretManagerServiceClient();
 
+/**
+ *
+ */
 async function syncSecrets() {
   console.log(`Starting secret sync for project '${projectId}'...`);
 
@@ -67,8 +70,8 @@ async function syncSecrets() {
 /**
  * Parses a .env file content into a key-value object.
  * Handles comments and empty lines.
- * @param {string} content The content of the .env file.
- * @returns {Object<string, string>}
+ * @param {string} content - The content of the .env file.
+ * @returns {Record<string, string>} A map of environment variable names to their values.
  */
 function parseEnv(content) {
   const env = {};
@@ -90,6 +93,12 @@ function parseEnv(content) {
   return env;
 }
 
+/**
+ * Creates a new secret or updates an existing one in Secret Manager.
+ * @param {string} secretId - The ID of the secret.
+ * @param {string} value - The value to store in the secret.
+ * @returns {Promise<void>}
+ */
 async function createOrUpdateSecret(secretId, value) {
   const parent = `projects/${projectId}`;
   const secretPath = `${parent}/secrets/${secretId}`;
