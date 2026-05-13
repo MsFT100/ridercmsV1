@@ -900,8 +900,17 @@ router.post('/booths/:boothUid/slots/:slotIdentifier/command', [verifyFirebaseTo
           ORDER BY d.created_at DESC
           LIMIT 1
         )
-        RETURNING id;
+        RETURNING id, consumed_deposit_id;
       `, [boothUid, slotIdentifier]);
+
+      // If we force-completed a withdrawal, we must also mark the associated 'deposit credit'
+      // as 'redeemed' to prevent the user from withdrawing again with the same credit.
+      if (updateResult.rowCount > 0 && updateResult.rows[0].consumed_deposit_id) {
+        await pgClient.query(
+          "UPDATE deposits SET status = 'redeemed', updated_at = NOW() WHERE id = $1",
+          [updateResult.rows[0].consumed_deposit_id]
+        );
+      }
 
       // Also reset the slot status to 'available' and remove the battery link.
       // This ensures the slot is immediately ready for the next user.

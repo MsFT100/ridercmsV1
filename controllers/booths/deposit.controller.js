@@ -12,7 +12,7 @@ const router = Router();
  * Called by a user's app to start a deposit. Finds an available slot
  * and creates a pending session record.
  */
-router.post('/initiate-deposit', verifyFirebaseToken, async (req, res) => {
+router.post('/initiate-deposit', verifyFirebaseToken, async (/** @type {any} */ req, res) => {
   const { boothUid } = req.body;
   const { uid: firebaseUid } = req.user;
 
@@ -57,17 +57,9 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (req, res) => {
         if (session.slot_id) {
           await client.query("UPDATE booth_slots SET status = 'available' WHERE id = $1", [session.slot_id]);
         }
-        // By cancelling the old session, we allow the code to continue and find a new, valid slot.
-        // This is safer than re-using the old slot which might no longer be available.
-        continue; // Continue to the next check in the loop (or exit if this was the only one)
-      }
-
-      // If a deposit is 'opening', but the user is trying to start another one,
-      // it implies the first attempt failed without the app knowing. Block it.
-      if (session.status === 'opening' && session.session_type === 'deposit') {
-        throw new Error('ACTIVE_SESSION_IN_PROGRESS');
-      }
-      if (session.status === 'in_progress') {
+        // Clean up complete. Continue to find a fresh slot.
+        continue; 
+      } else if (session.status === 'in_progress') {
         throw new Error('ACTIVE_SESSION_IN_PROGRESS');
       }
 
@@ -243,7 +235,7 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (req, res) => {
  * GET /api/booths/my-battery-status
  * Allows a logged-in user to check the status and location of their deposited battery.
  */
-router.get('/my-battery-status', verifyFirebaseToken, async (req, res) => {
+router.get('/my-battery-status', verifyFirebaseToken, async (/** @type {any} */ req, res) => {
   const { uid: firebaseUid } = req.user;
 
   const pool = await poolPromise;

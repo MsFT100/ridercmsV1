@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "target": "es6",
+    "checkJs": true,
+    "ignoreDeprecations": "6.0",
+    "baseUrl": ".",
+    "paths": {
+      "*": ["*", "types.d.ts"]
+    }
+  },
+  "include": ["**/*.js", "types.d.ts"],
+  "exclude": ["node_modules"]
+}

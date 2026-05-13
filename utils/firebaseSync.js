@@ -458,6 +458,14 @@ async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
           break;
         }
 
+        case 'battery_full': {
+          logger.info(`Received 'battery_full' ACK for slot ${slotIdentifier}. Updating DB: is_charging = false.`);
+          // The battery is full, so we should stop charging it.
+          await pgClient.query("UPDATE booth_slots SET is_charging = false WHERE id = $1", [slotId]);
+          await commandRef.update({ ack: "" });
+          break;
+        }
+
         // Log informational ACKs for debugging and visibility.
         case 'openForCollection_sent':
         case 'openForDeposit_sent':
@@ -535,4 +543,8 @@ function initializeFirebaseSync() {
   });
 }
 
-module.exports = { initializeFirebaseSync };
+module.exports = { 
+  initializeFirebaseSync, 
+  handleWithdrawalCompletion, 
+  handleDepositCompletion 
+};
