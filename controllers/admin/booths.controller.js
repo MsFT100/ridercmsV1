@@ -533,7 +533,7 @@ router.delete('/booths/:boothUid/slots/:slotIdentifier', [verifyFirebaseToken, i
 /**
  * PATCH /api/admin/booths/:boothUid
  * @summary Update a booth's details
- * @description Updates a booth's name and/or location address. This is a protected route only accessible by users with the 'admin' role.
+ * @description Updates a booth's name and/or location details. This is a protected route only accessible by users with the 'admin' role.
  * @tags [Admin]
  * @security
  *   - bearerAuth: []
@@ -557,6 +557,14 @@ router.delete('/booths/:boothUid/slots/:slotIdentifier', [verifyFirebaseToken, i
  *           locationAddress:
  *             type: string
  *             description: The new physical address or location of the booth.
+ *           latitude:
+ *             type: number
+ *             nullable: true
+ *             description: Updated latitude for the booth. Send null to clear.
+ *           longitude:
+ *             type: number
+ *             nullable: true
+ *             description: Updated longitude for the booth. Send null to clear.
  * @responses
  *   200:
  *     description: Booth updated successfully.
@@ -569,10 +577,42 @@ router.delete('/booths/:boothUid/slots/:slotIdentifier', [verifyFirebaseToken, i
  */
 router.patch('/booths/:boothUid', [verifyFirebaseToken, isAdmin], async (req, res) => {
   const { boothUid } = req.params;
-  const { name, locationAddress } = req.body;
+  const { name, locationAddress, latitude, longitude } = req.body;
 
-  if (!name && !locationAddress) {
-    return res.status(400).json({ error: 'At least one field (name or locationAddress) must be provided to update.' });
+  const hasName = typeof name === 'string' && name.trim() !== '';
+  const hasLocationAddress = typeof locationAddress === 'string' && locationAddress.trim() !== '';
+  const hasLatitude = typeof latitude !== 'undefined';
+  const hasLongitude = typeof longitude !== 'undefined';
+
+  if (!hasName && !hasLocationAddress && !hasLatitude && !hasLongitude) {
+    return res.status(400).json({ error: 'Provide at least one field to update: name, locationAddress, latitude, or longitude.' });
+  }
+
+  let parsedLatitude = null;
+  let parsedLongitude = null;
+
+  if (hasLatitude) {
+    if (latitude !== null && latitude !== '') {
+      parsedLatitude = parseFloat(latitude);
+      if (Number.isNaN(parsedLatitude)) {
+        return res.status(400).json({ error: 'Latitude must be a valid number or null.' });
+      }
+      if (parsedLatitude < -90 || parsedLatitude > 90) {
+        return res.status(400).json({ error: 'Latitude must be between -90 and 90.' });
+      }
+    }
+  }
+
+  if (hasLongitude) {
+    if (longitude !== null && longitude !== '') {
+      parsedLongitude = parseFloat(longitude);
+      if (Number.isNaN(parsedLongitude)) {
+        return res.status(400).json({ error: 'Longitude must be a valid number or null.' });
+      }
+      if (parsedLongitude < -180 || parsedLongitude > 180) {
+        return res.status(400).json({ error: 'Longitude must be between -180 and 180.' });
+      }
+    }
   }
 
   const pool = await poolPromise;
@@ -584,13 +624,21 @@ router.patch('/booths/:boothUid', [verifyFirebaseToken, isAdmin], async (req, re
     const queryParams = [];
     let paramIndex = 1;
 
-    if (name) {
+    if (hasName) {
       setClauses.push(`name = $${paramIndex++}`);
-      queryParams.push(name);
+      queryParams.push(name.trim());
     }
-    if (locationAddress) {
+    if (hasLocationAddress) {
       setClauses.push(`location_address = $${paramIndex++}`);
-      queryParams.push(locationAddress);
+      queryParams.push(locationAddress.trim());
+    }
+    if (hasLatitude) {
+      setClauses.push(`latitude = $${paramIndex++}`);
+      queryParams.push(latitude === null || latitude === '' ? null : parsedLatitude);
+    }
+    if (hasLongitude) {
+      setClauses.push(`longitude = $${paramIndex++}`);
+      queryParams.push(longitude === null || longitude === '' ? null : parsedLongitude);
     }
 
     const updateQuery = `UPDATE booths SET ${setClauses.join(', ')}, updated_at = NOW() WHERE booth_uid = $${paramIndex} RETURNING *`;
@@ -599,6 +647,7 @@ router.patch('/booths/:boothUid', [verifyFirebaseToken, isAdmin], async (req, re
     const result = await client.query(updateQuery, queryParams);
 
     if (result.rowCount === 0) {
+      await client.query('ROLLBACK');
       return res.status(404).json({ error: `Booth with UID ${boothUid} not found.` });
     }
 
