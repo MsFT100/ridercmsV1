@@ -6,7 +6,9 @@ require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
 const cookieParser = require('cookie-parser');
+const { globalLimiter, authLimiter, boothLimiter, mpesaLimiter } = require('./middleware/rateLimiter');
 const morgan = require('morgan');
 const logger = require('./utils/logger'); // Corrected path
 const poolPromise = require('./db/index.js'); // Corrected path
@@ -104,6 +106,8 @@ const corsOptions = {
 
 // Middleware
 app.use(cors(corsOptions));
+app.use(helmet());
+app.use(globalLimiter);
 app.use(express.json());
 app.use(cookieParser());
 app.use(express.urlencoded({ extended: true }));
@@ -137,10 +141,10 @@ app.get('/admin/log-viewer', (req, res) => {
 });
 
 // API Routes
-app.use('/api/auth', authRoutes);
+app.use('/api/auth', authLimiter, authRoutes);
 app.use('/api/admin', adminRoutes);
-app.use('/api/booths', boothRoutes);
-app.use('/api/mpesa', mpesaRoutes);
+app.use('/api/booths', boothLimiter, boothRoutes);
+app.use('/api/mpesa', mpesaLimiter, mpesaRoutes);
 app.use('/api/stats', statsRoutes);
 
 
