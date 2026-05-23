@@ -29,7 +29,7 @@ const router = Router();
  *     name: searchTerm
  *     schema:
  *       type: string
- *     description: Search by user email or name.
+ *     description: Search by user email, name, or phone number.
  *   - in: query
  *     name: status
  *     schema:
@@ -96,7 +96,7 @@ router.get('/sessions', [verifyFirebaseToken, isAdmin], async (req, res) => {
     let paramIndex = 1;
 
     if (searchTerm) {
-      whereClauses.push(`(u.email ILIKE $${paramIndex} OR u.name ILIKE $${paramIndex++})`);
+      whereClauses.push(`(u.email ILIKE $${paramIndex} OR u.name ILIKE $${paramIndex} OR u.phone_number ILIKE $${paramIndex++})`);
       queryParams.push(`%${searchTerm}%`);
     }
     if (status) {
@@ -147,7 +147,7 @@ router.get('/sessions', [verifyFirebaseToken, isAdmin], async (req, res) => {
         d.id, d.session_type AS "sessionType", d.status, d.amount,
         d.mpesa_checkout_id AS "mpesaCheckoutId", d.initial_charge_level AS "initialChargeLevel",
         d.created_at AS "createdAt", d.started_at AS "startedAt", d.completed_at AS "completedAt",
-        u.email AS "userEmail", b.booth_uid AS "boothUid", s.slot_identifier AS "slotIdentifier",
+        u.email AS "userEmail", u.phone_number AS "userPhoneNumber", b.booth_uid AS "boothUid", s.slot_identifier AS "slotIdentifier",
         bat.battery_uid AS "batteryUid"
       ${baseQuery}
       ORDER BY d.created_at DESC
