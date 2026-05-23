@@ -60,7 +60,7 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (/** @type {any} */ 
         // Clean up complete. Continue to find a fresh slot.
         continue; 
       } else if (session.status === 'in_progress') {
-        throw new Error('ACTIVE_SESSION_IN_PROGRESS');
+        continue;
       }
 
       if (session.status === 'pending' && session.session_type === 'deposit') {
@@ -83,12 +83,11 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (/** @type {any} */ 
         continue; 
       }
 
-      // 🔧 FIX 3: Block if a withdrawal is pending
       if (
         session.status === 'pending' &&
         session.session_type === 'withdrawal'
       ) {
-        throw new Error('PENDING_WITHDRAWAL_EXISTS');
+        continue;
       }
     }
 
@@ -187,28 +186,6 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (/** @type {any} */ 
   } catch (error) {
     await client.query('ROLLBACK');
 
-    if (error.message === 'ACTIVE_SESSION_IN_PROGRESS') {
-      return res.status(409).json({
-        error: 'Active session in progress',
-        message: 'You already have a session in progress.',
-      });
-    }
-
-    if (error.message === 'PENDING_WITHDRAWAL_EXISTS') {
-      return res.status(409).json({
-        error: 'Pending withdrawal',
-        message: 'Complete or cancel the withdrawal before depositing.',
-      });
-    }
-
-    if (error.message === 'STALE_SESSION_CLEANED') {
-      return res.status(409).json({
-        error: 'Stale session cleaned',
-        message:
-          'We cleaned up a previous incomplete session. Please try again.',
-      });
-    }
-
     if (error.message === 'NO_AVAILABLE_SLOTS' || error.message === 'BOOTH_NOT_AVAILABLE') {
       const userMessage = error.message === 'NO_AVAILABLE_SLOTS'
         ? 'All slots at this booth are currently occupied. Please try again later.'
@@ -266,35 +243,39 @@ router.get('/my-battery-status', verifyFirebaseToken, async (/** @type {any} */ 
       return res.status(200).json(null);
     }
 
-    const { boothUid, slotId, slotIdentifier, lastKnownChargeLevel, sessionStatus } = locationResult.rows[0];
-
-    // 2. Fetch the latest, real-time data from Firebase.
     const db = getDatabase();
-    const slotRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}`);
-    const snapshot = await slotRef.get();
 
-    if (!snapshot.exists()) {
-      logger.warn(`Data inconsistency: Battery for user ${firebaseUid} is in PG for slot ${boothUid}/${slotIdentifier}, but slot does not exist in Firebase.`);
-      // Return last known data from DB in this edge case.
-      return res.status(200).json({ boothUid, slotIdentifier, chargeLevel: lastKnownChargeLevel, sessionStatus, telemetry: null });
-    }
+    const statuses = await Promise.all(locationResult.rows.map(async (row) => {
+      const { boothUid, slotId, slotIdentifier, lastKnownChargeLevel, sessionStatus } = row;
 
-    const firebaseData = snapshot.val();
-    const realTimeCharge = extractValidSoc(firebaseData, lastKnownChargeLevel) ?? 0;
-    const lastChargeLevelSoc = lastKnownChargeLevel;
-    const realTimeTelemetry = firebaseData.telemetry || null;
-  
+      const slotRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}`);
+      const snapshot = await slotRef.get();
 
-    // 3. (Fire-and-forget) Update our database with the fresh data. No need to wait for this.
-    client.query(
-      'UPDATE booth_slots SET charge_level_percent = $1, telemetry = $2, updated_at = NOW() WHERE id = $3',
-      [realTimeCharge, realTimeTelemetry, slotId]
-    ).catch(err => logger.error(`Failed to background-update slot ${slotId} with Firebase data:`, err));
+      if (!snapshot.exists()) {
+        logger.warn(`Data inconsistency: Battery for user ${firebaseUid} is in PG for slot ${boothUid}/${slotIdentifier}, but slot does not exist in Firebase.`);
+        return { boothUid, slotIdentifier, chargeLevel: lastKnownChargeLevel, sessionStatus, telemetry: null };
+      }
 
-    // 4. Return the fresh, real-time data to the user.
-    res.status(200).json({
-      boothUid, slotIdentifier, chargeLevel: realTimeCharge, lastChargeLevel: lastChargeLevelSoc, sessionStatus, telemetry: realTimeTelemetry
-    });
+      const firebaseData = snapshot.val();
+      const realTimeCharge = extractValidSoc(firebaseData, lastKnownChargeLevel) ?? 0;
+
+      // Fire-and-forget: update our database with the fresh data.
+      client.query(
+        'UPDATE booth_slots SET charge_level_percent = $1, telemetry = $2, updated_at = NOW() WHERE id = $3',
+        [realTimeCharge, firebaseData.telemetry || null, slotId]
+      ).catch(err => logger.error(`Failed to background-update slot ${slotId} with Firebase data:`, err));
+
+      return {
+        boothUid,
+        slotIdentifier,
+        chargeLevel: realTimeCharge,
+        lastChargeLevel: lastKnownChargeLevel,
+        sessionStatus,
+        telemetry: firebaseData.telemetry || null,
+      };
+    }));
+
+    res.status(200).json(statuses);
   } catch (error) {
     logger.error(`Failed to get battery status for user ${firebaseUid}:`, error);
     res.status(500).json({ error: 'Failed to retrieve battery status.', details: error.message });

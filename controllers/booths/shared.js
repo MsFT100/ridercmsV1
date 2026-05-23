@@ -88,14 +88,45 @@ const WITHDRAWAL_BATTERY_QUERY = `
   LIMIT 1;
 `;
 
+const WITHDRAWAL_BATTERY_BY_ID_QUERY = `
+  SELECT
+    d.id as "depositCreditId",
+    d.completed_at AS "depositCompletedAt",
+    d.initial_charge_level AS "initialCharge",
+    s.id AS "slotId",
+    s.slot_identifier AS "slotIdentifier",
+    s.charge_level_percent AS "chargeLevel",
+    b.id AS "boothId",
+    b.booth_uid AS "boothUid"
+  FROM deposits d
+  JOIN booth_slots s ON d.slot_id = s.id
+  JOIN booths b ON d.booth_id = b.id
+  WHERE d.id = $1
+    AND d.user_id = $2
+    AND d.session_type = 'deposit'
+    AND d.status = 'completed';
+`;
+
 /**
- * Gets the battery context for a withdrawal based on the user's last completed deposit.
+ * Gets the battery context for a withdrawal.
  * @param {object} client - The database client.
  * @param {string} firebaseUid - The Firebase UID of the user.
+ * @param {number} [sessionId] - Optional deposit session ID to target a specific credit.
  * @returns {Promise<object>} The battery context object.
  */
-async function getWithdrawalBatteryContext(client, firebaseUid) {
-  const batteryRes = await client.query(WITHDRAWAL_BATTERY_QUERY, [firebaseUid]);
+async function getWithdrawalBatteryContext(client, firebaseUid, sessionId = null) {
+  let query;
+  let params;
+
+  if (sessionId) {
+    query = WITHDRAWAL_BATTERY_BY_ID_QUERY;
+    params = [sessionId, firebaseUid];
+  } else {
+    query = WITHDRAWAL_BATTERY_QUERY;
+    params = [firebaseUid];
+  }
+
+  const batteryRes = await client.query(query, params);
 
   if (batteryRes.rows.length === 0) {
     throw new Error('NO_DEPOSITED_BATTERY');

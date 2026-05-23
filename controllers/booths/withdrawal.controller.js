@@ -19,6 +19,7 @@ const router = Router();
  * Allows the app to stop charging first, then wait before creating a withdrawal session.
  */
 router.post('/stop-charging', verifyFirebaseToken, async (req, res) => {
+  const { sessionId } = req.body;
   const { uid: firebaseUid } = req.user;
   const pool = await poolPromise;
   const client = await pool.connect();
@@ -32,22 +33,24 @@ router.post('/stop-charging', verifyFirebaseToken, async (req, res) => {
       [firebaseUid]
     );
 
-    const existingSessionRes = await client.query(
-      `
-      SELECT 1
-      FROM deposits
-      WHERE user_id = $1
-        AND status IN ('pending', 'opening', 'in_progress')
-      LIMIT 1
-      `,
-      [firebaseUid]
-    );
+    if (!sessionId) {
+      const existingSessionRes = await client.query(
+        `
+        SELECT 1
+        FROM deposits
+        WHERE user_id = $1
+          AND status IN ('pending', 'opening', 'in_progress')
+        LIMIT 1
+        `,
+        [firebaseUid]
+      );
 
-    if (existingSessionRes.rows.length > 0) {
-      throw new Error('ACTIVE_SESSION_EXISTS');
+      if (existingSessionRes.rows.length > 0) {
+        throw new Error('ACTIVE_SESSION_EXISTS');
+      }
     }
 
-    const batteryContext = await getWithdrawalBatteryContext(client, firebaseUid);
+    const batteryContext = await getWithdrawalBatteryContext(client, firebaseUid, sessionId);
     const {
       chargeLevel: dbChargeLevel,
       slotIdentifier,
@@ -115,6 +118,7 @@ router.post('/stop-charging', verifyFirebaseToken, async (req, res) => {
  * Called by a user's app to start the collection of their charged battery.
  */
 router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
+  const { sessionId } = req.body;
   const { uid: firebaseUid } = req.user;
   const pool = await poolPromise;
   const client = await pool.connect();
@@ -127,24 +131,26 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
       [firebaseUid]
     );
 
-    const existingSessionRes = await client.query(
-      `
-      SELECT 1
-      FROM deposits
-      WHERE user_id = $1
-        AND status IN ('pending', 'opening', 'in_progress')
-      `,
-      [firebaseUid]
-    );
+    if (!sessionId) {
+      const existingSessionRes = await client.query(
+        `
+        SELECT 1
+        FROM deposits
+        WHERE user_id = $1
+          AND status IN ('pending', 'opening', 'in_progress')
+        `,
+        [firebaseUid]
+      );
 
-    if (existingSessionRes.rows.length > 0) {
-      throw new Error('ACTIVE_SESSION_EXISTS');
+      if (existingSessionRes.rows.length > 0) {
+        throw new Error('ACTIVE_SESSION_EXISTS');
+      }
     }
 
     /* -------------------------------------------------------
      * 1. Find user's battery & slot
      * ----------------------------------------------------- */
-    const batteryContext = await getWithdrawalBatteryContext(client, firebaseUid);
+    const batteryContext = await getWithdrawalBatteryContext(client, firebaseUid, sessionId);
     const {
       chargeLevel: dbChargeLevel,
       depositCreditId,
@@ -406,8 +412,7 @@ router.get('/sessions/pending-withdrawal', verifyFirebaseToken, async (req, res)
         WHERE d.user_id = $1 
           AND d.session_type = 'withdrawal' 
           AND d.status = 'pending'
-        ORDER BY d.created_at DESC
-        LIMIT 1;
+        ORDER BY d.created_at DESC;
     `;
     
     const { rows } = await client.query(query, [firebaseUid]);
@@ -416,28 +421,29 @@ router.get('/sessions/pending-withdrawal', verifyFirebaseToken, async (req, res)
       return res.status(204).send();
     }
 
-    const session = rows[0];
+    const sessions = rows.map((session) => {
+      const chargeDurationMs = new Date() - new Date(session.depositCompletedAt);
+      const chargeDurationMinutes = Math.round(chargeDurationMs / 60000);
 
-    const chargeDurationMs = new Date() - new Date(session.depositCompletedAt);
-    const chargeDurationMinutes = Math.round(chargeDurationMs / 60000);
+      const socGained = Math.max(0, 
+        parseFloat(session.finalSocAtWithdrawal || 0) - parseFloat(session.startingSocAtDeposit || 0)
+      ).toFixed(1);
 
-    // Now startingSocAtDeposit exists, so the math won't return NaN/null
-    const socGained = Math.max(0, 
-      parseFloat(session.finalSocAtWithdrawal || 0) - parseFloat(session.startingSocAtDeposit || 0)
-    ).toFixed(1);
-
-    res.status(200).json({
-      sessionId: session.sessionId,
-      amount: parseFloat(session.lockedAmount || 0),
-      durationMinutes: chargeDurationMinutes,
-      soc: parseFloat(socGained),
-      socAtInitiation: parseFloat(session.startingSocAtDeposit),
-      socAtWithdrawal: parseFloat(session.finalSocAtWithdrawal),
-      currentBoothSoc: parseFloat(session.currentLiveSoc),
-      boothUid: session.boothUid,
-      slotIdentifier: session.slotIdentifier,
-      depositCompletedAt: session.depositCompletedAt
+      return {
+        sessionId: session.sessionId,
+        amount: parseFloat(session.lockedAmount || 0),
+        durationMinutes: chargeDurationMinutes,
+        soc: parseFloat(socGained),
+        socAtInitiation: parseFloat(session.startingSocAtDeposit),
+        socAtWithdrawal: parseFloat(session.finalSocAtWithdrawal),
+        currentBoothSoc: parseFloat(session.currentLiveSoc),
+        boothUid: session.boothUid,
+        slotIdentifier: session.slotIdentifier,
+        depositCompletedAt: session.depositCompletedAt,
+      };
     });
+
+    res.status(200).json(sessions);
 
   } catch (error) {
     logger.error(`Failed to get pending withdrawal for user ${firebaseUid}:`, error);
@@ -545,40 +551,53 @@ router.get('/withdrawal-status/:checkoutRequestId', verifyFirebaseToken, async (
  *     description: Internal server error.
  */
 router.post('/release-battery', verifyFirebaseToken, async (req, res) => {
-  const { boothUid } = req.body;
+  const { boothUid, sessionId } = req.body;
   const { uid: firebaseUid } = req.user;
 
-  if (!boothUid) {
-    return res.status(400).json({ error: 'boothUid is required.' });
+  if (!boothUid && !sessionId) {
+    return res.status(400).json({ error: 'boothUid or sessionId is required.' });
   }
 
   const pool = await poolPromise;
   const client = await pool.connect();
   try {
-    // Find the paid withdrawal session that matches this user and this booth.
-    const sessionRes = await client.query(
-      `SELECT d.id, s.slot_identifier
-       FROM deposits d
-       JOIN booths b ON d.booth_id = b.id
-       JOIN booth_slots s ON d.slot_id = s.id
-       WHERE d.user_id = $1 AND b.booth_uid = $2 AND d.session_type = 'withdrawal' AND d.status = 'in_progress'
-       LIMIT 1`,
-      [firebaseUid, boothUid]
-    );
-
-    if (sessionRes.rowCount === 0) {
-      return res.status(404).json({ error: 'No paid withdrawal session found for this booth. Please ensure you have paid.' });
+    let sessionRes;
+    if (sessionId) {
+      sessionRes = await client.query(
+        `SELECT d.id, s.slot_identifier, b.booth_uid AS "boothUid"
+         FROM deposits d
+         JOIN booth_slots s ON d.slot_id = s.id
+         JOIN booths b ON d.booth_id = b.id
+         WHERE d.id = $1 AND d.user_id = $2
+           AND d.session_type = 'withdrawal' AND d.status = 'in_progress'`,
+        [sessionId, firebaseUid]
+      );
+    } else {
+      sessionRes = await client.query(
+        `SELECT d.id, s.slot_identifier, b.booth_uid AS "boothUid"
+         FROM deposits d
+         JOIN booths b ON d.booth_id = b.id
+         JOIN booth_slots s ON d.slot_id = s.id
+         WHERE d.user_id = $1 AND b.booth_uid = $2
+           AND d.session_type = 'withdrawal' AND d.status = 'in_progress'
+         LIMIT 1`,
+        [firebaseUid, boothUid]
+      );
     }
 
-    const { slot_identifier: slotIdentifier } = sessionRes.rows[0];
+    if (sessionRes.rowCount === 0) {
+      return res.status(404).json({ error: 'No paid withdrawal session found. Please ensure you have paid.' });
+    }
+
+    const { slot_identifier: slotIdentifier, boothUid: resolvedBoothUid } = sessionRes.rows[0];
     const db = getDatabase();
-    await db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`).update({
+    await db.ref(`booths/${resolvedBoothUid}/slots/${slotIdentifier}/command`).update({
       openForCollection: true,
       openForDeposit: false,
     });
 
-    logger.info(`User ${firebaseUid} verified at booth ${boothUid}. Battery released from slot ${slotIdentifier}.`);
-    res.status(200).json({ message: `Battery released. Please collect it from slot ${slotIdentifier}.`, slotIdentifier });
+    logger.info(`User ${firebaseUid} verified. Battery released from slot ${slotIdentifier} at booth ${resolvedBoothUid}.`);
+    res.status(200).json({ message: `Battery released. Please collect it from slot ${slotIdentifier}.`, slotIdentifier, boothUid: resolvedBoothUid });
   } catch (error) {
     logger.error(`Failed to release battery for user ${firebaseUid}:`, error);
     res.status(500).json({ error: 'Failed to release battery.', details: error.message });
