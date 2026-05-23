@@ -147,7 +147,7 @@ router.get('/sessions', [verifyFirebaseToken, isAdmin], async (req, res) => {
         d.id, d.session_type AS "sessionType", d.status, d.amount,
         d.mpesa_checkout_id AS "mpesaCheckoutId", d.initial_charge_level AS "initialChargeLevel",
         d.created_at AS "createdAt", d.started_at AS "startedAt", d.completed_at AS "completedAt",
-        u.email AS "userEmail", u.phone_number AS "userPhoneNumber", b.booth_uid AS "boothUid", s.slot_identifier AS "slotIdentifier",
+        u.email AS "userEmail", u.phone AS "userPhoneNumber", b.booth_uid AS "boothUid", s.slot_identifier AS "slotIdentifier",
         bat.battery_uid AS "batteryUid"
       ${baseQuery}
       ORDER BY d.created_at DESC

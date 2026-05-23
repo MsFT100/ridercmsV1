@@ -215,6 +215,7 @@ async function handleWithdrawalCompletion(pgClient, slotIdentifier, slotId) {
         AND status = 'in_progress'
         AND session_type = 'withdrawal'
       RETURNING id, user_id
+      LIMIT 1
     )
     -- Mark the original deposit as 'redeemed' so it can't be used for more withdrawals.
     UPDATE deposits
