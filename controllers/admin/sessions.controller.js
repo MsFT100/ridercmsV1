@@ -96,7 +96,7 @@ router.get('/sessions', [verifyFirebaseToken, isAdmin], async (req, res) => {
     let paramIndex = 1;
 
     if (searchTerm) {
-      whereClauses.push(`(u.email ILIKE $${paramIndex} OR u.name ILIKE $${paramIndex} OR u.phone_number ILIKE $${paramIndex++})`);
+      whereClauses.push(`(u.email ILIKE $${paramIndex} OR u.name ILIKE $${paramIndex} OR u.phone ILIKE $${paramIndex++})`);
       queryParams.push(`%${searchTerm}%`);
     }
     if (status) {
