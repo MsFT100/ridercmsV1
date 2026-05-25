@@ -223,6 +223,7 @@ router.get('/my-battery-status', verifyFirebaseToken, async (/** @type {any} */ 
     // that has not yet been redeemed by a withdrawal.
     const locationQuery = `
       SELECT
+        d.id AS "sessionId",
         bo.booth_uid AS "boothUid",
         s.id AS "slotId",
         s.slot_identifier AS "slotIdentifier",
@@ -246,14 +247,14 @@ router.get('/my-battery-status', verifyFirebaseToken, async (/** @type {any} */ 
     const db = getDatabase();
 
     const statuses = await Promise.all(locationResult.rows.map(async (row) => {
-      const { boothUid, slotId, slotIdentifier, lastKnownChargeLevel, sessionStatus } = row;
+      const { sessionId, boothUid, slotId, slotIdentifier, lastKnownChargeLevel, sessionStatus } = row;
 
       const slotRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}`);
       const snapshot = await slotRef.get();
 
       if (!snapshot.exists()) {
         logger.warn(`Data inconsistency: Battery for user ${firebaseUid} is in PG for slot ${boothUid}/${slotIdentifier}, but slot does not exist in Firebase.`);
-        return { boothUid, slotIdentifier, chargeLevel: lastKnownChargeLevel, sessionStatus, telemetry: null };
+        return { sessionId, boothUid, slotIdentifier, chargeLevel: lastKnownChargeLevel, sessionStatus, telemetry: null };
       }
 
       const firebaseData = snapshot.val();
@@ -266,6 +267,7 @@ router.get('/my-battery-status', verifyFirebaseToken, async (/** @type {any} */ 
       ).catch(err => logger.error(`Failed to background-update slot ${slotId} with Firebase data:`, err));
 
       return {
+        sessionId,
         boothUid,
         slotIdentifier,
         chargeLevel: realTimeCharge,

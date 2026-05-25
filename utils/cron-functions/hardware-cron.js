@@ -89,19 +89,16 @@ async function checkChargingConditions() {
 }
 
 /**
- * Automated session maintenance.
- * 1. Resolves withdrawal sessions stuck in 'in_progress' (> 5 mins).
- * 2. Purges cancelled sessions older than 30 days.
+ * Resolves withdrawal sessions stuck in 'in_progress' for more than 5 minutes.
+ * Runs frequently to prevent users from being blocked.
  */
-async function runWeeklyCleanup() {
+async function resolveStuckWithdrawals() {
   let client;
   try {
     const pool = await poolPromise;
     client = await pool.connect();
     await client.query('BEGIN');
 
-    // 1. Resolve stuck 'in_progress' withdrawals
-    // We use a 5-minute threshold as defined in SYSTEM_CRITERIA.md
     const stuckWithdrawalsQuery = `
       SELECT id, slot_id, user_id
       FROM deposits
@@ -110,7 +107,7 @@ async function runWeeklyCleanup() {
         AND updated_at < NOW() - INTERVAL '5 minutes'
     `;
     const stuckRes = await client.query(stuckWithdrawalsQuery);
-    
+
     if (stuckRes.rowCount > 0) {
       const { handleWithdrawalCompletion } = require('../firebaseSync');
       for (const session of stuckRes.rows) {
@@ -119,19 +116,41 @@ async function runWeeklyCleanup() {
       }
     }
 
-    // 2. Purge cancelled sessions older than 30 days
+    await client.query('COMMIT');
+
+    if (stuckRes.rowCount > 0) {
+      logger.info(`[CleanupCron] Resolved ${stuckRes.rowCount} stuck withdrawal sessions.`);
+    }
+  } catch (error) {
+    if (client) await client.query('ROLLBACK');
+    logger.error('[CleanupCron] Error resolving stuck withdrawals:', error);
+  } finally {
+    if (client) client.release();
+  }
+}
+
+/**
+ * Weekly maintenance: purges cancelled sessions older than 30 days.
+ */
+async function runWeeklyMaintenance() {
+  let client;
+  try {
+    const pool = await poolPromise;
+    client = await pool.connect();
+    await client.query('BEGIN');
+
     const purgeResult = await client.query(
       "DELETE FROM deposits WHERE status = 'cancelled' AND updated_at < NOW() - INTERVAL '30 days'"
     );
 
     await client.query('COMMIT');
 
-    if (stuckRes.rowCount > 0 || purgeResult.rowCount > 0) {
-      logger.info(`[CleanupCron] Maintenance completed: Resolved ${stuckRes.rowCount} stuck sessions, Purged ${purgeResult.rowCount} cancelled sessions.`);
+    if (purgeResult.rowCount > 0) {
+      logger.info(`[CleanupCron] Weekly maintenance purged ${purgeResult.rowCount} cancelled sessions.`);
     }
   } catch (error) {
     if (client) await client.query('ROLLBACK');
-    logger.error('[CleanupCron] Error running weekly cleanup:', error);
+    logger.error('[CleanupCron] Error running weekly maintenance:', error);
   } finally {
     if (client) client.release();
   }
@@ -141,16 +160,21 @@ async function runWeeklyCleanup() {
  * Starts the cron job interval.
  */
 function startCronJob() {
-  logger.info('[HardwareCron] Starting charging condition check cron (Interval: 1 minute).');
-  
+  logger.info('[HardwareCron] Starting charging condition check cron (Interval: 5 seconds).');
+
   // Run immediately on server start
   checkChargingConditions().catch((err) => {
     logger.error('[HardwareCron] Initial run failed:', err);
   });
 
-  // Run cleanup once on startup, then every week.
-  runWeeklyCleanup().catch((err) => {
-    logger.error('[CleanupCron] Initial cleanup failed:', err);
+  // Resolve stuck withdrawals immediately on startup
+  resolveStuckWithdrawals().catch((err) => {
+    logger.error('[CleanupCron] Initial stuck resolution failed:', err);
+  });
+
+  // Run weekly maintenance once on startup
+  runWeeklyMaintenance().catch((err) => {
+    logger.error('[CleanupCron] Initial maintenance failed:', err);
   });
 
   // Schedule M-Pesa reconciliation at 2 AM daily
@@ -159,18 +183,27 @@ function startCronJob() {
     await runMpesaReconciliation();
   });
 
-  // Schedule weekly cleanup at 3 AM every Sunday
+  // Schedule weekly data purge at 3 AM every Sunday
   cron.schedule('0 3 * * 0', async () => {
-    logger.info('[HardwareCron] Starting scheduled weekly session cleanup...');
-    await runWeeklyCleanup();
+    logger.info('[HardwareCron] Starting scheduled weekly data purge...');
+    await runWeeklyMaintenance();
   });
 
-  // Then run every 60 seconds
+  // Check charging conditions every 5 seconds
   setInterval(() => {
     checkChargingConditions().catch((err) => {
       logger.error('[HardwareCron] Scheduled run failed:', err);
     });
   }, 5 * 1000);
+
+  // Resolve stuck withdrawals every 90 seconds
+  // This ensures sessions are auto-completed ~6.5 minutes after getting stuck
+  // (5 min threshold + 90s check window)
+  setInterval(() => {
+    resolveStuckWithdrawals().catch((err) => {
+      logger.error('[CleanupCron] Scheduled stuck resolution failed:', err);
+    });
+  }, 90 * 1000);
 }
 
-module.exports = { startCronJob };
+module.exports = { startCronJob, resolveStuckWithdrawals, runWeeklyMaintenance };

@@ -1,5 +1,6 @@
 const rateLimit = require('express-rate-limit');
 
+// @ts-ignore
 const globalLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 600,
@@ -8,6 +9,7 @@ const globalLimiter = rateLimit({
   message: { error: 'Too many requests. Please try again later.' },
 });
 
+// @ts-ignore
 const authLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 5,
@@ -16,14 +18,16 @@ const authLimiter = rateLimit({
   message: { error: 'Too many authentication attempts. Please try again later.' },
 });
 
+// @ts-ignore
 const boothLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 30,
+  max: 30000,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests. Please slow down.' },
 });
 
+// @ts-ignore
 const mpesaLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 30,

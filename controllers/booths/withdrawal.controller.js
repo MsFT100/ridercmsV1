@@ -131,20 +131,20 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
       [firebaseUid]
     );
 
-    if (!sessionId) {
-      const existingSessionRes = await client.query(
-        `
-        SELECT 1
-        FROM deposits
-        WHERE user_id = $1
-          AND status IN ('pending', 'opening', 'in_progress')
-        `,
-        [firebaseUid]
-      );
+    const existingSessionRes = await client.query(
+      `
+      SELECT 1
+      FROM deposits
+      WHERE user_id = $1
+        AND session_type = 'withdrawal'
+        AND status IN ('pending', 'in_progress')
+      LIMIT 1
+      `,
+      [firebaseUid]
+    );
 
-      if (existingSessionRes.rows.length > 0) {
-        throw new Error('ACTIVE_SESSION_EXISTS');
-      }
+    if (existingSessionRes.rows.length > 0) {
+      throw new Error('ACTIVE_SESSION_EXISTS');
     }
 
     /* -------------------------------------------------------
@@ -220,7 +220,7 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
       [firebaseUid, boothId, slotId, totalCost, chargeLevel, depositCreditId]
     );
 
-    const sessionId = sessionRes.rows[0].id;
+    const withdrawalSessionId = sessionRes.rows[0].id;
 
     await client.query('COMMIT');
 
@@ -231,7 +231,7 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
 
     return res.status(200).json({
       message: 'Withdrawal session created. Please confirm cost before payment.',
-      sessionId: sessionId,
+      sessionId: withdrawalSessionId,
       amount: totalCost,
       soc: parseFloat(chargeAddedToBattery.toFixed(1)),
       socAtWithdrawal: parseFloat(chargeLevel.toFixed(1)),
