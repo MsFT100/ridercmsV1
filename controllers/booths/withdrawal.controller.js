@@ -480,8 +480,8 @@ router.get('/withdrawal-status/:checkoutRequestId', verifyFirebaseToken, async (
     }
 
     // --- Self-Healing Logic for Stuck Pending Transactions ---
-    // M-Pesa STK push timeout is typically 60 seconds. We wait slightly longer to allow for callback latency.
-    const PENDING_TIMEOUT_SECONDS = parseInt(process.env.MPESA_PENDING_TIMEOUT_SECONDS, 10) || 80;
+    // M-Pesa STK push timeout is typically 60 seconds. Wait slightly past that before querying.
+    const PENDING_TIMEOUT_SECONDS = parseInt(process.env.MPESA_PENDING_TIMEOUT_SECONDS, 10) || 60;
     const secondsSinceStart = (new Date() - new Date(startedAt)) / 1000;
 
     // If it has been pending for less than the timeout, just tell the client to keep polling.

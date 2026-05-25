@@ -4,6 +4,8 @@ const cron = require('node-cron');
 const { getDatabase } = require('firebase-admin/database');
 const poolPromise = require('../../db');
 const logger = require('../logger');
+const { querySTKStatus } = require('../mpesa');
+const { completePaidWithdrawal } = require('../sessionUtils');
 const { runMpesaReconciliation } = require('../reconciliationWorker');
 
 /**
@@ -85,6 +87,82 @@ async function checkChargingConditions() {
     if (client) {
       client.release();
     }
+  }
+}
+
+/**
+ * Queries M-Pesa for withdrawal sessions stuck in 'pending' with an mpesa_checkout_id.
+ * If M-Pesa confirms payment, completes the session so the user can proceed.
+ * Runs frequently to recover from missed callbacks (network blips, service restarts).
+ */
+async function resolvePendingPayments() {
+  let client;
+  try {
+    const pool = await poolPromise;
+    client = await pool.connect();
+
+    // Find pending withdrawals with an mpesa_checkout_id older than 45 seconds.
+    // M-Pesa STK push timeout is ~60s; by 45s the user has likely entered their PIN.
+    const pendingQuery = `
+      SELECT id, mpesa_checkout_id
+      FROM deposits
+      WHERE session_type = 'withdrawal'
+        AND status = 'pending'
+        AND mpesa_checkout_id IS NOT NULL
+        AND started_at < NOW() - INTERVAL '45 seconds'
+      ORDER BY started_at ASC
+    `;
+    const { rows } = await client.query(pendingQuery);
+
+    if (rows.length === 0) return;
+
+    logger.info(`[MpesaCron] Found ${rows.length} pending payment(s) to verify.`);
+
+    for (const session of rows) {
+      const { id: sessionId, mpesa_checkout_id: checkoutId } = session;
+      try {
+        const response = await querySTKStatus(checkoutId);
+        const { ResultCode, ResultDesc } = response.data;
+
+        if (ResultCode === '0') {
+          logger.info(`[MpesaCron] M-Pesa confirmed payment for session ${sessionId} (${checkoutId}). Completing...`);
+          await client.query('BEGIN');
+          const completed = await completePaidWithdrawal(client, checkoutId);
+          await client.query('COMMIT');
+          if (completed) {
+            logger.info(`[MpesaCron] Session ${sessionId} moved to in_progress via proactive check.`);
+          }
+        } else {
+          // Non-zero result code: payment failed or cancelled.
+          // Only mark as failed if the session is older than 75s (well past M-Pesa timeout)
+          // to avoid premature failure before the callback arrives.
+          const ageRes = await client.query(
+            `SELECT EXTRACT(EPOCH FROM (NOW() - started_at))::int AS age_seconds
+             FROM deposits WHERE id = $1`,
+            [sessionId]
+          );
+          const ageSeconds = ageRes.rows[0]?.age_seconds || 0;
+
+          if (ageSeconds > 75) {
+            logger.warn(`[MpesaCron] Marking session ${sessionId} as failed. M-Pesa code: ${ResultCode} (${ResultDesc})`);
+            await client.query(
+              `UPDATE deposits SET status = 'failed',
+               notes = COALESCE(notes, '') || '\n[' || NOW() || '] Proactive check failed: ' || $1
+               WHERE id = $2 AND status = 'pending'`,
+              [`${ResultCode} - ${ResultDesc}`, sessionId]
+            );
+          } else {
+            logger.debug(`[MpesaCron] Session ${sessionId} still pending (M-Pesa: ${ResultCode}). Skipping.`);
+          }
+        }
+      } catch (apiError) {
+        logger.warn(`[MpesaCron] M-Pesa query failed for session ${sessionId}: ${apiError.message}`);
+      }
+    }
+  } catch (error) {
+    logger.error('[MpesaCron] Error resolving pending payments:', error);
+  } finally {
+    if (client) client.release();
   }
 }
 
@@ -172,6 +250,11 @@ function startCronJob() {
     logger.error('[CleanupCron] Initial stuck resolution failed:', err);
   });
 
+  // Check for pending payments that may have missed callbacks
+  resolvePendingPayments().catch((err) => {
+    logger.error('[MpesaCron] Initial pending payment check failed:', err);
+  });
+
   // Run weekly maintenance once on startup
   runWeeklyMaintenance().catch((err) => {
     logger.error('[CleanupCron] Initial maintenance failed:', err);
@@ -204,6 +287,15 @@ function startCronJob() {
       logger.error('[CleanupCron] Scheduled stuck resolution failed:', err);
     });
   }, 90 * 1000);
+
+  // Check M-Pesa for stuck pending payments every 30 seconds
+  // This recovers from missed callbacks within ~75 seconds of the STK push
+  // (45s threshold + 30s check window)
+  setInterval(() => {
+    resolvePendingPayments().catch((err) => {
+      logger.error('[MpesaCron] Scheduled pending payment check failed:', err);
+    });
+  }, 30 * 1000);
 }
 
-module.exports = { startCronJob, resolveStuckWithdrawals, runWeeklyMaintenance };
+module.exports = { startCronJob, resolvePendingPayments, resolveStuckWithdrawals, runWeeklyMaintenance };

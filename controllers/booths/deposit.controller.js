@@ -1,5 +1,6 @@
 const { Router } = require('express');
 const { getDatabase } = require('firebase-admin/database');
+const crypto = require('crypto');
 const logger = require('../../utils/logger');
 const poolPromise = require('../../db');
 const { verifyFirebaseToken } = require('../../middleware/auth');
@@ -214,13 +215,12 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (/** @type {any} */ 
  */
 router.get('/my-battery-status', verifyFirebaseToken, async (/** @type {any} */ req, res) => {
   const { uid: firebaseUid } = req.user;
+  const isPoll = req.headers['x-purpose'] === 'poll';
 
   const pool = await poolPromise;
   const client = await pool.connect();
   try {
     // 1. Find where the user's battery is located from our database.
-    // This query finds the user's "deposit credit" - a completed deposit session
-    // that has not yet been redeemed by a withdrawal.
     const locationQuery = `
       SELECT
         d.id AS "sessionId",
@@ -228,20 +228,30 @@ router.get('/my-battery-status', verifyFirebaseToken, async (/** @type {any} */ 
         s.id AS "slotId",
         s.slot_identifier AS "slotIdentifier",
         s.charge_level_percent AS "lastKnownChargeLevel",
-        d.status AS "sessionStatus" -- Will be 'completed'
+        d.status AS "sessionStatus",
+        GREATEST(d.updated_at, s.updated_at) AS "lastModified"
       FROM deposits d
       JOIN booth_slots s ON d.slot_id = s.id
       JOIN booths bo ON s.booth_id = bo.id
       WHERE d.user_id = $1
         AND d.session_type = 'deposit'
-        AND d.status = 'completed'; -- 'completed' means deposited, 'redeemed' means withdrawn against.
+        AND d.status = 'completed';
     `;
     const locationResult = await client.query(locationQuery, [firebaseUid]);
 
     if (locationResult.rows.length === 0) {
-      // Instead of a 404, return a 200 with a null body.
-      // This indicates a successful lookup with no result, which is not an error.
       return res.status(200).json(null);
+    }
+
+    // Compute a cheap ETag from the latest timestamp across all deposits/slots.
+    const maxModified = locationResult.rows.reduce(
+      (max, r) => Math.max(max, new Date(r.lastModified).getTime()), 0
+    );
+    const timestampTag = `"${maxModified}"`;
+
+    // If the client sent the timestamp ETag back, nothing changed — skip Firebase entirely.
+    if (req.headers['if-none-match'] === timestampTag) {
+      return res.status(304).end();
     }
 
     const db = getDatabase();
@@ -260,11 +270,13 @@ router.get('/my-battery-status', verifyFirebaseToken, async (/** @type {any} */ 
       const firebaseData = snapshot.val();
       const realTimeCharge = extractValidSoc(firebaseData, lastKnownChargeLevel) ?? 0;
 
-      // Fire-and-forget: update our database with the fresh data.
-      client.query(
-        'UPDATE booth_slots SET charge_level_percent = $1, telemetry = $2, updated_at = NOW() WHERE id = $3',
-        [realTimeCharge, firebaseData.telemetry || null, slotId]
-      ).catch(err => logger.error(`Failed to background-update slot ${slotId} with Firebase data:`, err));
+      // On poll requests skip the background DB sync (non-essential).
+      if (!isPoll) {
+        client.query(
+          'UPDATE booth_slots SET charge_level_percent = $1, telemetry = $2, updated_at = NOW() WHERE id = $3',
+          [realTimeCharge, firebaseData.telemetry || null, slotId]
+        ).catch(err => logger.error(`Failed to background-update slot ${slotId} with Firebase data:`, err));
+      }
 
       return {
         sessionId,
@@ -277,6 +289,16 @@ router.get('/my-battery-status', verifyFirebaseToken, async (/** @type {any} */ 
       };
     }));
 
+    // Compute an exact ETag from the full response body.
+    const body = JSON.stringify(statuses);
+    const responseTag = `"${crypto.createHash('md5').update(body).digest('hex')}"`;
+
+    // Double-check: if the client already has this exact payload, avoid sending it again.
+    if (req.headers['if-none-match'] === responseTag) {
+      return res.status(304).end();
+    }
+
+    res.set('ETag', responseTag);
     res.status(200).json(statuses);
   } catch (error) {
     logger.error(`Failed to get battery status for user ${firebaseUid}:`, error);

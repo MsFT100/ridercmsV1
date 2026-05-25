@@ -206,7 +206,7 @@ async function handleDepositCompletion(pgClient, boothUid, slotIdentifier, slotI
 async function handleWithdrawalCompletion(pgClient, slotIdentifier, slotId) {
   const findAndUpdateWithdrawalQuery = `
     WITH selected AS (
-      SELECT id, user_id
+      SELECT id, user_id, consumed_deposit_id
       FROM deposits
       WHERE slot_id = $1
         AND status = 'in_progress'
@@ -221,13 +221,16 @@ async function handleWithdrawalCompletion(pgClient, slotIdentifier, slotId) {
       FROM selected
       WHERE deposits.id = selected.id
       RETURNING deposits.id, deposits.user_id
+    ), redeem_credit AS (
+      UPDATE deposits
+      SET status = 'redeemed'
+      WHERE id = (SELECT consumed_deposit_id FROM selected)
+      RETURNING id
     )
-    -- Mark the original deposit as 'redeemed' so it can't be used for more withdrawals.
-    UPDATE deposits
-    SET status = 'redeemed'
-    WHERE user_id = (SELECT user_id FROM updated_deposit)
-      AND session_type = 'deposit'
-      AND status = 'completed'
+    -- Reset the slot to available so it can accept the next deposit.
+    UPDATE booth_slots
+    SET status = 'available', current_battery_id = NULL, updated_at = NOW()
+    WHERE id = $1
     RETURNING (SELECT id FROM updated_deposit) AS session_id;
   `;
   const withdrawalUpdateResult = await pgClient.query(findAndUpdateWithdrawalQuery, [slotId]);
