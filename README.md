@@ -74,6 +74,45 @@ See `.env` for the full list. Key ones:
 | `FIREBASE_*` | Firebase Admin SDK credentials |
 | `DATABASE_URL` | PostgreSQL connection string |
 
+## Admin Endpoints
+
+All admin routes are under `/api/admin/booths` and require a Firebase auth token with the `admin` role.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/booths` | List all booths (paginated, with slot/battery/user info) |
+| `GET` | `/booths/status` | Real-time status of all booths (merges Firebase telemetry) |
+| `GET` | `/booths/:boothUid` | Details of a single booth with its slots |
+| `GET` | `/booths/:boothUid/slots/:slotIdentifier` | Detailed slot info with active session and real-time Firebase data |
+| `POST` | `/booths` | Create a new booth (name, locationAddress required) |
+| `PATCH` | `/booths/:boothUid` | Update booth metadata (name, locationAddress, latitude, longitude) |
+| `DELETE` | `/booths/:boothUid` | Delete a booth and all its slots |
+| `DELETE` | `/booths/:boothUid/slots/:slotIdentifier` | Delete a single slot |
+| `POST` | `/booths/:boothUid/status` | Set booth status: `online`, `maintenance`, `offline` |
+| `POST` | `/booths/:boothUid/slots/:slotIdentifier/status` | Set slot status: `available`, `disabled` |
+| `POST` | `/booths/:boothUid/slots/:slotIdentifier/command` | Send a command to a slot (see below) |
+| `POST` | `/booths/:boothUid/reset-slots` | Reset one or all slots to factory defaults |
+| `POST` | `/booths/:boothUid/slots/:slotIdentifier/manual-withdraw` | Manually withdraw a battery (stop charge, create completed withdrawal, release door) |
+
+### Slot Commands
+
+Send any combination of these boolean flags to `POST /booths/:boothUid/slots/:slotIdentifier/command`:
+
+| Command | Description |
+|---------|-------------|
+| `forceLock` | Physically lock the slot door. Clears `forceUnlock`. |
+| `forceUnlock` | Physically unlock the slot door. Auto-completes any stuck withdrawal session and resets the slot to `available`. Clears `forceLock`. |
+| `openForDeposit` | Open door for battery insertion |
+| `openForCollection` | Open door for battery removal |
+| `startCharging` | Begin charging the battery. Blocked if slot is `disabled`/`faulty` or has no active deposit session. Clears `stopCharging`. |
+| `stopCharging` | Stop charging. Clears `startCharging`. |
+| `openDoorId` | A string value used to trigger an open action with a unique identifier |
+
+**Example:**
+```json
+{ "forceUnlock": true }
+```
+
 ## Setup
 
 ```bash
