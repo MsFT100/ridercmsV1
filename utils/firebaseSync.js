@@ -479,11 +479,27 @@ async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
         case 'openForCollection_sent':
         case 'openForDeposit_sent':
         case 'startCharging_pulsed':
-        case 'forceUnlock_pulsed':
-        case 'forceUnlock_done':
         case 'forceLock_done':
           logger.debug(`Hardware signal: ${ackMessage} for slot ${slotIdentifier}.`);
           break;
+
+        case 'forceUnlock_pulsed':
+        case 'forceUnlock_done': {
+          logger.debug(`Hardware signal: ${ackMessage} for slot ${slotIdentifier}. Clearing command and resetting slot if empty.`);
+          try {
+            if (!batteryInserted) {
+              await pgClient.query(
+                `UPDATE booth_slots SET status = 'available', current_battery_id = NULL, updated_at = NOW() WHERE id = $1`,
+                [slotId]
+              );
+              logger.info(`Force unlock acknowledged for empty slot ${slotIdentifier}. Slot reset to available.`);
+            }
+            await commandRef.update({ forceUnlock: false, ack: "" });
+          } catch (dbError) {
+            logger.error(`Failed to process force unlock cleanup for ${slotIdentifier}:`, dbError);
+          }
+          break;
+        }
 
         default:
           logger.debug(`Received unhandled ACK '${ackMessage}' for slot ${slotIdentifier}. No action taken.`);
