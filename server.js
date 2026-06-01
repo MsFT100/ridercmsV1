@@ -1,18 +1,16 @@
 // @ts-check
-// --- Load Environment Variables ---
-// This must be at the very top to ensure `process.env` is populated before other modules.
 const path = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 
 const express = require('express');
 const cors = require('cors');
-const helmet = require('helmet');
+const helmet = require('helmet').default;
 const cookieParser = require('cookie-parser');
 const { globalLimiter, authLimiter, boothLimiter, mpesaLimiter } = require('./middleware/rateLimiter');
 const morgan = require('morgan');
-const logger = require('./utils/logger'); // Corrected path
-const poolPromise = require('./db/index.js'); // Corrected path
-const { initializeDatabase } = require('./db/init'); // Corrected path
+const logger = require('./utils/logger'); 
+const poolPromise = require('./db/index.js'); 
+const { initializeDatabase } = require('./db/init');
 const { initializeFirebase } = require('./utils/firebase');
 const { initializeFirebaseSync } = require('./utils/firebaseSync');
 const { startCronJob } = require('./utils/cron-functions/hardware-cron');
@@ -103,6 +101,8 @@ const corsOptions = {
   credentials: true,
   optionsSuccessStatus: 204 // For legacy browser compatibility
 };
+
+app.set('trust proxy', 1);
 
 // Middleware
 app.use(cors(corsOptions));
