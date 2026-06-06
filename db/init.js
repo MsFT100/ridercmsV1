@@ -25,7 +25,7 @@ const initializeDatabase = async () => {
         profile_image_url TEXT, -- URL for the user's profile picture
         fcm_token TEXT, -- For sending push notifications
         status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active', 'inactive', 'suspended')),
-        role VARCHAR(20) DEFAULT 'user' CHECK (role IN ('user', 'admin')),
+        role VARCHAR(20) DEFAULT 'user' CHECK (role IN ('user', 'admin', 'developer')),
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW()
       );`;
@@ -288,6 +288,26 @@ const initializeDatabase = async () => {
       await client.query(insertSettingQuery, [setting.key, setting.value, setting.description]);
     }
     logger.info('Default application settings verified.');
+
+    // --- Dev Schema (mirror of public for developer isolation) ---
+    await client.query('CREATE SCHEMA IF NOT EXISTS dev');
+    const devQueries = [
+      createUsersTableQuery,
+      createMpesaCallbacksTableQuery,
+      createAppSettingsTableQuery,
+      createBoothsTableQuery,
+      createBatteriesTableQuery,
+      createBoothSlotsTableQuery,
+      createDepositsTableQuery,
+      createProblemReportsTableQuery,
+    ];
+    await client.query('SET search_path TO dev');
+    for (const q of devQueries) {
+      await client.query(q);
+    }
+    await client.query('SET search_path TO public');
+
+    logger.info('Dev schema initialized with mirrored tables.');
 
     await client.query('COMMIT');
     logger.info('Database schema initialized successfully.');

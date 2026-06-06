@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const logger = require('../../utils/logger');
 const poolPromise = require('../../db');
 const { verifyFirebaseToken } = require('../../middleware/auth');
-const { extractValidSoc } = require('./shared');
+const { extractValidSoc, isDevBooth } = require('./shared');
 
 const router = Router();
 
@@ -22,7 +22,7 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (/** @type {any} */ 
   }
 
   const pool = await poolPromise;
-  const client = await pool.connect();
+  const client = await pool.connect(req.schema);
 
   try {
     await client.query('BEGIN');
@@ -160,20 +160,57 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (/** @type {any} */ 
 
     const { id: slotId, slot_identifier: slotIdentifier } = assignedSlot;
 
-    // 4. Issue hardware command
-    await db
-      .ref(`booths/${boothUid}/slots/${slotIdentifier}/command`)
-      .update({
-        openForDeposit: true,
-        openForCollection: false,
-      });
+    // 4. Issue hardware command (skip for dev booths — no real hardware)
+    if (isDevBooth(boothUid)) {
+      logger.info(`Dev booth: skipping Firebase hardware command for deposit at ${boothUid}/${slotIdentifier}.`);
+    } else {
+      await db
+        .ref(`booths/${boothUid}/slots/${slotIdentifier}/command`)
+        .update({
+          openForDeposit: true,
+          openForCollection: false,
+        });
+    }
 
     // 5. Create deposit session
-    await client.query(
+    const depositInsert = await client.query(
       `INSERT INTO deposits (user_id, booth_id, slot_id, session_type, status)
-      VALUES ($1, $2, $3, 'deposit', 'opening')`,
+      VALUES ($1, $2, $3, 'deposit', 'opening')
+      RETURNING id`,
       [firebaseUid, boothId, slotId]
     );
+    const depositId = depositInsert.rows[0].id;
+
+    // 6. For dev booths: simulate hardware response — auto-complete the deposit
+    if (isDevBooth(boothUid)) {
+      // Assign an available battery from the dev pool
+      const batteryRes = await client.query(
+        `SELECT id, battery_uid, charge_level_percent
+         FROM batteries b
+         WHERE NOT EXISTS (
+           SELECT 1 FROM booth_slots bs WHERE bs.current_battery_id = b.id
+         )
+         LIMIT 1`
+      );
+      if (batteryRes.rows.length > 0) {
+        const battery = batteryRes.rows[0];
+        await client.query(
+          `UPDATE booth_slots SET status = 'occupied', current_battery_id = $1,
+           charge_level_percent = $2, is_charging = true, door_status = 'closed'
+           WHERE id = $3`,
+          [battery.id, battery.charge_level_percent, slotId]
+        );
+        await client.query(
+          `UPDATE deposits SET status = 'completed', completed_at = NOW(),
+           battery_id = $1, initial_charge_level = $2
+           WHERE id = $3`,
+          [battery.id, battery.charge_level_percent, depositId]
+        );
+        logger.info(`Dev booth: simulated deposit completion — battery ${battery.battery_uid} assigned to slot ${slotIdentifier}.`);
+      } else {
+        logger.warn('Dev booth: no unassigned batteries available for simulation.');
+      }
+    }
 
     await client.query('COMMIT');
 
@@ -181,7 +218,7 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (/** @type {any} */ 
     return res.status(200).json({
       slot: {
         identifier: slotIdentifier,
-        status: 'opening',
+        status: isDevBooth(boothUid) ? 'completed' : 'opening',
       },
     });
   } catch (error) {
@@ -218,7 +255,7 @@ router.get('/my-battery-status', verifyFirebaseToken, async (/** @type {any} */ 
   const isPoll = req.headers['x-purpose'] === 'poll';
 
   const pool = await poolPromise;
-  const client = await pool.connect();
+  const client = await pool.connect(req.schema);
   try {
     // 1. Find where the user's battery is located from our database.
     const locationQuery = `

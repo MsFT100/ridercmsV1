@@ -31,7 +31,8 @@
     "test:booths-smoke": "jest tests/booths.routes.smoke.test.js",
     "test:admin-smoke": "jest tests/admin.routes.smoke.test.js",
     "build:types": "tsc --declaration --emitDeclarationOnly --allowJs --outDir ./types utils/types.js",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "seed:dev": "node scripts/seed-dev.js"
   },
   "devDependencies": {
     "@types/cookie-parser": "^1.4.10",

@@ -1,6 +1,7 @@
 const { Pool } = require('pg');
 const { Connector } = require('@google-cloud/cloud-sql-connector');
 const logger = require('../utils/logger');
+const schemaStorage = require('../utils/schemaStorage');
 
 let pool;
 const connector = new Connector();
@@ -241,6 +242,21 @@ process.on('SIGTERM', async () => {
 
 module.exports = (async () => {
   pool = await configurePool();
+
+  const _originalConnect = pool.connect.bind(pool);
+  pool.connect = async (schema) => {
+    const client = await _originalConnect();
+    const effectiveSchema = schema || schemaStorage.getStore() || 'public';
+    if (effectiveSchema !== 'public') {
+      await client.query(`SET search_path TO ${effectiveSchema}`);
+    }
+    const _originalRelease = client.release.bind(client);
+    client.release = (...args) => {
+      client.query(`SET search_path TO public`).catch(() => {});
+      return _originalRelease(...args);
+    };
+    return client;
+  };
 
   pool.on('connect', () => {
     logger.debug('New database client connected to the pool.');

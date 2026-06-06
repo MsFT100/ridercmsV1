@@ -44,7 +44,7 @@ const router = Router();
  */
 router.post('/users/set-role', [verifyFirebaseToken, isAdmin], async (req, res) => {
   const { uid, newRole } = req.body;
-  const validRoles = ['admin', 'customer', 'driver']; // Define your application's roles
+  const validRoles = ['admin', 'customer', 'driver', 'developer'];
 
   if (!uid || !newRole) {
     return res.status(400).json({ error: 'Both uid and newRole are required.' });

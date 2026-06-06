@@ -10,6 +10,7 @@ const {
   extractValidSoc,
   isRelayOff,
   getWithdrawalBatteryContext,
+  isDevBooth,
 } = require('./shared');
 
 const router = Router();
@@ -22,7 +23,7 @@ router.post('/stop-charging', verifyFirebaseToken, async (req, res) => {
   const { sessionId } = req.body;
   const { uid: firebaseUid } = req.user;
   const pool = await poolPromise;
-  const client = await pool.connect();
+  const client = await pool.connect(req.schema);
 
   try {
     await client.query('BEGIN');
@@ -57,22 +58,29 @@ router.post('/stop-charging', verifyFirebaseToken, async (req, res) => {
       boothUid,
     } = batteryContext;
 
-    const db = getDatabase();
-    const slotRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}`);
-    const snapshot = await slotRef.get();
-    const slotData = snapshot.exists() && snapshot.val() ? snapshot.val() : null;
+    let socAtStopRequest = dbChargeLevel;
+    let relayAlreadyOff = true;
 
-    const socAtStopRequest = extractValidSoc(slotData, dbChargeLevel);
-    const relayAlreadyOff = isRelayOff(slotData);
+    if (isDevBooth(boothUid)) {
+      logger.info(`Dev booth: skipping Firebase stop-charging for ${boothUid}/${slotIdentifier}.`);
+    } else {
+      const db = getDatabase();
+      const slotRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}`);
+      const snapshot = await slotRef.get();
+      const slotData = snapshot.exists() && snapshot.val() ? snapshot.val() : null;
 
-    await slotRef.child('command').update({
-      stopCharging: true,
-      startCharging: false,
-    });
+      socAtStopRequest = extractValidSoc(slotData, dbChargeLevel);
+      relayAlreadyOff = isRelayOff(slotData);
+
+      await slotRef.child('command').update({
+        stopCharging: true,
+        startCharging: false,
+      });
+    }
 
     await client.query('COMMIT');
 
-    const recommendedWaitSeconds = getEnvInt('WITHDRAWAL_STOP_WAIT_SECONDS', 25);
+    const recommendedWaitSeconds = isDevBooth(boothUid) ? 0 : getEnvInt('WITHDRAWAL_STOP_WAIT_SECONDS', 25);
     return res.status(200).json({
       message: relayAlreadyOff
         ? 'Charging is already off. You can continue to withdrawal.'
@@ -121,7 +129,7 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
   const { sessionId } = req.body;
   const { uid: firebaseUid } = req.user;
   const pool = await poolPromise;
-  const client = await pool.connect();
+  const client = await pool.connect(req.schema);
   try {
     await client.query('BEGIN');
 
@@ -306,7 +314,7 @@ router.post('/sessions/:sessionId/pay', verifyFirebaseToken, async (req, res) =>
   const { uid: firebaseUid, phone_number: userPhone } = req.user;
 
   const pool = await poolPromise;
-  const client = await pool.connect();
+  const client = await pool.connect(req.schema);
   try {
     await client.query('BEGIN');
 
@@ -322,19 +330,32 @@ router.post('/sessions/:sessionId/pay', verifyFirebaseToken, async (req, res) =>
     }
     const amount = sessionRes.rows[0].amount;
 
+    // 2. Dev mode: skip M-Pesa, auto-approve payment.
+    if (req.user.role === 'developer') {
+      const devCheckoutId = `DEV_${sessionId}_${Date.now()}`;
+      await client.query(
+        "UPDATE deposits SET mpesa_checkout_id = $1, status = 'pending', started_at = NOW() WHERE id = $2",
+        [devCheckoutId, sessionId]);
+      await completePaidWithdrawal(client, devCheckoutId);
+      await client.query('COMMIT');
+      return res.status(200).json({
+        message: 'Payment auto-approved (dev mode).',
+        paymentStatus: 'paid',
+        checkoutRequestId: devCheckoutId,
+      });
+    }
+
     // 2. Initiate the M-Pesa STK Push.
     const mpesaResponse = await initiateSTKPush({
       phone: userPhone,
       amount: amount,
-      accountReference: `session_${sessionId}`, // A reference for the transaction
+      accountReference: `session_${sessionId}`,
       transactionDesc: `Payment for battery charging session ${sessionId}`
     });
 
     const checkoutRequestId = mpesaResponse.data.CheckoutRequestID;
 
     // 3. Update the session record with the new CheckoutRequestID from M-Pesa.
-    // Reset the status to 'pending' in case it was 'failed'.
-    // Also, reset the started_at timestamp to restart the self-healing timer.
     await client.query(
       "UPDATE deposits SET mpesa_checkout_id = $1, status = 'pending', started_at = NOW() WHERE id = $2",
       [checkoutRequestId, sessionId]);
@@ -345,7 +366,6 @@ router.post('/sessions/:sessionId/pay', verifyFirebaseToken, async (req, res) =>
       message: 'STK push sent. Please complete the payment on your phone.',
       checkoutRequestId: checkoutRequestId,
     });
-    console.log(`STK push initiated for session ${sessionId}, CheckoutRequestID: ${checkoutRequestId}`);
   } catch (error) {
     await client.query('ROLLBACK');
     // Improved error logging for external API calls
@@ -386,7 +406,7 @@ router.post('/sessions/:sessionId/pay', verifyFirebaseToken, async (req, res) =>
 router.get('/sessions/pending-withdrawal', verifyFirebaseToken, async (req, res) => {
   const { uid: firebaseUid } = req.user;
   const pool = await poolPromise;
-  const client = await pool.connect();
+  const client = await pool.connect(req.schema);
 
   try {
     const query = `
@@ -458,7 +478,7 @@ router.get('/withdrawal-status/:checkoutRequestId', verifyFirebaseToken, async (
   const { uid: firebaseUid } = req.user;
 
   const pool = await poolPromise;
-  const client = await pool.connect();
+  const client = await pool.connect(req.schema);
   try {
     // Find the session and check its status.
     // The M-Pesa callback would have updated the status to 'in_progress' upon successful payment.
@@ -472,6 +492,11 @@ router.get('/withdrawal-status/:checkoutRequestId', verifyFirebaseToken, async (
     }
 
     const { id: sessionId, status, started_at: startedAt } = sessionQuery.rows[0];
+
+    // Dev checkout IDs are auto-approved — no M-Pesa callback to wait for.
+    if (checkoutRequestId.startsWith('DEV_')) {
+      return res.status(200).json({ paymentStatus: 'paid' });
+    }
 
     // If status is not pending, the callback has already been processed. Return immediately.
     if (status !== 'pending') {
@@ -559,12 +584,12 @@ router.post('/release-battery', verifyFirebaseToken, async (req, res) => {
   }
 
   const pool = await poolPromise;
-  const client = await pool.connect();
+  const client = await pool.connect(req.schema);
   try {
     let sessionRes;
     if (sessionId) {
       sessionRes = await client.query(
-        `SELECT d.id, s.slot_identifier, b.booth_uid AS "boothUid"
+        `SELECT d.id, s.id AS "slotId", s.slot_identifier, b.booth_uid AS "boothUid"
          FROM deposits d
          JOIN booth_slots s ON d.slot_id = s.id
          JOIN booths b ON d.booth_id = b.id
@@ -574,7 +599,7 @@ router.post('/release-battery', verifyFirebaseToken, async (req, res) => {
       );
     } else {
       sessionRes = await client.query(
-        `SELECT d.id, s.slot_identifier, b.booth_uid AS "boothUid"
+        `SELECT d.id, s.id AS "slotId", s.slot_identifier, b.booth_uid AS "boothUid"
          FROM deposits d
          JOIN booths b ON d.booth_id = b.id
          JOIN booth_slots s ON d.slot_id = s.id
@@ -589,12 +614,28 @@ router.post('/release-battery', verifyFirebaseToken, async (req, res) => {
       return res.status(404).json({ error: 'No paid withdrawal session found. Please ensure you have paid.' });
     }
 
-    const { slot_identifier: slotIdentifier, boothUid: resolvedBoothUid } = sessionRes.rows[0];
-    const db = getDatabase();
-    await db.ref(`booths/${resolvedBoothUid}/slots/${slotIdentifier}/command`).update({
-      openForCollection: true,
-      openForDeposit: false,
-    });
+    const { slot_identifier: slotIdentifier, boothUid: resolvedBoothUid, slotId } = sessionRes.rows[0];
+
+    if (isDevBooth(resolvedBoothUid)) {
+      // Dev booth: skip Firebase, auto-complete the session
+      await client.query(
+        `UPDATE deposits SET status = 'completed', completed_at = NOW()
+         WHERE id = $1 AND session_type = 'withdrawal'`,
+        [sessionRes.rows[0].id]
+      );
+      await client.query(
+        `UPDATE booth_slots SET status = 'available', current_battery_id = NULL, is_charging = false
+         WHERE id = $1`,
+        [slotId]
+      );
+      logger.info(`Dev booth: simulated battery release for session ${sessionRes.rows[0].id}.`);
+    } else {
+      const db = getDatabase();
+      await db.ref(`booths/${resolvedBoothUid}/slots/${slotIdentifier}/command`).update({
+        openForCollection: true,
+        openForDeposit: false,
+      });
+    }
 
     logger.info(`User ${firebaseUid} verified. Battery released from slot ${slotIdentifier} at booth ${resolvedBoothUid}.`);
     res.status(200).json({ message: `Battery released. Please collect it from slot ${slotIdentifier}.`, slotIdentifier, boothUid: resolvedBoothUid });

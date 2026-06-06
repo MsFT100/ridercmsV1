@@ -13,6 +13,7 @@ const poolPromise = require('./db/index.js');
 const { initializeDatabase } = require('./db/init');
 const { initializeFirebase } = require('./utils/firebase');
 const { initializeFirebaseSync } = require('./utils/firebaseSync');
+const schemaRouter = require('./middleware/schemaRouter');
 const { startCronJob } = require('./utils/cron-functions/hardware-cron');
 const swaggerUi = require('swagger-ui-express');
 const swaggerSpec = require('./utils/swaggerConfig');
@@ -115,6 +116,9 @@ app.use(express.urlencoded({ extended: true }));
 // --- Serve Static Files ---
 // Serve static files (like the logs.html page) from the 'public' directory
 app.use(express.static(path.join(__dirname, 'public')));
+
+// Schema routing for developer isolation (must be before routes)
+app.use(schemaRouter);
 
 // Use morgan for HTTP request logging, piped through our winston logger
 // We cast morgan to 'any' to bypass a known mismatch between Morgan's base HTTP types 

@@ -1,5 +1,6 @@
 const { admin } = require('../utils/firebase');
 const logger = require('../utils/logger');
+const schemaStorage = require('../utils/schemaStorage');
 
 /**
  * Middleware to verify a Firebase ID token from the Authorization header.
@@ -24,6 +25,12 @@ const verifyFirebaseToken = async (req, res, next) => {
   try {
     const decodedToken = await admin.auth().verifyIdToken(idToken);
     req.user = decodedToken;
+    if (decodedToken.role === 'developer') {
+      req.schema = 'dev';
+      schemaStorage.enterWith('dev');
+    } else {
+      req.schema = 'public';
+    }
     next();
   } catch (error) {
     logger.error('Authentication error:', error);

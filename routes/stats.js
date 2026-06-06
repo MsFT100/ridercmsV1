@@ -133,7 +133,7 @@ router.get('/', verifyFirebaseToken, async (req, res) => {
   const uid = req.user.uid;
 
   const pool = await poolPromise;
-  const client = await pool.connect();
+  const client = await pool.connect(req.schema);
 
   try {
     const baseFilter = buildFilter({ scope, sessionType, uid, alias: 'd', startIndex: 1 });

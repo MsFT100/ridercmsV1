@@ -25,7 +25,7 @@ router.post('/cancel-session', verifyFirebaseToken, async (req, res) => {
   const { uid: firebaseUid } = req.user;
 
   const pool = await poolPromise;
-  const client = await pool.connect();
+  const client = await pool.connect(req.schema);
   try {
     await client.query('BEGIN');
 
@@ -98,7 +98,7 @@ router.get('/history', verifyFirebaseToken, async (req, res) => {
   const { uid: firebaseUid } = req.user;
 
   const pool = await poolPromise;
-  const client = await pool.connect();
+  const client = await pool.connect(req.schema);
   try {
     const query = `
       SELECT
@@ -152,7 +152,7 @@ router.post('/report-problem', verifyFirebaseToken, async (req, res) => {
   }
 
   const pool = await poolPromise;
-  const client = await pool.connect();
+  const client = await pool.connect(req.schema);
   try {
     await client.query('BEGIN');
 

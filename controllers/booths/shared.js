@@ -135,9 +135,18 @@ async function getWithdrawalBatteryContext(client, firebaseUid, sessionId = null
   return batteryRes.rows[0];
 }
 
+/**
+ * Checks if a booth UID is a virtual dev booth.
+ * Dev booths skip Firebase hardware interactions and simulate responses.
+ * @param {string} boothUid
+ * @returns {boolean}
+ */
+const isDevBooth = (boothUid) => typeof boothUid === 'string' && boothUid.startsWith('dev-');
+
 module.exports = {
   getEnvInt,
   extractValidSoc,
   isRelayOff,
   getWithdrawalBatteryContext,
+  isDevBooth,
 };

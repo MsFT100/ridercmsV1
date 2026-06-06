@@ -21,7 +21,7 @@ const router = Router();
  */
 router.get('/', verifyFirebaseToken, async (req, res) => {
   const pool = await poolPromise;
-  const client = await pool.connect();
+  const client = await pool.connect(req.schema);
   try {
     // This query fetches all online booths and counts their available slots.
     // It assumes you have 'latitude' and 'longitude' columns in your 'booths' table.
@@ -79,7 +79,7 @@ router.get('/', verifyFirebaseToken, async (req, res) => {
 router.get('/:boothUid/slots/:slotIdentifier', verifyFirebaseToken, async (req, res) => {
   const { boothUid, slotIdentifier } = req.params;
   const pool = await poolPromise;
-  const client = await pool.connect();
+  const client = await pool.connect(req.schema);
 
   try {
     const query = `

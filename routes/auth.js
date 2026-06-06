@@ -141,7 +141,7 @@ router.post('/register', async (req, res) => {
 
     // 3. Insert user record into PostgreSQL with 'inactive' status
     const pool = await poolPromise;
-    const pgClient = await pool.connect();
+    const pgClient = await pool.connect(req.schema);
     try {
       await pgClient.query(
         'INSERT INTO users (user_id, email, name, phone, role, status) VALUES ($1, $2, $3, $4, $5, $6)',
@@ -234,7 +234,7 @@ router.post('/user-by-phone', async (req, res) => {
   // This endpoint is public for the login flow, so no token verification is needed.
   // It simply acts as a lookup service.
   const pool = await poolPromise;
-  const pgClient = await pool.connect();
+  const pgClient = await pool.connect(req.schema);
   try {
     // Query the database for a user with the given phone number
     const userRes = await pgClient.query(
@@ -283,7 +283,7 @@ router.post('/verify-phone', async (req, res) => {
 
     // 2. Update the user's status in PostgreSQL
     const pool = await poolPromise;
-    const pgClient = await pool.connect();
+    const pgClient = await pool.connect(req.schema);
     try {
       await pgClient.query("UPDATE users SET phone_verified = true, updated_at = NOW() WHERE user_id = $1", [uid]);
       logger.info(`Phone number ${phone_number} verified for user UID: ${uid}`);
@@ -332,7 +332,7 @@ router.post('/google/sync', verifyFirebaseToken, async (req, res) => {
     });
 
     const pool = await poolPromise;
-    const pgClient = await pool.connect();
+    const pgClient = await pool.connect(req.schema);
     try {
       const userRes = await pgClient.query(
         `INSERT INTO users (user_id, email, name, phone, role, status, profile_image_url, phone_verified)
@@ -397,7 +397,7 @@ router.post('/google/complete-profile', verifyFirebaseToken, async (req, res) =>
     }
 
     const pool = await poolPromise;
-    const pgClient = await pool.connect();
+    const pgClient = await pool.connect(req.schema);
     try {
       await pgClient.query('BEGIN');
 
@@ -487,7 +487,7 @@ router.get('/profile', verifyFirebaseToken, async (req, res) => {
   const { uid } = req.user;
 
   const pool = await poolPromise;
-  const pgClient = await pool.connect();
+  const pgClient = await pool.connect(req.schema);
   try {
     // Fetch the user's full profile from PostgreSQL
     let userRes = await pgClient.query(
@@ -495,8 +495,41 @@ router.get('/profile', verifyFirebaseToken, async (req, res) => {
       [uid]
     );
 
+    // Fallback: user not found in current schema — try the dev schema.
+    // This handles the case where a fresh JWT hasn't picked up the 'developer' claim yet
+    // (Firebase custom claims can take minutes to propagate to new tokens).
     if (userRes.rows.length === 0) {
-      logger.error(`Session valid for UID ${uid}, but user not found in PostgreSQL.`);
+      logger.warn(`User ${uid} not found in schema '${req.schema}'; trying dev schema fallback.`);
+      const fallbackClient = await pool.connect('dev');
+      try {
+        const fallbackRes = await fallbackClient.query(
+          'SELECT user_id as "id", email, name, phone as "phoneNumber", role, status, phone_verified as "phoneVerified", balance FROM users WHERE user_id = $1',
+          [uid]
+        );
+        if (fallbackRes.rows.length > 0) {
+          logger.info(`User ${uid} found in dev schema (role: ${fallbackRes.rows[0].role}). Using dev profile.`);
+          const userProfile = fallbackRes.rows[0];
+
+          // Also check for active battery session
+          const batteryQuery = `
+            SELECT bat.battery_uid as "batteryUid", s.charge_level_percent as "chargeLevel",
+                   bo.booth_uid AS "boothUid", s.slot_identifier AS "slotIdentifier"
+            FROM deposits d
+            JOIN booth_slots s ON d.slot_id = s.id
+            JOIN booths bo ON d.booth_id = bo.id
+            LEFT JOIN batteries bat ON s.current_battery_id = bat.id
+            WHERE d.user_id = $1 AND d.session_type = 'deposit' AND d.status = 'completed'`;
+          const batteryRes = await fallbackClient.query(batteryQuery, [uid]);
+          if (batteryRes.rows.length > 0) {
+            userProfile.activeBatterySession = batteryRes.rows[0];
+          }
+
+          return res.status(200).json(userProfile);
+        }
+      } finally {
+        fallbackClient.release();
+      }
+      logger.error(`Session valid for UID ${uid}, but user not found in PostgreSQL (schemas tried: ${req.schema}, dev).`);
       return res.status(404).json({ error: 'User profile not found.' });
     }
 

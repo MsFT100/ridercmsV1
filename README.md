@@ -9,7 +9,7 @@ Battery swapping backend API with M-Pesa payment integration and Firebase Realti
 | Runtime | Node.js / Express |
 | Database | PostgreSQL (persistent state) |
 | Realtime | Firebase Realtime Database (hardware telemetry, commands) |
-| Payments | Safaricom M-Pesa STK Push (sandbox) |
+| Payments | Safaricom M-Pesa STK Push |
 
 ## Key Files
 
@@ -113,13 +113,93 @@ Send any combination of these boolean flags to `POST /booths/:boothUid/slots/:sl
 { "forceUnlock": true }
 ```
 
-## Setup
+## Developer Isolation (PostgreSQL Schema)
+
+The system isolates frontend development from production data using a separate **`dev` PostgreSQL schema**. When a user has the `developer` role, all their queries automatically target the `dev` schema instead of `public`.
+
+### How it works
+
+| Component | Production (`public`) | Developer (`dev`) |
+|---|---|---|
+| Firebase Auth | Same project, `role: user\|admin` | Same project, `role: developer` |
+| PostgreSQL | `public.users`, `public.booths`, etc. | `dev.users`, `dev.booths`, etc. |
+| M-Pesa | Real STK push | Auto-approved (no payment) |
+| Firebase hardware commands | Sent to real hardware | Auto-simulated |
+
+The schema is selected via `AsyncLocalStorage` — zero changes needed to the 272+ query calls across the codebase.
+
+### Setup
 
 ```bash
-npm install
-# Edit .env with your credentials
-node server.js
+# 1. Start the server at least once to create the dev schema tables
+npm run dev
+
+# 2. Seed the dev environment (Firebase user + virtual data)
+npm run seed:dev
 ```
+
+### Developer Credentials
+
+```
+Email:    dev@ridercms.test
+Password: Maxtek2020
+Role:     developer
+```
+
+> **Note:** Firebase custom claims take a few minutes to propagate. If login returns "User profile not found," wait and try again. The profile endpoint auto-falls back to the `dev` schema.
+
+### Virtual Booth Simulation
+
+Two virtual booths are seeded in the `dev` schema. Booth UIDs starting with `dev-` trigger automatic simulation — no real hardware or M-Pesa is needed.
+
+| Booth UID | Slots | Batteries |
+|---|---|---|
+| `dev-booth-alpha` | A1, A2, A3, A4 | 5 virtual batteries |
+| `dev-booth-beta` | B1, B2, B3, B4 | (shared pool) |
+
+### Full Developer Walkthrough
+
+The developer can test the complete user flow without real hardware or payments:
+
+| Step | Endpoint | Dev Behavior |
+|---|---|---|
+| 1. List booths | `GET /api/booths` | Shows both virtual booths |
+| 2. Initiate deposit | `POST /api/booths/initiate-deposit` | Auto-assigns battery, completes instantly |
+| 3. Check battery | `GET /api/booths/my-battery-status` | Shows deposited battery from DB |
+| 4. Stop charging | `POST /api/booths/stop-charging` | Reports relay already off |
+| 5. Initiate withdrawal | `POST /api/booths/initiate-withdrawal` | Creates withdrawal session |
+| 6. Pay | `POST /api/booths/sessions/:sessionId/pay` | Auto-approved, no M-Pesa call |
+| 7. Release battery | `POST /api/booths/release-battery` | Marks session complete, frees slot |
+
+### Architecture
+
+```
+Request → schemaRouter (ALS: 'public')
+       → verifyFirebaseToken
+           ├── role === 'developer'  → ALS: 'dev'  +  req.schema = 'dev'
+           └── role !== 'developer'  → ALS: 'public' +  req.schema = 'public'
+       → pool.connect(req.schema)
+           └── SET search_path TO <schema>
+               └── Query resolves to correct schema tables
+```
+
+### Background jobs (unaffected)
+
+`firebaseSync.js`, `hardware-cron.js`, and `reconciliationWorker.js` run outside HTTP request context and always target the `public` schema.
+
+### New / Modified Files
+
+| File | Purpose |
+|---|---|
+| `utils/schemaStorage.js` | AsyncLocalStorage instance for per-request schema context |
+| `middleware/schemaRouter.js` | Express middleware wrapping each request in ALS context |
+| `scripts/seed-dev.js` | Seeds Firebase Auth user + dev schema with virtual data |
+| `db/index.js` | Monkey-patches `pool.connect()` to set `search_path` from ALS |
+| `db/init.js` | Creates `dev` schema with mirrored tables on startup |
+| `middleware/auth.js` | Sets `req.schema` and ALS context based on `role` claim |
+| `controllers/booths/shared.js` | Exports `isDevBooth()` helper |
+| `controllers/booths/deposit.controller.js` | Simulates deposit for `dev-` booths |
+| `controllers/booths/withdrawal.controller.js` | Simulates stop-charging and release for `dev-` booths, skips M-Pesa |
 
 ## Deploy
 
