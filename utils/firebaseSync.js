@@ -1,6 +1,7 @@
 const { getDatabase } = require('firebase-admin/database');
 const pool = require('../db');
 const logger = require('./logger');
+const { finalizeWithdrawalSession } = require('./sessionUtils');
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -204,42 +205,8 @@ async function handleDepositCompletion(pgClient, boothUid, slotIdentifier, slotI
  * @returns {Promise<boolean>} True if a session was completed.
  */
 async function handleWithdrawalCompletion(pgClient, slotIdentifier, slotId) {
-  const findAndUpdateWithdrawalQuery = `
-    WITH selected AS (
-      SELECT id, user_id, consumed_deposit_id
-      FROM deposits
-      WHERE slot_id = $1
-        AND status = 'in_progress'
-        AND session_type = 'withdrawal'
-      LIMIT 1
-      FOR UPDATE
-    ), updated_deposit AS (
-      UPDATE deposits
-      SET
-        status = 'completed',
-        completed_at = NOW()
-      FROM selected
-      WHERE deposits.id = selected.id
-      RETURNING deposits.id, deposits.user_id
-    ), redeem_credit AS (
-      UPDATE deposits
-      SET status = 'redeemed'
-      WHERE id = (SELECT consumed_deposit_id FROM selected)
-      RETURNING id
-    )
-    -- Reset the slot to available so it can accept the next deposit.
-    UPDATE booth_slots
-    SET status = 'available', current_battery_id = NULL, updated_at = NOW()
-    WHERE id = $1
-    RETURNING (SELECT id FROM updated_deposit) AS session_id;
-  `;
-  const withdrawalUpdateResult = await pgClient.query(findAndUpdateWithdrawalQuery, [slotId]);
-
-  if (withdrawalUpdateResult.rowCount > 0) {
-    logger.info(`Withdrawal session ${withdrawalUpdateResult.rows[0].session_id} for slot ${slotIdentifier} finalized.`);
-    return true;
-  }
-  return false;
+  const finalized = await finalizeWithdrawalSession(pgClient, slotId, slotIdentifier);
+  return finalized !== null;
 }
 
 /**

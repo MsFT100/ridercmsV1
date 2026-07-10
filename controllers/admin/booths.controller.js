@@ -4,6 +4,7 @@ const { v4: uuidv4 } = require('uuid');
 const logger = require('../../utils/logger.js');
 const poolPromise = require('../../db');
 const { verifyFirebaseToken, isAdmin } = require('../../middleware/auth');
+const { finalizeWithdrawalSession } = require('../../utils/sessionUtils');
 
 const router = Router();
 
@@ -1439,15 +1440,15 @@ router.post('/booths/:boothUid/slots/:slotIdentifier/manual-withdraw', [verifyFi
     const slotData = snapshot.exists() ? snapshot.val() : null;
 
     const { extractValidSoc } = require('../booths/shared');
-    const currentChargeLevel = extractValidSoc(slotData, dbChargeLevel) ?? 0;
+    const currentChargeLevel = Number(extractValidSoc(slotData, dbChargeLevel) ?? 0);
 
     // 7. Calculate cost
     const chargeAddedToBattery = Math.max(
       0,
-      parseFloat(currentChargeLevel) - parseFloat(slotInitialSoc || 0)
+      currentChargeLevel - Number(slotInitialSoc || 0)
     );
-    const chargeComponent = chargeAddedToBattery * parseFloat(costPerChargePercent || 0);
-    const totalCost = parseFloat(Math.max(baseSwapFee, chargeComponent).toFixed(2));
+    const chargeComponent = chargeAddedToBattery * Number(costPerChargePercent || 0);
+    const totalCost = Number(Math.max(baseSwapFee, chargeComponent).toFixed(2));
 
     // 8. Create withdrawal session (completed) and redeem the deposit credit
     const insertRes = await client.query(`
@@ -1460,18 +1461,8 @@ router.post('/booths/:boothUid/slots/:slotIdentifier/manual-withdraw', [verifyFi
 
     const newSessionId = insertRes.rows[0].id;
 
-    // Redeem the original deposit credit
-    await client.query(
-      "UPDATE deposits SET status = 'redeemed', updated_at = NOW() WHERE id = $1",
-      [depositCreditId]
-    );
-
-    // 9. Reset the slot to available
-    await client.query(`
-      UPDATE booth_slots
-      SET status = 'available', current_battery_id = NULL, updated_at = NOW()
-      WHERE id = $1
-    `, [slotId]);
+    // 9. Finalize the slot state using the same shared logic as paid withdrawals.
+    await finalizeWithdrawalSession(client, slotId, slotIdentifier);
 
     await client.query('COMMIT');
 

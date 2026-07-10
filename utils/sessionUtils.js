@@ -2,6 +2,65 @@ const { admin } = require('./firebase');
 const logger = require('./logger');
 
 /**
+ * Finalizes a withdrawal session by completing the withdrawal row, redeeming the
+ * original deposit credit, and resetting the slot back to available.
+ * This is shared by paid withdrawals and manual/admin withdrawals so they cannot
+ * diverge in the slot-release behavior.
+ * @param {object} client - The PostgreSQL client, assumed to be within an active transaction.
+ * @param {number} slotId - The booth slot ID.
+ * @param {string} [slotIdentifier] - Optional slot identifier for logging.
+ * @returns {Promise<{sessionId: number, consumedDepositId: number|null}>} - The finalized session details.
+ */
+async function finalizeWithdrawalSession(client, slotId, slotIdentifier = null) {
+  const finalizationQuery = `
+    WITH selected AS (
+      SELECT id, user_id, consumed_deposit_id
+      FROM deposits
+      WHERE slot_id = $1
+        AND session_type = 'withdrawal'
+        AND status IN ('in_progress', 'completed')
+      ORDER BY CASE WHEN status = 'in_progress' THEN 0 ELSE 1 END, completed_at DESC, created_at DESC
+      LIMIT 1
+      FOR UPDATE
+    ), updated_deposit AS (
+      UPDATE deposits
+      SET
+        status = CASE
+          WHEN deposits.status = 'in_progress' THEN 'completed'
+          ELSE deposits.status
+        END,
+        completed_at = COALESCE(deposits.completed_at, NOW())
+      FROM selected
+      WHERE deposits.id = selected.id
+      RETURNING deposits.id, deposits.user_id
+    ), redeem_credit AS (
+      UPDATE deposits
+      SET status = 'redeemed'
+      WHERE id = (SELECT consumed_deposit_id FROM selected)
+      RETURNING id
+    )
+    UPDATE booth_slots
+    SET status = 'available', current_battery_id = NULL, updated_at = NOW()
+    WHERE id = $1
+    RETURNING (SELECT id FROM updated_deposit) AS session_id,
+              (SELECT consumed_deposit_id FROM selected) AS consumed_deposit_id;
+  `;
+
+  const updateResult = await client.query(finalizationQuery, [slotId]);
+
+  if (updateResult.rowCount === 0) {
+    return null;
+  }
+
+  const { session_id: sessionId, consumed_deposit_id: consumedDepositId } = updateResult.rows[0];
+  logger.info(`Withdrawal session ${sessionId} finalized${slotIdentifier ? ` for slot ${slotIdentifier}` : ''}.`);
+  return {
+    sessionId,
+    consumedDepositId,
+  };
+}
+
+/**
  * A reusable function to complete a paid withdrawal session.
  * It updates the database and sends the command to Firebase to open the slot.
  * This prevents code duplication between the M-Pesa callback and self-healing logic.
@@ -87,4 +146,4 @@ async function completePaidWithdrawal(client, checkoutRequestId) {
   }
 }
 
-module.exports = { completePaidWithdrawal };
+module.exports = { completePaidWithdrawal, finalizeWithdrawalSession };
