@@ -518,7 +518,14 @@ router.get('/profile', verifyFirebaseToken, async (req, res) => {
             JOIN booth_slots s ON d.slot_id = s.id
             JOIN booths bo ON d.booth_id = bo.id
             LEFT JOIN batteries bat ON s.current_battery_id = bat.id
-            WHERE d.user_id = $1 AND d.session_type = 'deposit' AND d.status = 'completed'`;
+            WHERE d.user_id = $1 AND d.session_type = 'deposit' AND d.status = 'completed'
+              AND s.current_battery_id IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM deposits w
+                WHERE w.consumed_deposit_id = d.id
+                  AND w.session_type = 'withdrawal'
+                  AND w.status NOT IN ('cancelled', 'failed')
+              )`;
           const batteryRes = await fallbackClient.query(batteryQuery, [uid]);
           if (batteryRes.rows.length > 0) {
             userProfile.activeBatterySession = batteryRes.rows[0];
@@ -548,7 +555,14 @@ router.get('/profile', verifyFirebaseToken, async (req, res) => {
       JOIN booth_slots s ON d.slot_id = s.id
       JOIN booths bo ON d.booth_id = bo.id
       LEFT JOIN batteries bat ON s.current_battery_id = bat.id
-      WHERE d.user_id = $1 AND d.session_type = 'deposit' AND d.status = 'completed';
+      WHERE d.user_id = $1 AND d.session_type = 'deposit' AND d.status = 'completed'
+        AND s.current_battery_id IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM deposits w
+          WHERE w.consumed_deposit_id = d.id
+            AND w.session_type = 'withdrawal'
+            AND w.status NOT IN ('cancelled', 'failed')
+        );
     `;
     const batteryRes = await pgClient.query(batteryQuery, [uid]);
 

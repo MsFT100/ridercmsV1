@@ -962,6 +962,22 @@ router.post('/booths/:boothUid/slots/:slotIdentifier/command', [verifyFirebaseTo
         );
       }
 
+      // If no in_progress withdrawal was found, mark any orphaned completed deposit on this slot
+      // as 'failed' so it doesn't appear as an active session to the user.
+      if (updateResult.rowCount === 0) {
+        await pgClient.query(`
+          UPDATE deposits
+          SET status = 'failed',
+              notes = COALESCE(notes, '') || '\n[' || NOW() || '] Slot force-unlocked with no active withdrawal.'
+          WHERE slot_id = (
+            SELECT s.id FROM booth_slots s
+            JOIN booths b ON s.booth_id = b.id
+            WHERE b.booth_uid = $1 AND s.slot_identifier = $2
+          )
+            AND session_type = 'deposit' AND status = 'completed'
+        `, [boothUid, slotIdentifier]);
+      }
+
       // Also reset the slot status to 'available' and remove the battery link.
       // This ensures the slot is immediately ready for the next user.
       await pgClient.query(`
@@ -1462,7 +1478,9 @@ router.post('/booths/:boothUid/slots/:slotIdentifier/manual-withdraw', [verifyFi
     const newSessionId = insertRes.rows[0].id;
 
     // 9. Finalize the slot state using the same shared logic as paid withdrawals.
-    await finalizeWithdrawalSession(client, slotId, slotIdentifier);
+    // Pass the newSessionId so the CTE matches the just-inserted completed withdrawal
+    // and the deposit credit is properly redeemed.
+    await finalizeWithdrawalSession(client, slotId, slotIdentifier, newSessionId);
 
     await client.query('COMMIT');
 

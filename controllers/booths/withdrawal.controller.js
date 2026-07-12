@@ -4,7 +4,7 @@ const logger = require('../../utils/logger');
 const poolPromise = require('../../db');
 const { verifyFirebaseToken } = require('../../middleware/auth');
 const { initiateSTKPush, querySTKStatus } = require('../../utils/mpesa');
-const { completePaidWithdrawal } = require('../../utils/sessionUtils');
+const { completePaidWithdrawal, finalizeWithdrawalSession } = require('../../utils/sessionUtils');
 const {
   getEnvInt,
   extractValidSoc,
@@ -618,16 +618,7 @@ router.post('/release-battery', verifyFirebaseToken, async (req, res) => {
 
     if (isDevBooth(resolvedBoothUid)) {
       // Dev booth: skip Firebase, auto-complete the session
-      await client.query(
-        `UPDATE deposits SET status = 'completed', completed_at = NOW()
-         WHERE id = $1 AND session_type = 'withdrawal'`,
-        [sessionRes.rows[0].id]
-      );
-      await client.query(
-        `UPDATE booth_slots SET status = 'available', current_battery_id = NULL, is_charging = false
-         WHERE id = $1`,
-        [slotId]
-      );
+      await finalizeWithdrawalSession(client, slotId, slotIdentifier, sessionRes.rows[0].id);
       logger.info(`Dev booth: simulated battery release for session ${sessionRes.rows[0].id}.`);
     } else {
       const db = getDatabase();

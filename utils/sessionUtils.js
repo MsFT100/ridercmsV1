@@ -9,17 +9,21 @@ const logger = require('./logger');
  * @param {object} client - The PostgreSQL client, assumed to be within an active transaction.
  * @param {number} slotId - The booth slot ID.
  * @param {string} [slotIdentifier] - Optional slot identifier for logging.
+ * @param {number|null} [sessionId] - Optional exact withdrawal session ID to finalize.
  * @returns {Promise<{sessionId: number, consumedDepositId: number|null}>} - The finalized session details.
  */
-async function finalizeWithdrawalSession(client, slotId, slotIdentifier = null) {
+async function finalizeWithdrawalSession(client, slotId, slotIdentifier = null, sessionId = null) {
   const finalizationQuery = `
     WITH selected AS (
       SELECT id, user_id, consumed_deposit_id
       FROM deposits
       WHERE slot_id = $1
         AND session_type = 'withdrawal'
-        AND status IN ('in_progress', 'completed')
-      ORDER BY CASE WHEN status = 'in_progress' THEN 0 ELSE 1 END, completed_at DESC, created_at DESC
+        AND (
+          ($2::int IS NULL AND status = 'in_progress')
+          OR ($2::int IS NOT NULL AND id = $2 AND status IN ('in_progress', 'completed'))
+        )
+      ORDER BY completed_at DESC, created_at DESC
       LIMIT 1
       FOR UPDATE
     ), updated_deposit AS (
@@ -46,16 +50,16 @@ async function finalizeWithdrawalSession(client, slotId, slotIdentifier = null) 
               (SELECT consumed_deposit_id FROM selected) AS consumed_deposit_id;
   `;
 
-  const updateResult = await client.query(finalizationQuery, [slotId]);
+  const updateResult = await client.query(finalizationQuery, [slotId, sessionId]);
 
   if (updateResult.rowCount === 0) {
     return null;
   }
 
-  const { session_id: sessionId, consumed_deposit_id: consumedDepositId } = updateResult.rows[0];
-  logger.info(`Withdrawal session ${sessionId} finalized${slotIdentifier ? ` for slot ${slotIdentifier}` : ''}.`);
+  const { session_id: finalizedSessionId, consumed_deposit_id: consumedDepositId } = updateResult.rows[0];
+  logger.info(`Withdrawal session ${finalizedSessionId} finalized${slotIdentifier ? ` for slot ${slotIdentifier}` : ''}.`);
   return {
-    sessionId,
+    sessionId: finalizedSessionId,
     consumedDepositId,
   };
 }

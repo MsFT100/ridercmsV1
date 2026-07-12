@@ -12,7 +12,7 @@ describe('finalizeWithdrawalSession', () => {
         if (text.includes('SELECT id, user_id, consumed_deposit_id')) {
           return {
             rowCount: 1,
-            rows: [{ id: 55, user_id: 'user-1', consumed_deposit_id: 10 }],
+            rows: [{ session_id: 55, consumed_deposit_id: 10 }],
           };
         }
 
@@ -35,9 +35,10 @@ describe('finalizeWithdrawalSession', () => {
     const result = await finalizeWithdrawalSession(client, 4, 'slot-001');
 
     assert.deepStrictEqual(result, { sessionId: 55, consumedDepositId: 10 });
+    assert.equal(queries.length, 1, 'finalizeWithdrawalSession should run exactly one query');
     assert.match(queries[0].text, /SELECT id, user_id, consumed_deposit_id/);
-    assert.match(queries[1].text, /status = 'completed'/);
-    assert.match(queries[2].text, /status = 'redeemed'/);
-    assert.match(queries[3].text, /UPDATE booth_slots/);
+    assert.match(queries[0].text, /THEN 'completed'/);
+    assert.match(queries[0].text, /SET status = 'redeemed'/);
+    assert.match(queries[0].text, /UPDATE booth_slots/);
   });
 });

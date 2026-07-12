@@ -272,6 +272,9 @@ async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
     const isCharging = !!telemetry.isCharging;
 
     // 4. Update the database.
+    // When the battery is physically removed, also clear current_battery_id to prevent
+    // stale deposit credits from being usable against a slot that will be reassigned.
+    const batteryCleared = !batteryInserted && dbStatus !== 'available';
     const result = await pgClient.query(
       `UPDATE booth_slots 
        SET 
@@ -280,9 +283,10 @@ async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
          charge_level_percent = $3, 
          is_charging = $4,
          telemetry = $5,
+         current_battery_id = CASE WHEN $7 THEN NULL ELSE current_battery_id END,
          updated_at = NOW()
        WHERE id = $6`,
-      [newStatus, doorStatus, soc, isCharging, telemetry, slotId]
+      [newStatus, doorStatus, soc, isCharging, telemetry, slotId, batteryCleared]
     );
 
     if (result.rowCount === 0) {
@@ -295,6 +299,31 @@ async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
       slotId = result.rows[0].id; // Get the newly created slot ID.
     }
     logger.debug(`Successfully synced slot ${slotIdentifier} for booth ${boothUid}.`);
+
+    // 5. Defensive cleanup: If the slot just transitioned to 'available' from a non-available
+    // state (battery physically removed), fail any orphaned unredeemed completed deposits.
+    // This is the critical safety net that prevents double-allocation: without this, a stale
+    // deposit credit from a previous user would remain 'completed' when the slot is reassigned.
+    if (newStatus === 'available' && dbStatus !== 'available' && dbStatus !== 'opening') {
+      const orphanResult = await pgClient.query(
+        `UPDATE deposits
+         SET status = 'failed',
+             notes = COALESCE(notes, '') || '\n[' || NOW() || '] Deposit failed: battery removed from slot, slot returned to available.'
+         WHERE slot_id = $1
+           AND session_type = 'deposit'
+           AND status = 'completed'
+           AND NOT EXISTS (
+             SELECT 1 FROM deposits w
+             WHERE w.consumed_deposit_id = deposits.id
+               AND w.session_type = 'withdrawal'
+               AND w.status NOT IN ('cancelled', 'failed')
+           )`,
+        [slotId]
+      );
+      if (orphanResult.rowCount > 0) {
+        logger.warn(`Cleaned up ${orphanResult.rowCount} orphaned deposit(s) for slot ${slotIdentifier} (${dbStatus} -> available).`);
+      }
+    }
 
     // --- Event-driven logic based on hardware ACK messages ---
     const ackMessage = slotData.command?.ack;
@@ -356,19 +385,62 @@ async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
           break;
         }
 
-        case 'collection_timeout':
-        case 'openForCollection_rejected_no_battery': {
-          logger.warn(`Received '${ackMessage}' ACK for slot ${slotIdentifier}. Failing the in-progress withdrawal session.`);
-          // The user paid but failed to collect the battery in time, or the slot was unexpectedly empty.
-          // Mark the session as 'failed' to un-stick the user.
-          const failQueryResult = await pgClient.query(
+        case 'collection_timeout': {
+          logger.warn(`Received 'collection_timeout' ACK for slot ${slotIdentifier}. Failing the in-progress withdrawal session.`);
+          // The user paid but did not collect the battery in time. The battery is likely still
+          // in the slot, so we only mark the withdrawal as failed and let the user retry.
+          // If the battery was actually removed, the next Firebase telemetry sync will
+          // detect it and clean up via syncSlotState().
+          const timeoutFailResult = await pgClient.query(
             "UPDATE deposits SET status = 'failed' WHERE slot_id = $1 AND status = 'in_progress' AND session_type = 'withdrawal' RETURNING id",
             [slotId]
           );
-          if (failQueryResult.rowCount > 0) {
-            logger.info(`Session ${failQueryResult.rows[0].id} marked as 'failed' due to collection issue.`);
+          if (timeoutFailResult.rowCount > 0) {
+            logger.info(`Session ${timeoutFailResult.rows[0].id} marked as 'failed' due to collection timeout.`);
           }
-          // Reset command state
+          await commandRef.update({ openForCollection: false, ack: "" });
+          break;
+        }
+
+        case 'openForCollection_rejected_no_battery': {
+          logger.warn(`Received 'openForCollection_rejected_no_battery' ACK for slot ${slotIdentifier}. Battery is physically gone — cleaning up slot and orphaned deposits.`);
+          // The hardware confirmed no battery is present. The battery was removed during the
+          // failed collection attempt. We must reset the slot AND fail any orphaned deposit
+          // to prevent double-allocation when a new user is assigned to this slot.
+          const noBatteryFailResult = await pgClient.query(
+            "UPDATE deposits SET status = 'failed' WHERE slot_id = $1 AND status = 'in_progress' AND session_type = 'withdrawal' RETURNING id",
+            [slotId]
+          );
+          if (noBatteryFailResult.rowCount > 0) {
+            logger.info(`Session ${noBatteryFailResult.rows[0].id} marked as 'failed' due to no battery in slot.`);
+          }
+
+          // Reset the slot: the battery is gone, so the slot is available again.
+          await pgClient.query(
+            `UPDATE booth_slots SET status = 'available', current_battery_id = NULL, updated_at = NOW() WHERE id = $1`,
+            [slotId]
+          );
+
+          // Fail any orphaned completed deposit on this slot that hasn't been redeemed by a
+          // successful withdrawal. This prevents double-allocation: without this, the old
+          // deposit credit would remain 'completed' and a new user could be assigned to the
+          // same slot, resulting in two users claiming the same slot.
+          await pgClient.query(
+            `UPDATE deposits
+             SET status = 'failed',
+                 notes = COALESCE(notes, '') || '\n[' || NOW() || '] Deposit failed: battery physically removed during unsuccessful withdrawal.'
+             WHERE slot_id = $1
+               AND session_type = 'deposit'
+               AND status = 'completed'
+               AND NOT EXISTS (
+                 SELECT 1 FROM deposits w
+                 WHERE w.consumed_deposit_id = deposits.id
+                   AND w.session_type = 'withdrawal'
+                   AND w.status NOT IN ('cancelled', 'failed')
+               )`,
+            [slotId]
+          );
+
           await commandRef.update({ openForCollection: false, ack: "" });
           break;
         }
@@ -457,6 +529,15 @@ async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
             if (!batteryInserted) {
               await pgClient.query(
                 `UPDATE booth_slots SET status = 'available', current_battery_id = NULL, updated_at = NOW() WHERE id = $1`,
+                [slotId]
+              );
+              // Fail orphaned completed deposits so they don't appear as active sessions
+              await pgClient.query(
+                `UPDATE deposits
+                 SET status = 'failed',
+                     notes = COALESCE(notes, '') || '\n[' || NOW() || '] Slot freed via force-unlock.'
+                 WHERE slot_id = $1
+                   AND session_type = 'deposit' AND status = 'completed'`,
                 [slotId]
               );
               logger.info(`Force unlock acknowledged for empty slot ${slotIdentifier}. Slot reset to available.`);

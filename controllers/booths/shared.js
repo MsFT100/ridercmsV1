@@ -68,7 +68,8 @@ function isRelayOff(slotData) {
 
 const WITHDRAWAL_BATTERY_QUERY = `
   -- Find the user's "deposit credit" and the details of the battery they deposited.
-  -- This credit is a completed deposit session that hasn't been redeemed by a withdrawal.
+  -- This credit is a completed deposit session that hasn't been redeemed by a withdrawal
+  -- and whose slot still has a battery.
   SELECT
     d.id as "depositCreditId",
     d.completed_at AS "depositCompletedAt",
@@ -83,7 +84,14 @@ const WITHDRAWAL_BATTERY_QUERY = `
   JOIN booths b ON d.booth_id = b.id
   WHERE d.user_id = $1
     AND d.session_type = 'deposit'
-    AND d.status = 'completed' -- 'completed' means deposited, 'redeemed' means withdrawn against.
+    AND d.status = 'completed'
+    AND s.current_battery_id IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM deposits w
+      WHERE w.consumed_deposit_id = d.id
+        AND w.session_type = 'withdrawal'
+        AND w.status NOT IN ('cancelled', 'failed')
+    )
   ORDER BY d.completed_at DESC
   LIMIT 1;
 `;
@@ -104,7 +112,14 @@ const WITHDRAWAL_BATTERY_BY_ID_QUERY = `
   WHERE d.id = $1
     AND d.user_id = $2
     AND d.session_type = 'deposit'
-    AND d.status = 'completed';
+    AND d.status = 'completed'
+    AND s.current_battery_id IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM deposits w
+      WHERE w.consumed_deposit_id = d.id
+        AND w.session_type = 'withdrawal'
+        AND w.status NOT IN ('cancelled', 'failed')
+    );
 `;
 
 /**

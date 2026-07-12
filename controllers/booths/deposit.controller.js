@@ -149,6 +149,26 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (/** @type {any} */ 
       );
 
       if (slotReserveRes.rowCount > 0) {
+        // Safety net: Clean up any stale unredeemed deposit credits on this slot.
+        // This prevents double-allocation when the previous user's withdrawal failed
+        // but their deposit credit was not cleaned up by the Firebase sync.
+        await client.query(
+          `UPDATE deposits
+           SET status = 'failed',
+               notes = COALESCE(notes, '') || '\n[' || NOW() || '] Deposit failed: slot reassigned to new user.'
+           WHERE slot_id = $1
+             AND session_type = 'deposit'
+             AND status = 'completed'
+             AND current_battery_id IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM deposits w
+               WHERE w.consumed_deposit_id = deposits.id
+                 AND w.session_type = 'withdrawal'
+                 AND w.status NOT IN ('cancelled', 'failed')
+             )`,
+          [potentialSlot.id]
+        );
+
         assignedSlot = slotReserveRes.rows[0];
         break;
       }
@@ -272,7 +292,14 @@ router.get('/my-battery-status', verifyFirebaseToken, async (/** @type {any} */ 
       JOIN booths bo ON s.booth_id = bo.id
       WHERE d.user_id = $1
         AND d.session_type = 'deposit'
-        AND d.status = 'completed';
+        AND d.status = 'completed'
+        AND s.current_battery_id IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM deposits w
+          WHERE w.consumed_deposit_id = d.id
+            AND w.session_type = 'withdrawal'
+            AND w.status NOT IN ('cancelled', 'failed')
+        );
     `;
     const locationResult = await client.query(locationQuery, [firebaseUid]);
 
