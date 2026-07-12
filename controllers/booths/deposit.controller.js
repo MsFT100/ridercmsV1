@@ -159,7 +159,9 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (/** @type {any} */ 
            WHERE slot_id = $1
              AND session_type = 'deposit'
              AND status = 'completed'
-             AND current_battery_id IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM booth_slots bs WHERE bs.id = deposits.slot_id AND bs.current_battery_id IS NOT NULL
+             )
              AND NOT EXISTS (
                SELECT 1 FROM deposits w
                WHERE w.consumed_deposit_id = deposits.id
