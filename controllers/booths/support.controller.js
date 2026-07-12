@@ -47,7 +47,7 @@ router.post('/cancel-session', verifyFirebaseToken, async (req, res) => {
     const sessionRes = await client.query(sessionQuery, [firebaseUid]);
 
     if (sessionRes.rows.length === 0) {
-      return res.status(404).json({ error: 'No active session found to cancel.' });
+      return res.status(200).json({ message: 'No active session to cancel. You are all clear.' });
     }
 
     const { id: sessionId, session_type: sessionType, status: sessionStatus, slot_id: slotId, slot_identifier: slotIdentifier, booth_uid: boothUid } = sessionRes.rows[0];

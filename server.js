@@ -25,6 +25,7 @@ const adminRoutes = require('./routes/admin');
 const boothRoutes = require('./routes/booths');
 const mpesaRoutes = require('./routes/mpesa');
 const statsRoutes = require('./routes/stats');
+const cronRoutes = require('./routes/cron');
 
 
 const app = express();
@@ -149,6 +150,7 @@ app.use('/api/auth', authLimiter, authRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/booths', boothLimiter, boothRoutes);
 app.use('/api/mpesa', mpesaLimiter, mpesaRoutes);
+app.use('/api/cron', cronRoutes);
 app.use('/api/stats', statsRoutes);
 
 

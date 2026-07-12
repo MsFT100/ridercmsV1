@@ -1,11 +1,12 @@
 const assert = require('node:assert/strict');
-const { describe, it, beforeEach } = require('node:test');
+const { describe, it } = require('node:test');
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
  * Creates a mock pgClient that records every query call and returns canned results.
- * @param {object} [overrides] - Map of SQL-substring → { rowCount, rows } to return.
+ * @param {object} [overrides] - Map of SQL-substring to { rowCount, rows } to return.
+ * @returns {object} A mock pgClient with a `.queries` array and a `.query()` method.
  */
 function createMockClient(overrides = {}) {
   const queries = [];
@@ -124,7 +125,6 @@ describe('Anti-double-allocation fixes', () => {
     });
 
     it('does NOT clear current_battery_id when battery is still inserted', async () => {
-      const slotId = 4;
       const dbStatus = 'occupied';
       const batteryInserted = true;
       const batteryCleared = !batteryInserted && dbStatus !== 'available';

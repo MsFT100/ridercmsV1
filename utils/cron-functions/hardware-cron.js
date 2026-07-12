@@ -298,4 +298,10 @@ function startCronJob() {
   }, 30 * 1000);
 }
 
-module.exports = { startCronJob, resolvePendingPayments, resolveStuckWithdrawals, runWeeklyMaintenance };
+module.exports = {
+  startCronJob,
+  checkChargingConditions,
+  resolvePendingPayments,
+  resolveStuckWithdrawals,
+  runWeeklyMaintenance,
+};
