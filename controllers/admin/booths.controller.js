@@ -1205,7 +1205,24 @@ router.get('/booths/:boothUid/slots/:slotIdentifier', [verifyFirebaseToken, isAd
     const sessionRes = await client.query(activeSessionQuery, [slotInfo.slotId]);
     const activeSession = sessionRes.rows[0] || null;
 
-    // 3. Fetch real-time data from Firebase for comparison and debugging.
+    // 3. Find the battery owner from the most recent completed deposit.
+    const ownerQuery = `
+      SELECT
+        u.name AS "userName",
+        u.email AS "userEmail",
+        u.user_id AS "userId"
+      FROM deposits d
+      JOIN users u ON d.user_id = u.user_id
+      WHERE d.slot_id = $1
+        AND d.session_type = 'deposit'
+        AND d.status = 'completed'
+      ORDER BY d.completed_at DESC
+      LIMIT 1;
+    `;
+    const ownerRes = await client.query(ownerQuery, [slotInfo.slotId]);
+    const batteryOwner = ownerRes.rows[0] || null;
+
+    // 4. Fetch real-time data from Firebase for comparison and debugging.
     const db = getDatabase();
     const slotRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}`);
     const snapshot = await slotRef.get();
@@ -1215,6 +1232,7 @@ router.get('/booths/:boothUid/slots/:slotIdentifier', [verifyFirebaseToken, isAd
       boothUid,
       slot: slotInfo,
       activeSession: activeSession,
+      batteryOwner: batteryOwner,
       realTimeData: realTimeData
     });
 
