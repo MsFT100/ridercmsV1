@@ -183,6 +183,39 @@ async function handleDepositCompletion(pgClient, boothUid, slotIdentifier, slotI
     const depositId = depositUpdateResult.rows[0].id;
     logger.info(`Deposit session ${depositId} for slot ${slotIdentifier} completed with initial charge ${chargeLevel}%.`);
 
+    // Ensure the slot has a linked battery record. Dev booths and admin simulations
+    // already set current_battery_id, but the normal hardware flow does not.
+    // Without this, my-battery-status returns empty because it requires
+    // s.current_battery_id IS NOT NULL.
+    try {
+      const slotCheck = await pgClient.query(
+        'SELECT current_battery_id FROM booth_slots WHERE id = $1',
+        [slotId]
+      );
+      if (slotCheck.rows.length > 0 && slotCheck.rows[0].current_battery_id === null) {
+        const batteryUid = `bat-${slotId}-${Date.now()}`;
+        const batteryRes = await pgClient.query(
+          `INSERT INTO batteries (battery_uid, charge_level_percent, health_status)
+           VALUES ($1, $2, 'good')
+           ON CONFLICT (battery_uid) DO UPDATE SET charge_level_percent = $2
+           RETURNING id`,
+          [batteryUid, chargeLevel]
+        );
+        const batteryId = batteryRes.rows[0].id;
+        await pgClient.query(
+          'UPDATE booth_slots SET current_battery_id = $1 WHERE id = $2',
+          [batteryId, slotId]
+        );
+        await pgClient.query(
+          'UPDATE deposits SET battery_id = $1 WHERE id = $2',
+          [batteryId, depositId]
+        );
+        logger.info(`Linked new battery ${batteryUid} (id=${batteryId}) to slot ${slotIdentifier} for deposit ${depositId}.`);
+      }
+    } catch (batteryError) {
+      logger.error(`Failed to create/link battery for slot ${slotIdentifier}:`, batteryError);
+    }
+
     // Automatically send command to start charging the newly deposited battery.
     const db = getDatabase();
     const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
