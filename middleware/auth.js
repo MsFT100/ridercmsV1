@@ -56,8 +56,7 @@ const isAdmin = (req, res, next) => {
   // `verifyFirebaseToken` should have already run and attached the user object.
   const { role } = req.user;
 
-  if (role === 'admin') {
-    // User has the admin role, proceed to the next handler.
+  if (role === 'admin' || role === 'developer') {
     return next();
   }
 
