@@ -501,4 +501,119 @@ router.post('/sessions/cleanup', [verifyFirebaseToken, isAdmin], async (req, res
   }
 });
 
+/**
+ * GET /api/admin/rentals/fleet
+ * @summary Inventory of rental-pool batteries and their current location
+ * @description Lists every borrowable (rental-pool) battery and where it is right now:
+ * either sitting in a booth slot (state 'in_slot') or out with a user (state 'issued' /
+ * 'returned'). A battery qualifies as pool stock when it occupies a slot but has no
+ * completed-and-unredeemed deposit credit (i.e. it does not belong to someone's active
+ * charging session). When a battery is rented it leaves the slot and shows the user who
+ * has it until the return is physically completed.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @responses
+ *   200:
+ *     description: Array of rental batteries with their current location.
+ *   500:
+ *     description: Internal server error.
+ */
+router.get('/rentals/fleet', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    // Batteries currently out with a user (rental issued and not yet returned/completed).
+    const issuedRes = await client.query(
+      `SELECT
+         r.id AS "sessionId",
+         r.created_at AS "rentedAt",
+         r.return_slot_id,
+         b.battery_uid AS "batteryUid",
+         br.booth_uid AS "sourceBoothUid",
+         bl.slot_identifier AS "sourceSlotIdentifier",
+         u.name AS "userName",
+         u.phone AS "userPhone",
+         u.email AS "userEmail"
+       FROM deposits r
+       JOIN batteries b ON r.battery_id = b.id
+       JOIN users u ON r.user_id = u.user_id
+       JOIN booth_slots bl ON r.slot_id = bl.id
+       JOIN booths br ON bl.booth_id = br.id
+       WHERE r.session_type = 'rental'
+         AND r.status IN ('pending', 'in_progress')
+       ORDER BY r.created_at DESC`
+    );
+
+    // Batteries sitting in a booth slot that belong to the rental pool (no deposit owner
+    // and no active rental on that battery).
+    const inSlotRes = await client.query(
+      `SELECT
+         s.slot_identifier AS "slotIdentifier",
+         bo.booth_uid AS "boothUid",
+         b.battery_uid AS "batteryUid",
+         s.charge_level_percent AS "chargeLevel",
+         s.status AS "slotStatus"
+       FROM booth_slots s
+       JOIN booths bo ON s.booth_id = bo.id
+       JOIN batteries b ON s.current_battery_id = b.id
+       WHERE bo.status = 'online'
+         AND s.status = 'occupied'
+         AND NOT EXISTS (
+           SELECT 1 FROM deposits d
+           WHERE d.battery_id = b.id
+             AND d.session_type = 'deposit'
+             AND d.status = 'completed'
+             AND NOT EXISTS (
+               SELECT 1 FROM deposits w
+               WHERE w.consumed_deposit_id = d.id
+                 AND w.session_type IN ('withdrawal', 'rental')
+                 AND w.status NOT IN ('cancelled', 'failed')
+             )
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM deposits r
+           WHERE r.battery_id = b.id
+             AND r.session_type = 'rental'
+             AND r.status IN ('pending', 'in_progress')
+         )
+       ORDER BY bo.booth_uid ASC, s.slot_identifier ASC`
+    );
+
+    const issued = issuedRes.rows.map((row) => ({
+      batteryUid: row.batteryUid,
+      state: row.return_slot_id ? 'RETURNED' : 'ISSUED',
+      sessionId: row.sessionId,
+      rentedAt: row.rentedAt,
+      sourceBoothUid: row.sourceBoothUid,
+      sourceSlotIdentifier: row.sourceSlotIdentifier,
+      user: {
+        name: row.userName,
+        phone: row.userPhone,
+        email: row.userEmail,
+      },
+    }));
+
+    const inSlots = inSlotRes.rows.map((row) => ({
+      batteryUid: row.batteryUid,
+      state: 'IN_SLOT',
+      boothUid: row.boothUid,
+      slotIdentifier: row.slotIdentifier,
+      chargeLevel: row.chargeLevel !== null ? Number(row.chargeLevel) : null,
+      slotStatus: row.slotStatus,
+    }));
+
+    res.status(200).json({
+      total: issued.length + inSlots.length,
+      issued,
+      inSlots,
+    });
+  } catch (error) {
+    logger.error('Failed to get rental fleet inventory:', error);
+    res.status(500).json({ error: 'Failed to retrieve rental fleet.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 module.exports = router;
