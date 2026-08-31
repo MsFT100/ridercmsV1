@@ -102,7 +102,7 @@ const initializeDatabase = async () => {
         slot_id INT NOT NULL REFERENCES booth_slots(id),
         battery_id INT REFERENCES batteries(id) ON DELETE SET NULL,
         consumed_deposit_id INT REFERENCES deposits(id) ON DELETE SET NULL, -- Links a withdrawal to the deposit it consumes
-        session_type VARCHAR(20) NOT NULL CHECK (session_type IN ('deposit', 'withdrawal')),
+        session_type VARCHAR(20) NOT NULL CHECK (session_type IN ('deposit', 'withdrawal', 'rental')),
         initial_charge_level INT, -- Stored on deposit
         amount DECIMAL(10, 2) NOT NULL DEFAULT 0.00, -- Amount charged for the session
         mpesa_checkout_id VARCHAR(255) UNIQUE, -- For tracking payment status
@@ -192,12 +192,28 @@ const initializeDatabase = async () => {
       "Added 'consumed_deposit_id' column to 'deposits' table."
     );
 
+    // Add 'return_slot_id' column to 'deposits' (rental returns)
+    await runAlteration(
+      'deposits',
+      'return_slot_id',
+      'ALTER TABLE deposits ADD COLUMN return_slot_id INT REFERENCES booth_slots(id) ON DELETE SET NULL;',
+      "Added 'return_slot_id' column to 'deposits' table."
+    );
+
     // Add 'redeemed' to the status check constraint on 'deposits'
     const checkConstraintRes = await client.query("SELECT 1 FROM pg_constraint WHERE conname = 'deposits_status_check' AND conrelid = 'deposits'::regclass AND pg_get_constraintdef(oid) LIKE '%redeemed%';");
     if (checkConstraintRes.rowCount === 0) {
       await client.query("ALTER TABLE deposits DROP CONSTRAINT deposits_status_check;");
       await client.query("ALTER TABLE deposits ADD CONSTRAINT deposits_status_check CHECK (status IN ('pending', 'opening', 'in_progress', 'completed', 'failed', 'cancelled', 'redeemed'));");
       logger.info("Updated 'deposits.status' CHECK constraint to include 'redeemed'.");
+    }
+
+    // Add 'rental' to the session_type check constraint on 'deposits'
+    const sessionTypeConstraintRes = await client.query("SELECT 1 FROM pg_constraint WHERE conname = 'deposits_session_type_check' AND pg_get_constraintdef(oid) LIKE '%rental%';");
+    if (sessionTypeConstraintRes.rowCount === 0) {
+      await client.query("ALTER TABLE deposits DROP CONSTRAINT deposits_session_type_check;");
+      await client.query("ALTER TABLE deposits ADD CONSTRAINT deposits_session_type_check CHECK (session_type IN ('deposit', 'withdrawal', 'rental'));");
+      logger.info("Added 'rental' to the 'deposits.session_type' CHECK constraint.");
     }
 
     // Add foreign key from deposits.user_id to users.user_id
@@ -265,7 +281,9 @@ const initializeDatabase = async () => {
         value: JSON.stringify({
           base_swap_fee: 5.00,
           cost_per_charge_percent: 10.00,
-          overtime_penalty_per_minute: 0.10
+          overtime_penalty_per_minute: 0.10,
+          rental_time_fee_per_minute: 0.20,
+          rental_energy_rate_per_percent: 10.00
         }),
         description: 'Pricing rules for battery swaps.'
       },

@@ -5,7 +5,7 @@ const { getDatabase } = require('firebase-admin/database');
 const poolPromise = require('../../db');
 const logger = require('../logger');
 const { querySTKStatus } = require('../mpesa');
-const { completePaidWithdrawal } = require('../sessionUtils');
+const { completePaidWithdrawal, completePaidRental } = require('../sessionUtils');
 const { runMpesaReconciliation } = require('../reconciliationWorker');
 
 /**
@@ -101,14 +101,22 @@ async function resolvePendingPayments() {
     const pool = await poolPromise;
     client = await pool.connect();
 
-    // Find pending withdrawals with an mpesa_checkout_id older than 45 seconds.
+    // Find payments older than 45 seconds that have not been confirmed:
+    // - withdrawals stuck in 'pending' awaiting their M-Pesa callback
+    // - rentals that initiated their consolidated-bill payment (still 'in_progress'
+    //   because a returned rental only flips to 'completed' once paid)
     // M-Pesa STK push timeout is ~60s; by 45s the user has likely entered their PIN.
     const pendingQuery = `
-      SELECT id, mpesa_checkout_id
+      SELECT id, session_type, mpesa_checkout_id
       FROM deposits
-      WHERE session_type = 'withdrawal'
-        AND status = 'pending'
+      WHERE (
+        (session_type = 'withdrawal' AND status = 'pending')
+        OR
+        (session_type = 'rental' AND status = 'in_progress'
+           AND return_slot_id IS NOT NULL AND mpesa_checkout_id IS NOT NULL)
+      )
         AND mpesa_checkout_id IS NOT NULL
+        AND mpesa_checkout_id NOT LIKE 'DEV_%'
         AND started_at < NOW() - INTERVAL '45 seconds'
       ORDER BY started_at ASC
     `;
@@ -119,7 +127,7 @@ async function resolvePendingPayments() {
     logger.info(`[MpesaCron] Found ${rows.length} pending payment(s) to verify.`);
 
     for (const session of rows) {
-      const { id: sessionId, mpesa_checkout_id: checkoutId } = session;
+      const { id: sessionId, session_type: sessionType, mpesa_checkout_id: checkoutId } = session;
       try {
         const response = await querySTKStatus(checkoutId);
         const { ResultCode, ResultDesc } = response.data;
@@ -127,15 +135,17 @@ async function resolvePendingPayments() {
         if (ResultCode === '0') {
           logger.info(`[MpesaCron] M-Pesa confirmed payment for session ${sessionId} (${checkoutId}). Completing...`);
           await client.query('BEGIN');
-          const completed = await completePaidWithdrawal(client, checkoutId);
+          // Whichever matching completion applies (withdrawal vs rental) will handle it.
+          const completed = await completePaidWithdrawal(client, checkoutId) || await completePaidRental(client, checkoutId);
           await client.query('COMMIT');
           if (completed) {
-            logger.info(`[MpesaCron] Session ${sessionId} moved to in_progress via proactive check.`);
+            logger.info(`[MpesaCron] Session ${sessionId} completed via proactive check.`);
           }
         } else {
           // Non-zero result code: payment failed or cancelled.
-          // Only mark as failed if the session is older than 75s (well past M-Pesa timeout)
-          // to avoid premature failure before the callback arrives.
+          // Only mark withdrawals as failed if older than 75s (well past M-Pesa timeout)
+          // to avoid premature failure before the callback arrives. Rentals keep their
+          // 'in_progress' status so the user can simply retry payment.
           const ageRes = await client.query(
             `SELECT EXTRACT(EPOCH FROM (NOW() - started_at))::int AS age_seconds
              FROM deposits WHERE id = $1`,
@@ -143,7 +153,7 @@ async function resolvePendingPayments() {
           );
           const ageSeconds = ageRes.rows[0]?.age_seconds || 0;
 
-          if (ageSeconds > 75) {
+          if (sessionType === 'withdrawal' && ageSeconds > 75) {
             logger.warn(`[MpesaCron] Marking session ${sessionId} as failed. M-Pesa code: ${ResultCode} (${ResultDesc})`);
             await client.query(
               `UPDATE deposits SET status = 'failed',
