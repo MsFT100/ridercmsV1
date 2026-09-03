@@ -4,6 +4,7 @@ const { v4: uuidv4 } = require('uuid');
 const logger = require('../../utils/logger.js');
 const poolPromise = require('../../db');
 const { verifyFirebaseToken, isAdmin } = require('../../middleware/auth');
+const { reconcileSlotDeposit } = require('../../utils/depositReconcile');
 
 const router = Router();
 
@@ -1645,6 +1646,78 @@ router.post('/booths/:boothUid/slots/:slotIdentifier/manual-withdraw', [verifyFi
     await client.query('ROLLBACK');
     logger.error(`Failed manual withdrawal for ${boothUid}/${slotIdentifier}:`, error);
     res.status(500).json({ error: 'Failed to prepare manual withdrawal.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * POST /api/admin/booths/:boothUid/slots/:slotIdentifier/reconcile-deposit
+ * @summary Re-sync a slot's deposit status against the physically present battery
+ * @description If a deposit was wrongly marked 'failed' (e.g. by a transient telemetry
+ * glitch) while the battery is still physically in the slot, restore it to 'completed'
+ * so the user's battery credit and withdrawal path are recovered.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @parameters
+ *   - in: path
+ *     name: boothUid
+ *     required: true
+ *     schema:
+ *       type: string
+ *   - in: path
+ *     name: slotIdentifier
+ *     required: true
+ *     schema:
+ *       type: string
+ * @responses
+ *   200:
+ *     description: Reconciliation result
+ *   404:
+ *     description: Slot not found
+ */
+router.post('/booths/:boothUid/slots/:slotIdentifier/reconcile-deposit', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const { boothUid, slotIdentifier } = req.params;
+
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const slotRes = await client.query(`
+      SELECT s.id AS "slotId"
+      FROM booth_slots s
+      JOIN booths b ON s.booth_id = b.id
+      WHERE b.booth_uid = $1 AND s.slot_identifier = $2
+      FOR UPDATE OF s
+    `, [boothUid, slotIdentifier]);
+
+    if (slotRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: `Slot '${slotIdentifier}' in booth '${boothUid}' not found.` });
+    }
+
+    const { slotId } = slotRes.rows[0];
+    const result = await reconcileSlotDeposit(client, slotId, slotIdentifier);
+
+    await client.query('COMMIT');
+
+    logger.info(`Admin (UID: ${req.user.uid}) reconciled deposit for slot ${boothUid}/${slotIdentifier}: ${result.previousStatus} -> ${result.newStatus} (${result.reason}).`);
+
+    res.status(200).json({
+      boothUid,
+      slotIdentifier,
+      reconciled: result.reconciled,
+      depositId: result.depositId,
+      previousStatus: result.previousStatus,
+      newStatus: result.newStatus,
+      reason: result.reason,
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    logger.error(`Failed to reconcile deposit for ${boothUid}/${slotIdentifier}:`, error);
+    res.status(500).json({ error: 'Failed to reconcile deposit.', details: error.message });
   } finally {
     client.release();
   }

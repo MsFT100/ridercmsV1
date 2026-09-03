@@ -2,6 +2,7 @@ const { getDatabase } = require('firebase-admin/database');
 const pool = require('../db');
 const logger = require('./logger');
 const { finalizeWithdrawalSession } = require('./sessionUtils');
+const { reconcileSlotDeposit } = require('./depositReconcile');
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -355,6 +356,17 @@ async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
       );
       if (orphanResult.rowCount > 0) {
         logger.warn(`Cleaned up ${orphanResult.rowCount} orphaned deposit(s) for slot ${slotIdentifier} (${dbStatus} -> available).`);
+      }
+    }
+
+    // 5b. Self-healing reconcile: if the battery is physically present and the slot
+    // is occupied, re-complete any deposit that was wrongly marked 'failed' (e.g. by
+    // a transient telemetry flicker that briefly reported the battery as absent).
+    if (batteryInserted && newStatus === 'occupied') {
+      try {
+        await reconcileSlotDeposit(pgClient, slotId, slotIdentifier);
+      } catch (reconcileError) {
+        logger.error(`Failed to reconcile deposit for slot ${slotIdentifier}:`, reconcileError);
       }
     }
 
