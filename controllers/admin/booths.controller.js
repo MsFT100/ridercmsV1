@@ -67,11 +67,17 @@ router.get('/booths', [verifyFirebaseToken, isAdmin], async (req, res) => {
       ) b
       LEFT JOIN booth_slots s ON b.id = s.booth_id
       LEFT JOIN batteries bat ON s.current_battery_id = bat.id
-      -- Find the user from the most recent completed deposit in each slot to identify current renter
+      -- Find the user from the most recent completed deposit that has NOT been consumed by a withdrawal.
       LEFT JOIN LATERAL (
         SELECT d.user_id
         FROM deposits d
         WHERE d.slot_id = s.id AND d.session_type = 'deposit' AND d.status = 'completed'
+          AND NOT EXISTS (
+            SELECT 1 FROM deposits w
+            WHERE w.consumed_deposit_id = d.id
+              AND w.session_type = 'withdrawal'
+              AND w.status NOT IN ('cancelled', 'failed')
+          )
         ORDER BY d.completed_at DESC
         LIMIT 1
       ) last_deposit ON true
@@ -160,11 +166,17 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
         manual_wd.manual_withdrawal_id IS NOT NULL AS pending_manual_unlock
       FROM booths b
       LEFT JOIN booth_slots s ON b.id = s.booth_id
-      -- Use a lateral join to find the user from the most recent completed deposit in each slot.
+      -- Use a lateral join to find the user from the most recent completed deposit that has NOT been consumed by a withdrawal.
       LEFT JOIN LATERAL (
         SELECT d.user_id
         FROM deposits d
         WHERE d.slot_id = s.id AND d.session_type = 'deposit' AND d.status = 'completed'
+          AND NOT EXISTS (
+            SELECT 1 FROM deposits w
+            WHERE w.consumed_deposit_id = d.id
+              AND w.session_type = 'withdrawal'
+              AND w.status NOT IN ('cancelled', 'failed')
+          )
         ORDER BY d.completed_at DESC
         LIMIT 1
       ) last_deposit ON true
@@ -1133,6 +1145,12 @@ router.get('/booths/:boothUid', [verifyFirebaseToken, isAdmin], async (req, res)
         SELECT d.user_id
         FROM deposits d
         WHERE d.slot_id = s.id AND d.session_type = 'deposit' AND d.status = 'completed'
+          AND NOT EXISTS (
+            SELECT 1 FROM deposits w
+            WHERE w.consumed_deposit_id = d.id
+              AND w.session_type = 'withdrawal'
+              AND w.status NOT IN ('cancelled', 'failed')
+          )
         ORDER BY d.completed_at DESC
         LIMIT 1
       ) last_deposit ON true
