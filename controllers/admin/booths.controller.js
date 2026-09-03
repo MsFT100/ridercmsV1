@@ -72,7 +72,6 @@ router.get('/booths', [verifyFirebaseToken, isAdmin], async (req, res) => {
         SELECT d.user_id
         FROM deposits d
         WHERE d.slot_id = s.id AND d.session_type = 'deposit' AND d.status = 'completed'
-          AND d.battery_id = s.current_battery_id
         ORDER BY d.completed_at DESC
         LIMIT 1
       ) last_deposit ON true
@@ -166,7 +165,6 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
         SELECT d.user_id
         FROM deposits d
         WHERE d.slot_id = s.id AND d.session_type = 'deposit' AND d.status = 'completed'
-          AND d.battery_id = s.current_battery_id
         ORDER BY d.completed_at DESC
         LIMIT 1
       ) last_deposit ON true
@@ -1135,7 +1133,6 @@ router.get('/booths/:boothUid', [verifyFirebaseToken, isAdmin], async (req, res)
         SELECT d.user_id
         FROM deposits d
         WHERE d.slot_id = s.id AND d.session_type = 'deposit' AND d.status = 'completed'
-          AND d.battery_id = s.current_battery_id
         ORDER BY d.completed_at DESC
         LIMIT 1
       ) last_deposit ON true
