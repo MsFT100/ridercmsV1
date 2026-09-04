@@ -295,6 +295,7 @@ router.get('/my-battery-status', verifyFirebaseToken, async (/** @type {any} */ 
       WHERE d.user_id = $1
         AND d.session_type = 'deposit'
         AND d.status = 'completed'
+        AND d.battery_id = s.current_battery_id
         AND s.current_battery_id IS NOT NULL
         AND NOT EXISTS (
           SELECT 1 FROM deposits w
