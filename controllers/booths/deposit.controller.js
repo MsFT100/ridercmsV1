@@ -280,6 +280,13 @@ router.get('/my-battery-status', verifyFirebaseToken, async (/** @type {any} */ 
   const client = await pool.connect(req.schema);
   try {
     // 1. Find where the user's battery is located from our database.
+    // NOTE: this endpoint is intentionally STRICT — it must locate the physical
+    // battery the user deposited (real-time device truth), so the deposit's
+    // battery must match the slot's battery exactly. This differs from the admin
+    // renter/withdrawal queries (controllers/admin/booths.controller.js) which
+    // are intentionally NULL-tolerant on battery_id because hardware deposits
+    // historically completed without linking battery_id when the slot already
+    // had a battery. do NOT copy the tolerant pattern here.
     const locationQuery = `
       SELECT
         d.id AS "sessionId",
