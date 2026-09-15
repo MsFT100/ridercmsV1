@@ -542,6 +542,7 @@ router.get('/rentals/fleet', [verifyFirebaseToken, isAdmin], async (req, res) =>
        JOIN booths br ON bl.booth_id = br.id
        WHERE r.session_type = 'rental'
          AND r.status IN ('pending', 'in_progress')
+         AND b.withdrawn_at IS NULL
        ORDER BY r.created_at DESC`
     );
 
@@ -559,6 +560,7 @@ router.get('/rentals/fleet', [verifyFirebaseToken, isAdmin], async (req, res) =>
        JOIN batteries b ON s.current_battery_id = b.id
        WHERE bo.status = 'online'
          AND s.status = 'occupied'
+         AND b.withdrawn_at IS NULL
          AND NOT EXISTS (
            SELECT 1 FROM deposits d
            WHERE d.battery_id = b.id
@@ -611,6 +613,343 @@ router.get('/rentals/fleet', [verifyFirebaseToken, isAdmin], async (req, res) =>
   } catch (error) {
     logger.error('Failed to get rental fleet inventory:', error);
     res.status(500).json({ error: 'Failed to retrieve rental fleet.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * POST /api/admin/rentals
+ * @summary Add a battery to the rental pool
+ * @description Registers (or re-registers) a battery as borrowable pool stock by
+ * placing it into a booth slot. If the battery_uid already exists it is re-activated
+ * (any prior withdrawal is lifted) and moved to the supplied location.
+ * @tags [Admin]
+ * @security - bearerAuth: []
+ * @requestBody
+ *   required: true
+ *   content:
+ *     application/json:
+ *       schema:
+ *         type: object
+ *         required: [batteryUid, chargeLevel, boothUid, slotIdentifier]
+ *         properties:
+ *           batteryUid:
+ *             type: string
+ *           chargeLevel:
+ *             type: integer
+ *             description: Current charge level 0-100.
+ *           boothUid:
+ *             type: string
+ *           slotIdentifier:
+ *             type: string
+ *           batteryType:
+ *             type: string
+ *             description: Optional label such as E-Bike/Scooter/Car Module (informational).
+ *           notes:
+ *             type: string
+ * @responses
+ *   201:
+ *     description: Rental battery created.
+ *   409:
+ *     description: Battery is currently rented out.
+ *   404:
+ *     description: Booth or slot not found.
+ */
+router.post('/rentals', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const { batteryUid, chargeLevel, boothUid, slotIdentifier, notes } = req.body;
+
+  if (!batteryUid || !batteryUid.trim()) {
+    return res.status(400).json({ error: 'batteryUid is required.' });
+  }
+  if (!boothUid || !slotIdentifier) {
+    return res.status(400).json({ error: 'boothUid and slotIdentifier are required.' });
+  }
+  const level = Number(chargeLevel);
+  if (Number.isNaN(level) || level < 0 || level > 100) {
+    return res.status(400).json({ error: 'chargeLevel must be between 0 and 100.' });
+  }
+
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const slotRes = await client.query(
+      `SELECT s.id AS "slotId", s.booth_id AS "boothId"
+       FROM booth_slots s
+       JOIN booths b ON s.booth_id = b.id
+       WHERE b.booth_uid = $1 AND s.slot_identifier = $2
+       LIMIT 1`,
+      [boothUid, slotIdentifier]
+    );
+    if (slotRes.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Booth or slot not found.' });
+    }
+    const { slotId } = slotRes.rows[0];
+
+    // 1. Find or create the battery.
+    const batteryRes = await client.query(
+      `SELECT id, battery_uid AS "batteryUid", withdrawn_at AS "withdrawnAt"
+       FROM batteries WHERE battery_uid = $1 LIMIT 1`,
+      [batteryUid.trim()]
+    );
+
+    let batteryId;
+    if (batteryRes.rowCount > 0) {
+      batteryId = batteryRes.rows[0].id;
+
+      // A battery that is currently rented out cannot be reassigned.
+      const activeRentalRes = await client.query(
+        `SELECT 1 FROM deposits
+         WHERE battery_id = $1 AND session_type = 'rental' AND status IN ('pending', 'in_progress')
+         LIMIT 1`,
+        [batteryId]
+      );
+      if (activeRentalRes.rowCount > 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'Battery is currently rented out.' });
+      }
+
+      await client.query(
+        `UPDATE batteries
+         SET charge_level_percent = $1, withdrawn_at = NULL, withdrawal_reason = NULL, withdrawal_notes = NULL, updated_at = NOW()
+         WHERE id = $2`,
+        [level, batteryId]
+      );
+    } else {
+      const insertRes = await client.query(
+        `INSERT INTO batteries (battery_uid, charge_level_percent, health_status)
+         VALUES ($1, $2, 'good') RETURNING id`,
+        [batteryUid.trim(), level]
+      );
+      batteryId = insertRes.rows[0].id;
+    }
+
+    // 2. Place the battery into the requested booth slot as unowned pool stock.
+    await client.query(
+      `UPDATE booth_slots
+       SET status = 'occupied', current_battery_id = $1, charge_level_percent = $2,
+           is_charging = FALSE, door_status = 'closed', updated_at = NOW()
+       WHERE id = $3`,
+      [batteryId, level, slotId]
+    );
+
+    await client.query('COMMIT');
+
+    logger.info(`Admin (UID: ${req.user.uid}) added rental battery ${batteryUid.trim()} to ${boothUid}/${slotIdentifier} at SOC ${level}%.`);
+    return res.status(201).json({
+      batteryUid: batteryUid.trim(),
+      chargeLevel: level,
+      boothUid,
+      slotIdentifier,
+      notes: notes || null,
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    logger.error('Failed to add rental battery:', error);
+    return res.status(500).json({ error: 'Failed to add rental battery.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * POST /api/admin/rentals/:batteryUid/withdraw
+ * @summary Withdraw a battery from the rental pool
+ * @description Marks a battery as withdrawn (e.g. damaged or lost) so it is no longer
+ * offered for rental, and clears the booth slot it currently occupies. A battery that is
+ * currently rented out to a rider cannot be withdrawn.
+ * @tags [Admin]
+ * @security - bearerAuth: []
+ * @requestBody
+ *   required: true
+ *   content:
+ *     application/json:
+ *       schema:
+ *         type: object
+ *         required: [reason]
+ *         properties:
+ *           reason:
+ *             type: string
+ *             description: e.g. Damaged, Faulty, Lost, Battery degradation, End of life, Other.
+ *           notes:
+ *             type: string
+ * @responses
+ *   200:
+ *     description: Battery withdrawn.
+ *   404:
+ *     description: Battery not found.
+ *   409:
+ *     description: Battery is currently rented out.
+ */
+router.post('/rentals/:batteryUid/withdraw', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const { batteryUid } = req.params;
+  const { reason, notes } = req.body;
+
+  if (!reason || !reason.trim()) {
+    return res.status(400).json({ error: 'A withdrawal reason is required.' });
+  }
+
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const batteryRes = await client.query(
+      `SELECT id, battery_uid AS "batteryUid", withdrawn_at AS "withdrawnAt"
+       FROM batteries WHERE battery_uid = $1 LIMIT 1`,
+      [batteryUid]
+    );
+    if (batteryRes.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Battery not found.' });
+    }
+    const battery = batteryRes.rows[0];
+
+    if (battery.withdrawnAt) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'Battery is already withdrawn.' });
+    }
+
+    // A battery that is currently rented out cannot be withdrawn.
+    const activeRentalRes = await client.query(
+      `SELECT 1 FROM deposits
+       WHERE battery_id = $1 AND session_type = 'rental' AND status IN ('pending', 'in_progress')
+       LIMIT 1`,
+      [battery.id]
+    );
+    if (activeRentalRes.rowCount > 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'Battery cannot be withdrawn while it is rented out.' });
+    }
+
+    await client.query(
+      `UPDATE batteries
+       SET withdrawn_at = NOW(), withdrawal_reason = $1, withdrawal_notes = $2, updated_at = NOW()
+       WHERE id = $3`,
+      [reason.trim(), notes || null, battery.id]
+    );
+
+    // Clear the booth slot this battery currently occupies (it has been physically removed).
+    const slotRes = await client.query(
+      `SELECT id FROM booth_slots WHERE current_battery_id = $1 LIMIT 1`,
+      [battery.id]
+    );
+    if (slotRes.rowCount > 0) {
+      await client.query(
+        `UPDATE booth_slots
+         SET status = 'available', current_battery_id = NULL, charge_level_percent = NULL,
+             is_charging = FALSE, door_status = 'closed', updated_at = NOW()
+         WHERE id = $1`,
+        [slotRes.rows[0].id]
+      );
+    }
+
+    await client.query('COMMIT');
+
+    logger.info(`Admin (UID: ${req.user.uid}) withdrew rental battery ${batteryUid} (${reason.trim()}).`);
+    return res.status(200).json({
+      batteryUid,
+      withdrawn: true,
+      reason: reason.trim(),
+      notes: notes || null,
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    logger.error('Failed to withdraw rental battery:', error);
+    return res.status(500).json({ error: 'Failed to withdraw rental battery.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/admin/rentals/sessions
+ * @summary List battery rental sessions
+ * @description Returns the rental session history (rentals from the deposits table)
+ * with the rider, the rented battery, the rider's own charging battery, duration,
+ * amount and a UI-friendly status.
+ * @tags [Admin]
+ * @security - bearerAuth: []
+ * @parameters
+ *   - in: query
+ *     name: limit
+ *     schema:
+ *       type: integer
+ *       default: 100
+ *   - in: query
+ *     name: offset
+ *     schema:
+ *       type: integer
+ *       default: 0
+ * @responses
+ *   200:
+ *     description: Rental sessions returned.
+ */
+router.get('/rentals/sessions', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const limit = parseInt(req.query.limit, 10) || 100;
+  const offset = parseInt(req.query.offset, 10) || 0;
+
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      `SELECT
+         r.id,
+         r.status,
+         r.amount,
+         r.created_at AS "startTime",
+         r.completed_at AS "completedAt",
+         r.return_slot_id,
+         u.name AS "riderName",
+         u.phone AS "phone",
+         bat.battery_uid AS "rentalBatteryId",
+         depBat.battery_uid AS "ownBatteryId"
+       FROM deposits r
+       JOIN users u ON r.user_id = u.user_id
+       LEFT JOIN batteries bat ON r.battery_id = bat.id
+       LEFT JOIN deposits dep ON dep.id = r.consumed_deposit_id
+       LEFT JOIN batteries depBat ON dep.battery_id = depBat.id
+       WHERE r.session_type = 'rental'
+       ORDER BY r.created_at DESC
+       LIMIT $1 OFFSET $2`,
+      [limit, offset]
+    );
+
+    const sessions = result.rows.map((row) => {
+      const endTime = row.completedAt || new Date().toISOString();
+      const startMs = new Date(row.startTime).getTime();
+      const endMs = new Date(endTime).getTime();
+      const durationMinutes = Math.max(0, Math.round((endMs - startMs) / 60000));
+
+      let status;
+      if (row.status === 'pending') status = 'issued';
+      else if (row.status === 'in_progress' && row.return_slot_id) status = 'returned';
+      else if (row.status === 'in_progress') status = 'active';
+      else status = row.status;
+
+      const amount = Number(row.amount) || 0;
+
+      return {
+        id: String(row.id),
+        riderName: row.riderName || 'Unknown Rider',
+        phone: row.phone || undefined,
+        rentalBatteryId: row.rentalBatteryId || 'N/A',
+        ownBatteryId: row.ownBatteryId || undefined,
+        durationMinutes,
+        amount,
+        totalAmount: amount,
+        status,
+        startTime: row.startTime,
+      };
+    });
+
+    return res.status(200).json({ sessions, total: sessions.length });
+  } catch (error) {
+    logger.error('Failed to get rental sessions:', error);
+    return res.status(500).json({ error: 'Failed to retrieve rental sessions.', details: error.message });
   } finally {
     client.release();
   }

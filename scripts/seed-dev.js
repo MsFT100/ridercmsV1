@@ -162,6 +162,22 @@ async function seed() {
           value: JSON.stringify({ min_charge_level: 0 }),
           description: 'Dev rules — no minimum charge required',
         },
+        {
+          key: 'rental',
+          value: JSON.stringify({
+            allocate_highest_soc_first: true,
+            minimum_soc_percent: 0,
+            max_rental_batteries_per_user: 1,
+            rental_time_limit_minutes: 60,
+            rental_energy_rate_per_kwh: 0.00,
+            rental_time_rate_per_minute: 0.00,
+            require_rental_scan_before_issue: false,
+            require_return_scan: false,
+            auto_charge_returned_battery: true,
+            allow_rental_while_own_battery_charging: true,
+          }),
+          description: 'Dev rental rules — all fees waived, no minimum charge required',
+        },
       ];
 
       for (const setting of devSettings) {

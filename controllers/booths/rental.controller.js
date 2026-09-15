@@ -53,12 +53,19 @@ router.get('/rentals/available', verifyFirebaseToken, async (req, res) => {
   const pool = await poolPromise;
   const client = await pool.connect(req.schema);
   try {
+    // Fetch rental allocation settings (fall back to sensible defaults).
+    const settingsRes = await client.query("SELECT value FROM app_settings WHERE key = 'rental'");
+    const rent = settingsRes.rows[0]?.value || {};
+    const minSocPercent = Number(rent.minimum_soc_percent ?? 50);
+    const allocateHighestSocFirst = rent.allocate_highest_soc_first !== false;
+    const maxRentalsPerUser = Number(rent.max_rental_batteries_per_user ?? 1);
+
     const activeRental = await client.query(
-      `SELECT id FROM deposits
-       WHERE user_id = $1 AND session_type = 'rental' AND status IN ('pending', 'in_progress')
-       LIMIT 1`,
+      `SELECT COUNT(*)::int AS cnt FROM deposits
+       WHERE user_id = $1 AND session_type = 'rental' AND status IN ('pending', 'in_progress')`,
       [firebaseUid]
     );
+    const activeRentalCount = activeRental.rows[0].cnt;
 
     const availableRes = await client.query(
       `SELECT
@@ -73,6 +80,7 @@ router.get('/rentals/available', verifyFirebaseToken, async (req, res) => {
        WHERE bo.booth_uid = $1
          AND bo.status = 'online'
          AND s.status = 'occupied'
+         AND b.withdrawn_at IS NULL
          AND ${noDepositOwnerExpr('b')}
          AND NOT EXISTS (
            SELECT 1 FROM deposits r
@@ -80,14 +88,17 @@ router.get('/rentals/available', verifyFirebaseToken, async (req, res) => {
              AND r.session_type = 'rental'
              AND r.status IN ('pending', 'in_progress')
          )
-       ORDER BY s.slot_identifier ASC`,
+       ${minSocPercent > 0 ? `AND s.charge_level_percent >= ${minSocPercent}` : ''}
+       ORDER BY ${allocateHighestSocFirst ? 's.charge_level_percent DESC' : 's.slot_identifier ASC'}`,
       [boothUid]
     );
 
     return res.status(200).json({
       boothUid,
       rentals: availableRes.rows,
-      hasPendingRental: activeRental.rowCount > 0,
+      hasPendingRental: activeRentalCount > 0,
+      rentalLimit: maxRentalsPerUser,
+      activeRentalCount,
     });
   } catch (error) {
     logger.error(`Failed to list available rentals for booth ${boothUid}:`, error);
@@ -114,6 +125,7 @@ router.post('/rentals/issue', verifyFirebaseToken, async (req, res) => {
     return res.status(400).json({ error: 'boothUid and slotIdentifier are required.' });
   }
 
+  let maxRentalsPerUser = 1;
   const pool = await poolPromise;
   const client = await pool.connect(req.schema);
   try {
@@ -127,15 +139,28 @@ router.post('/rentals/issue', verifyFirebaseToken, async (req, res) => {
     const existingRes = await client.query(
       `SELECT 1 FROM deposits
        WHERE user_id = $1
-         AND (
-           (session_type = 'rental' AND status IN ('pending', 'in_progress'))
-           OR (session_type = 'withdrawal' AND status IN ('pending', 'in_progress'))
-         )
+         AND session_type = 'withdrawal'
+         AND status IN ('pending', 'in_progress')
        LIMIT 1`,
       [firebaseUid]
     );
     if (existingRes.rows.length > 0) {
-      throw new Error('ACTIVE_SESSION_EXISTS');
+      throw new Error('ACTIVE_WITHDRAWAL_EXISTS');
+    }
+
+    // Enforce max active rentals from settings.
+    const rentalSettingsRes = await client.query("SELECT value FROM app_settings WHERE key = 'rental'");
+    const rent = rentalSettingsRes.rows[0]?.value || {};
+    maxRentalsPerUser = Number(rent.max_rental_batteries_per_user ?? 1);
+
+    const activeRentalCountRes = await client.query(
+      `SELECT COUNT(*)::int AS cnt FROM deposits
+       WHERE user_id = $1 AND session_type = 'rental' AND status IN ('pending', 'in_progress')`,
+      [firebaseUid]
+    );
+    const activeRentalCount = activeRentalCountRes.rows[0].cnt;
+    if (activeRentalCount >= maxRentalsPerUser) {
+      throw new Error('RENTAL_LIMIT_REACHED');
     }
 
     // 1. The user must own a deposit credit (their battery charging right now).
@@ -198,6 +223,7 @@ router.post('/rentals/issue', verifyFirebaseToken, async (req, res) => {
       `SELECT 1
        FROM batteries b
        WHERE b.id = $1
+         AND b.withdrawn_at IS NULL
          AND ${noDepositOwnerExpr('b')}
          AND NOT EXISTS (
            SELECT 1 FROM deposits r
@@ -251,8 +277,11 @@ router.post('/rentals/issue', verifyFirebaseToken, async (req, res) => {
   } catch (error) {
     await client.query('ROLLBACK');
 
-    if (error.message === 'ACTIVE_SESSION_EXISTS') {
-      return res.status(409).json({ error: 'Active session exists', message: 'You already have an active rental or withdrawal. Complete it first.' });
+    if (error.message === 'ACTIVE_WITHDRAWAL_EXISTS') {
+      return res.status(409).json({ error: 'Active withdrawal', message: 'You have an active withdrawal in progress. Complete it first.' });
+    }
+    if (error.message === 'RENTAL_LIMIT_REACHED') {
+      return res.status(409).json({ error: 'Rental limit reached', message: `You have reached the maximum number of concurrent rentals (${maxRentalsPerUser}).` });
     }
     if (error.message === 'NO_DEPOSITED_BATTERY') {
       return res.status(404).json({ error: 'No deposited battery', message: 'Deposit your own battery first so it can charge while you rent.' });
@@ -549,18 +578,29 @@ async function computeRentalBill(client, rental) {
   const durationMs = new Date() - new Date(rental.created_at);
   const durationMinutes = Math.max(0, Math.round(durationMs / 60000));
 
-  const settingsRes = await client.query("SELECT value FROM app_settings WHERE key = 'pricing'");
-  if (settingsRes.rows.length === 0) {
-    throw new Error('PRICING_NOT_CONFIGURED');
-  }
-  const p = settingsRes.rows[0].value;
+  // --- Pricing: prefer new `rental` settings; fall back to legacy `pricing` keys ---
+  const [rentalSettingsRes, pricingRes] = await Promise.all([
+    client.query("SELECT value FROM app_settings WHERE key = 'rental'"),
+    client.query("SELECT value FROM app_settings WHERE key = 'pricing'"),
+  ]);
+  const rent = rentalSettingsRes.rows[0]?.value || null;
+  const p = pricingRes.rows[0]?.value || {};
   const baseSwapFee = Number(p.base_swap_fee || 0);
   const costPerChargePercent = Number(p.cost_per_charge_percent || 0);
-  const rentalTimeFeePerMinute = Number(p.rental_time_fee_per_minute || 0);
-  const rentalEnergyRatePerPercent = Number(p.rental_energy_rate_per_percent || 0);
+
+  // Time rate: new `rental` key first, then legacy pricing key.
+  const rentalTimeFeePerMinute = rent != null
+    ? Number(rent.rental_time_rate_per_minute ?? 0)
+    : Number(p.rental_time_fee_per_minute || 0);
+
+  // Energy rate: new key is per full battery (KES/kWh → per 100%-points = rate/100).
+  // Legacy key is already per %-point so no division needed.
+  const energyRatePerPoint = rent != null
+    ? Number(rent.rental_energy_rate_per_kwh ?? 0) / 100
+    : Number(p.rental_energy_rate_per_percent || 0);
 
   const ownChargingCost = Math.max(baseSwapFee, ownGained * costPerChargePercent);
-  const rentalEnergyCost = energyGone * rentalEnergyRatePerPercent;
+  const rentalEnergyCost = energyGone * energyRatePerPoint;
   const rentalTimeCost = durationMinutes * rentalTimeFeePerMinute;
   const amount = Number((ownChargingCost + rentalEnergyCost + rentalTimeCost).toFixed(2));
 
