@@ -7,6 +7,7 @@ const {
   finalizeRentalOwnCollection,
   handleRentalReturnCompletion,
 } = require('./sessionUtils');
+const { reconcileSlotDeposit } = require('./depositReconcile');
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -211,14 +212,28 @@ async function handleDepositCompletion(pgClient, boothUid, slotIdentifier, slotI
           'UPDATE booth_slots SET current_battery_id = $1 WHERE id = $2',
           [batteryId, slotId]
         );
-        await pgClient.query(
-          'UPDATE deposits SET battery_id = $1 WHERE id = $2',
-          [batteryId, depositId]
-        );
         logger.info(`Linked new battery ${batteryUid} (id=${batteryId}) to slot ${slotIdentifier} for deposit ${depositId}.`);
       }
     } catch (batteryError) {
       logger.error(`Failed to create/link battery for slot ${slotIdentifier}:`, batteryError);
+    }
+
+    // Backfill the deposit's battery_id when the slot ALREADY had a linked battery
+    // (pre-seeded battery, admin simulation, or a previous linking run). The branch
+    // above only sets battery_id when it creates a brand-new battery record, which
+    // left recent hardware deposits with a NULL battery_id even though the battery
+    // is physically (and telemetrically) present in the slot. Keeping this column
+    // populated is what lets strict battery-matching queries work on new deposits.
+    try {
+      await pgClient.query(
+        `UPDATE deposits d
+         SET battery_id = COALESCE(d.battery_id, s.current_battery_id)
+         FROM booth_slots s
+         WHERE d.id = $1 AND s.id = $2`,
+        [depositId, slotId]
+      );
+    } catch (backfillError) {
+      logger.error(`Failed to backfill battery_id for deposit ${depositId} on slot ${slotIdentifier}:`, backfillError);
     }
 
     // Automatically send command to start charging the newly deposited battery.
@@ -370,6 +385,17 @@ async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
       );
       if (orphanResult.rowCount > 0) {
         logger.warn(`Cleaned up ${orphanResult.rowCount} orphaned deposit(s) for slot ${slotIdentifier} (${dbStatus} -> available).`);
+      }
+    }
+
+    // 5b. Self-healing reconcile: if the battery is physically present and the slot
+    // is occupied, re-complete any deposit that was wrongly marked 'failed' (e.g. by
+    // a transient telemetry flicker that briefly reported the battery as absent).
+    if (batteryInserted && newStatus === 'occupied') {
+      try {
+        await reconcileSlotDeposit(pgClient, slotId, slotIdentifier);
+      } catch (reconcileError) {
+        logger.error(`Failed to reconcile deposit for slot ${slotIdentifier}:`, reconcileError);
       }
     }
 

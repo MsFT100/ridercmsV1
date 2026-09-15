@@ -93,6 +93,7 @@ describe('Admin Routes Smoke Test', () => {
     { method: 'GET', path: '/booths/:boothUid/slots/:slotIdentifier/withdrawal-info' },
     { method: 'POST', path: '/booths/:boothUid/reset-slots' },
     { method: 'POST', path: '/booths/:boothUid/slots/:slotIdentifier/manual-withdraw' },
+    { method: 'POST', path: '/booths/:boothUid/slots/:slotIdentifier/reconcile-deposit' },
 
     { method: 'GET', path: '/problem-reports' },
     { method: 'POST', path: '/problem-reports/:reportId/status' },
