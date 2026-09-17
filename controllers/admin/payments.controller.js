@@ -3,6 +3,7 @@ const logger = require('../../utils/logger.js');
 const poolPromise = require('../../db');
 const { verifyFirebaseToken, isAdmin } = require('../../middleware/auth');
 const { initiateSTKPush, querySTKStatus } = require('../../utils/mpesa');
+const { completePaidWithdrawal } = require('../../utils/sessionUtils');
 
 const router = Router();
 
@@ -293,25 +294,22 @@ router.post('/payments/manual-withdraw', [verifyFirebaseToken, isAdmin], async (
       }
     }
 
-    // 4. Create a manual withdrawal session
-    let insertQuery, insertParams;
-    if (boothId && slotId) {
-      insertQuery = `INSERT INTO deposits (user_id, booth_id, slot_id, session_type, status, amount, consumed_deposit_id, notes)
-                     VALUES ($1, $2, $3, 'withdrawal', 'pending', $4, $5, 'manual_withdrawal')
-                     RETURNING id`;
-      insertParams = [userId, boothId, slotId, amount, consumedDepositId];
-    } else {
-      // Fallback for standalone usage (no slot context) — omit booth/slot
-      insertQuery = `INSERT INTO deposits (user_id, session_type, status, amount, notes)
-                     VALUES ($1, 'withdrawal', 'pending', $2, 'manual_withdrawal')
-                     RETURNING id`;
-      insertParams = [userId, amount];
+    // 4. A withdrawal session must be tied to a specific booth slot.
+    //    (deposits.booth_id and deposits.slot_id are NOT NULL.)
+    if (!boothId || !slotId) {
+      return res.status(400).json({ error: 'boothUid and slotIdentifier are required for a manual withdrawal.' });
     }
 
-    const sessionRes = await client.query(insertQuery, insertParams);
+    // 5. Create a manual withdrawal session
+    const sessionRes = await client.query(
+      `INSERT INTO deposits (user_id, booth_id, slot_id, session_type, status, amount, consumed_deposit_id, notes)
+       VALUES ($1, $2, $3, 'withdrawal', 'pending', $4, $5, 'manual_withdrawal')
+       RETURNING id`,
+      [userId, boothId, slotId, amount, consumedDepositId]
+    );
     const sessionId = sessionRes.rows[0].id;
 
-    // 5. Dev mode: skip M-Pesa, auto-approve
+    // 6. Dev mode: skip M-Pesa, auto-approve
     if (req.user.role === 'developer') {
       const devCheckoutId = `DEV_MANUAL_${sessionId}_${Date.now()}`;
       await client.query(
@@ -353,7 +351,7 @@ router.post('/payments/manual-withdraw', [verifyFirebaseToken, isAdmin], async (
       });
     }
 
-    // 6. Production: trigger M-Pesa STK push
+    // 7. Production: trigger M-Pesa STK push
     const safePhone = phoneNumber.replace(/[^0-9]/g, '');
     const mpesaResponse = await initiateSTKPush({
       phone: safePhone,
@@ -440,8 +438,10 @@ router.get('/payments/status/:sessionId', [verifyFirebaseToken, isAdmin], async 
         try {
           const mpesaResponse = await querySTKStatus(session.mpesa_checkout_id);
           const { ResultCode } = mpesaResponse.data;
-          if (ResultCode === '0') {
-            await client.query("UPDATE deposits SET status = 'in_progress', completed_at = NOW() WHERE id = $1", [sessionId]);
+          // Safaricom returns ResultCode as a number (0); the callback handler
+          // also treats it as such. Use a numeric compare to be safe.
+          if (Number(ResultCode) === 0) {
+            await completePaidWithdrawal(client, session.mpesa_checkout_id);
             return res.status(200).json({ success: true, status: 'in_progress', sessionId: session.id });
           }
         } catch (e) {

@@ -520,7 +520,8 @@ router.get('/withdrawal-status/:checkoutRequestId', verifyFirebaseToken, async (
       const mpesaStatusResponse = await querySTKStatus(checkoutRequestId);
       const { ResultCode, ResultDesc } = mpesaStatusResponse.data;
 
-      if (ResultCode === '0') {
+      // Safaricom returns ResultCode as a number (0) in the query response.
+      if (Number(ResultCode) === 0) {
         // The payment was successful. Manually trigger the same logic as the callback.
         logger.info(`M-Pesa query confirmed payment for ${checkoutRequestId}. Manually completing session.`);
         await completePaidWithdrawal(client, checkoutRequestId);

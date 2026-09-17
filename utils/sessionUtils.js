@@ -76,13 +76,12 @@ async function completePaidWithdrawal(client, checkoutRequestId) {
   // Note: This function is designed to be called from within an existing transaction.
   // It does not handle BEGIN/COMMIT/ROLLBACK itself.
   try {
-    // 1. Find and lock the specific session row to prevent race conditions.
+    // 1. Find and lock the specific session row (mpesa_checkout_id is UNIQUE),
+    //    preventing race conditions without needing booth/slot joins.
     const sessionRes = await client.query(
-      `SELECT d.id, d.status, d.user_id, d.amount
-       FROM deposits d
-       JOIN booth_slots s ON d.slot_id = s.id
-       JOIN booths b ON s.booth_id = b.id
-       WHERE d.mpesa_checkout_id = $1 AND d.session_type = 'withdrawal'
+      `SELECT id, status, user_id, amount
+       FROM deposits
+       WHERE mpesa_checkout_id = $1 AND session_type = 'withdrawal'
        FOR UPDATE;`,
       [checkoutRequestId]
     );

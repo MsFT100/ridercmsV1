@@ -34,8 +34,8 @@ async function runMpesaReconciliation() {
         logger.debug(`[Reconciliation] Querying M-Pesa for CheckoutID: ${checkoutRequestId}`);
         const mpesaResponse = await querySTKStatus(checkoutRequestId);
         
-        // The query API returns ResultCode '0' for a successful transaction
-        if (mpesaResponse.data.ResultCode === '0') {
+        // The query API returns ResultCode 0 (numeric or string) for a successful transaction
+        if (Number(mpesaResponse.data.ResultCode) === 0) {
           const metadata = parseMetadata(mpesaResponse.data.CallbackMetadata);
           const actualReceipt = metadata.MpesaReceiptNumber;
           const actualAmount = metadata.Amount;
