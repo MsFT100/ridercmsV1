@@ -1,0 +1,1 @@
+module.exports = require('../../controllers/booths/rental.controller');

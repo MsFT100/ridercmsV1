@@ -75,6 +75,14 @@ describe('Booths Routes Smoke Test', () => {
     { method: 'GET', path: '/history' },
     { method: 'POST', path: '/report-problem' },
     { method: 'POST', path: '/release-battery' },
+    { method: 'GET', path: '/rentals/available' },
+    { method: 'POST', path: '/rentals/issue' },
+    { method: 'GET', path: '/rentals/active' },
+    { method: 'POST', path: '/rentals/:sessionId/return' },
+    { method: 'GET', path: '/rentals/:sessionId/bill' },
+    { method: 'POST', path: '/rentals/:sessionId/pay' },
+    { method: 'GET', path: '/rentals/status/:checkoutRequestId' },
+    { method: 'POST', path: '/rentals/:sessionId/unlock-own' },
   ];
 
   test('includes exactly the expected booth routes (method + path)', () => {

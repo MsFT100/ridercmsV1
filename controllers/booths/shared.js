@@ -89,7 +89,7 @@ const WITHDRAWAL_BATTERY_QUERY = `
     AND NOT EXISTS (
       SELECT 1 FROM deposits w
       WHERE w.consumed_deposit_id = d.id
-        AND w.session_type = 'withdrawal'
+        AND w.session_type IN ('withdrawal', 'rental')
         AND w.status NOT IN ('cancelled', 'failed')
     )
   ORDER BY d.completed_at DESC
@@ -117,7 +117,7 @@ const WITHDRAWAL_BATTERY_BY_ID_QUERY = `
     AND NOT EXISTS (
       SELECT 1 FROM deposits w
       WHERE w.consumed_deposit_id = d.id
-        AND w.session_type = 'withdrawal'
+        AND w.session_type IN ('withdrawal', 'rental')
         AND w.status NOT IN ('cancelled', 'failed')
     );
 `;

@@ -70,6 +70,9 @@ const initializeDatabase = async () => {
         battery_uid VARCHAR(100) UNIQUE NOT NULL, -- A unique serial number for the battery
         charge_level_percent INT DEFAULT 100 CHECK (charge_level_percent BETWEEN 0 AND 100),
         health_status VARCHAR(50) NOT NULL DEFAULT 'good' CHECK (health_status IN ('good', 'degraded', 'faulty')),
+        withdrawn_at TIMESTAMPTZ, -- When an admin withdrew the battery from the rental pool
+        withdrawal_reason VARCHAR(255), -- Reason the battery was withdrawn (e.g. 'Damaged')
+        withdrawal_notes TEXT,
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW(),
         UNIQUE(battery_uid)
@@ -102,7 +105,7 @@ const initializeDatabase = async () => {
         slot_id INT NOT NULL REFERENCES booth_slots(id),
         battery_id INT REFERENCES batteries(id) ON DELETE SET NULL,
         consumed_deposit_id INT REFERENCES deposits(id) ON DELETE SET NULL, -- Links a withdrawal to the deposit it consumes
-        session_type VARCHAR(20) NOT NULL CHECK (session_type IN ('deposit', 'withdrawal')),
+        session_type VARCHAR(20) NOT NULL CHECK (session_type IN ('deposit', 'withdrawal', 'rental')),
         initial_charge_level INT, -- Stored on deposit
         amount DECIMAL(10, 2) NOT NULL DEFAULT 0.00, -- Amount charged for the session
         mpesa_checkout_id VARCHAR(255) UNIQUE, -- For tracking payment status
@@ -192,12 +195,48 @@ const initializeDatabase = async () => {
       "Added 'consumed_deposit_id' column to 'deposits' table."
     );
 
+    // Add 'return_slot_id' column to 'deposits' (rental returns)
+    await runAlteration(
+      'deposits',
+      'return_slot_id',
+      'ALTER TABLE deposits ADD COLUMN return_slot_id INT REFERENCES booth_slots(id) ON DELETE SET NULL;',
+      "Added 'return_slot_id' column to 'deposits' table."
+    );
+
+    // Add rental withdrawal tracking columns to 'batteries'
+    await runAlteration(
+      'batteries',
+      'withdrawn_at',
+      'ALTER TABLE batteries ADD COLUMN withdrawn_at TIMESTAMPTZ;',
+      "Added 'withdrawn_at' column to 'batteries' table."
+    );
+    await runAlteration(
+      'batteries',
+      'withdrawal_reason',
+      'ALTER TABLE batteries ADD COLUMN withdrawal_reason VARCHAR(255);',
+      "Added 'withdrawal_reason' column to 'batteries' table."
+    );
+    await runAlteration(
+      'batteries',
+      'withdrawal_notes',
+      'ALTER TABLE batteries ADD COLUMN withdrawal_notes TEXT;',
+      "Added 'withdrawal_notes' column to 'batteries' table."
+    );
+
     // Add 'redeemed' to the status check constraint on 'deposits'
     const checkConstraintRes = await client.query("SELECT 1 FROM pg_constraint WHERE conname = 'deposits_status_check' AND conrelid = 'deposits'::regclass AND pg_get_constraintdef(oid) LIKE '%redeemed%';");
     if (checkConstraintRes.rowCount === 0) {
       await client.query("ALTER TABLE deposits DROP CONSTRAINT deposits_status_check;");
       await client.query("ALTER TABLE deposits ADD CONSTRAINT deposits_status_check CHECK (status IN ('pending', 'opening', 'in_progress', 'completed', 'failed', 'cancelled', 'redeemed'));");
       logger.info("Updated 'deposits.status' CHECK constraint to include 'redeemed'.");
+    }
+
+    // Add 'rental' to the session_type check constraint on 'deposits'
+    const sessionTypeConstraintRes = await client.query("SELECT 1 FROM pg_constraint WHERE conname = 'deposits_session_type_check' AND pg_get_constraintdef(oid) LIKE '%rental%';");
+    if (sessionTypeConstraintRes.rowCount === 0) {
+      await client.query("ALTER TABLE deposits DROP CONSTRAINT deposits_session_type_check;");
+      await client.query("ALTER TABLE deposits ADD CONSTRAINT deposits_session_type_check CHECK (session_type IN ('deposit', 'withdrawal', 'rental'));");
+      logger.info("Added 'rental' to the 'deposits.session_type' CHECK constraint.");
     }
 
     // Add foreign key from deposits.user_id to users.user_id
@@ -265,7 +304,9 @@ const initializeDatabase = async () => {
         value: JSON.stringify({
           base_swap_fee: 5.00,
           cost_per_charge_percent: 10.00,
-          overtime_penalty_per_minute: 0.10
+          overtime_penalty_per_minute: 0.10,
+          rental_time_fee_per_minute: 0.20,
+          rental_energy_rate_per_percent: 10.00
         }),
         description: 'Pricing rules for battery swaps.'
       },
@@ -275,6 +316,22 @@ const initializeDatabase = async () => {
           min_charge_level: 95
         }),
         description: 'Rules governing when a user can withdraw a battery.'
+      },
+      {
+        key: 'rental',
+        value: JSON.stringify({
+          allocate_highest_soc_first: true,
+          minimum_soc_percent: 50,
+          max_rental_batteries_per_user: 1,
+          rental_time_limit_minutes: 60,
+          rental_energy_rate_per_kwh: 50,
+          rental_time_rate_per_minute: 10,
+          require_rental_scan_before_issue: true,
+          require_return_scan: true,
+          auto_charge_returned_battery: true,
+          allow_rental_while_own_battery_charging: true
+        }),
+        description: 'Battery rental pricing, allocation, duration and verification rules.'
       }
     ];
 
@@ -305,6 +362,15 @@ const initializeDatabase = async () => {
     for (const q of devQueries) {
       await client.query(q);
     }
+
+    // Mirror the public-schema alterations into the dev schema so the isolated
+    // dev booth flow behaves identically (e.g. rental returns need return_slot_id).
+    await runAlteration('deposits', 'notes', 'ALTER TABLE deposits ADD COLUMN notes TEXT;', "Added 'notes' column to 'dev.deposits' table.");
+    await runAlteration('deposits', 'return_slot_id', 'ALTER TABLE deposits ADD COLUMN return_slot_id INT REFERENCES booth_slots(id) ON DELETE SET NULL;', "Added 'return_slot_id' column to 'dev.deposits' table.");
+    await runAlteration('batteries', 'withdrawn_at', 'ALTER TABLE batteries ADD COLUMN withdrawn_at TIMESTAMPTZ;', "Added 'withdrawn_at' column to 'dev.batteries' table.");
+    await runAlteration('batteries', 'withdrawal_reason', 'ALTER TABLE batteries ADD COLUMN withdrawal_reason VARCHAR(255);', "Added 'withdrawal_reason' column to 'dev.batteries' table.");
+    await runAlteration('batteries', 'withdrawal_notes', 'ALTER TABLE batteries ADD COLUMN withdrawal_notes TEXT;', "Added 'withdrawal_notes' column to 'dev.batteries' table.");
+
     await client.query('SET search_path TO public');
 
     logger.info('Dev schema initialized with mirrored tables.');

@@ -101,6 +101,8 @@ async function seed() {
         { uid: 'DEV-BAT-003', charge: 100, health: 'good' },
         { uid: 'DEV-BAT-004', charge: 34, health: 'degraded' },
         { uid: 'DEV-BAT-005', charge: 97, health: 'good' },
+        { uid: 'DEV-RENT-001', charge: 100, health: 'good' },
+        { uid: 'DEV-RENT-002', charge: 98, health: 'good' },
       ];
 
       for (const bat of batteries) {
@@ -113,7 +115,34 @@ async function seed() {
           [bat.uid, bat.charge, bat.health]
         );
       }
-      console.log('[DB] Seeded 5 virtual batteries');
+      console.log('[DB] Seeded 7 virtual batteries');
+
+      // --- Rental pool: stock unowned batteries into occupied slots ---
+      // These slots are 'occupied' with a battery but have NO deposit owner,
+      // so the rental service treats them as borrowable pool stock.
+      const poolStocks = [
+        { booth: 'dev-booth-alpha', slot: 'A1', batteryUid: 'DEV-RENT-001' },
+        { booth: 'dev-booth-beta', slot: 'B1', batteryUid: 'DEV-RENT-002' },
+      ];
+
+      for (const stock of poolStocks) {
+        const boothId = boothMap[stock.booth];
+        const batteryRes = await client.query(
+          'SELECT id, charge_level_percent FROM batteries WHERE battery_uid = $1',
+          [stock.batteryUid]
+        );
+        if (boothId && batteryRes.rowCount > 0) {
+          const battery = batteryRes.rows[0];
+          await client.query(
+            `UPDATE booth_slots
+             SET status = 'occupied', current_battery_id = $1, charge_level_percent = $2,
+                 is_charging = true, door_status = 'closed', telemetry = NULL
+             WHERE booth_id = $3 AND slot_identifier = $4`,
+            [battery.id, battery.charge_level_percent, boothId, stock.slot]
+          );
+        }
+      }
+      console.log('[DB] Seeded 2 rental-pool batteries in occupied slots');
 
       // --- App Settings (dev-specific) ---
       const devSettings = [
@@ -123,6 +152,8 @@ async function seed() {
             base_swap_fee: 0.00,
             cost_per_charge_percent: 0.00,
             overtime_penalty_per_minute: 0.00,
+            rental_time_fee_per_minute: 0.00,
+            rental_energy_rate_per_percent: 0.00,
           }),
           description: 'Dev pricing — all fees waived',
         },
@@ -130,6 +161,22 @@ async function seed() {
           key: 'withdrawal_rules',
           value: JSON.stringify({ min_charge_level: 0 }),
           description: 'Dev rules — no minimum charge required',
+        },
+        {
+          key: 'rental',
+          value: JSON.stringify({
+            allocate_highest_soc_first: true,
+            minimum_soc_percent: 0,
+            max_rental_batteries_per_user: 1,
+            rental_time_limit_minutes: 60,
+            rental_energy_rate_per_kwh: 0.00,
+            rental_time_rate_per_minute: 0.00,
+            require_rental_scan_before_issue: false,
+            require_return_scan: false,
+            auto_charge_returned_battery: true,
+            allow_rental_while_own_battery_charging: true,
+          }),
+          description: 'Dev rental rules — all fees waived, no minimum charge required',
         },
       ];
 

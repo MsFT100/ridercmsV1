@@ -3,7 +3,7 @@ const { Router } = require('express');
 const poolPromise = require('../db');
 const logger = require('../utils/logger');
 const { getMpesaIpWhitelist, parseMetadata } = require('../utils/mpesa');
-const { completePaidWithdrawal } = require('../utils/sessionUtils');
+const { completePaidWithdrawal, completePaidRental } = require('../utils/sessionUtils');
 
 const router = Router();
 
@@ -93,9 +93,12 @@ router.post('/callback', async (req, res) => {
 
     // 3. Update Session State
     if (Number(ResultCode) === 0) {
-      // Success: move the withdrawal session to 'in_progress' and notify the user via FCM.
-      const processed = await completePaidWithdrawal(client, CheckoutRequestID);
-      
+      // Success: complete the session that owns this checkout request.
+      // Try withdrawal completion first, then rental completion — each is
+      // idempotent and session-type-scoped, so only the matching one applies.
+      const processed = await completePaidWithdrawal(client, CheckoutRequestID)
+        || await completePaidRental(client, CheckoutRequestID);
+
       if (processed) {
         logger.info(`[MpesaCallback] Successfully confirmed payment ${receiptNumber} for ${CheckoutRequestID}. Amount: ${transactionAmount}`);
       } else {

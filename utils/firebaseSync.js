@@ -1,7 +1,12 @@
 const { getDatabase } = require('firebase-admin/database');
 const pool = require('../db');
 const logger = require('./logger');
-const { finalizeWithdrawalSession } = require('./sessionUtils');
+const {
+  finalizeWithdrawalSession,
+  finalizeRentalCollection,
+  finalizeRentalOwnCollection,
+  handleRentalReturnCompletion,
+} = require('./sessionUtils');
 const { reconcileSlotDeposit } = require('./depositReconcile');
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -348,6 +353,16 @@ async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
     }
     logger.debug(`Successfully synced slot ${slotIdentifier} for booth ${boothUid}.`);
 
+    // 4b. Telemetry-only fallback for rental collection: if a battery leaves a slot
+    // that had a pending rental issued from it (no 'collection_complete' ACK arrived),
+    // the rental just started — flip it to 'in_progress'.
+    if (batteryCleared) {
+      const rentalCollected = await finalizeRentalCollection(pgClient, slotId, slotIdentifier);
+      if (rentalCollected) {
+        logger.info(`Telemetry confirmed rental battery collected from ${slotIdentifier}.`);
+      }
+    }
+
     // 5. Defensive cleanup: If the slot just transitioned to 'available' from a non-available
     // state (battery physically removed), fail any orphaned unredeemed completed deposits.
     // This is the critical safety net that prevents double-allocation: without this, a stale
@@ -387,6 +402,17 @@ async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
     // --- Event-driven logic based on hardware ACK messages ---
     const ackMessage = slotData.command?.ack;
 
+    // Telemetry-only fallback for rental returns: if a battery becomes physically
+    // present, it may be a rented battery dropped into its reserved return slot.
+    // Normal deposits are unaffected (handleRentalReturnCompletion matches only
+    // slots reserved via deposits.return_slot_id).
+    if (batteryInserted && newStatus === 'opening') {
+      const rentalReturned = await handleRentalReturnCompletion(pgClient, slotId, slotIdentifier, soc);
+      if (rentalReturned) {
+        logger.info(`Telemetry confirmed rental battery returned to ${slotIdentifier}.`);
+      }
+    }
+
     if (ackMessage) {
       const db = getDatabase();
       const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
@@ -414,32 +440,44 @@ async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
         }
 
         case 'collection_complete': {
-          // This is the definitive signal that a user has taken their battery.
-          logger.info(`Received 'collection_complete' ACK for slot ${slotIdentifier}. Finalizing withdrawal session.`);
+          // This is the definitive signal that a user has taken a battery from a slot.
+          logger.info(`Received 'collection_complete' ACK for slot ${slotIdentifier}. Resolving session finalization.`);
           try {
-            // Use the centralized handler
-            if (!await handleWithdrawalCompletion(pgClient, slotIdentifier, slotId)) {
-              logger.warn(`'collection_complete' ACK for ${slotIdentifier} received, but no 'in_progress' session was found to complete.`);
+            // The slot may belong to: a completed rental (user collecting their own
+            // charged battery), a pending rental (user collecting the rented battery),
+            // or an in-progress withdrawal. Each handler checks its own state.
+            const ownCollected = await finalizeRentalOwnCollection(pgClient, slotId, slotIdentifier);
+            const rentalCollected = ownCollected ? false : await finalizeRentalCollection(pgClient, slotId, slotIdentifier);
+            const withdrawalCompleted = (ownCollected || rentalCollected) ? false : await handleWithdrawalCompletion(pgClient, slotIdentifier, slotId);
+
+            if (!ownCollected && !rentalCollected && !withdrawalCompleted) {
+              logger.warn(`'collection_complete' ACK for ${slotIdentifier} received, but no matching session was found to complete.`);
             }
             // Clear command and ACK to stop hardware reporting
             await commandRef.update({ openForCollection: false, ack: "" });
           } catch (dbError) {
-            logger.error(`Failed to finalize withdrawal session in DB for slot ${slotIdentifier} after 'collection_complete' ACK:`, dbError);
+            logger.error(`Failed to finalize session in DB for slot ${slotIdentifier} after 'collection_complete' ACK:`, dbError);
           }
           break;
         }
 
         case 'deposit_accepted': {
           // This is the definitive signal that a user has successfully deposited a battery.
-          logger.info(`Received 'deposit_accepted' ACK for slot ${slotIdentifier}. Finalizing deposit session.`);
+          logger.info(`Received 'deposit_accepted' ACK for slot ${slotIdentifier}. Finalizing deposit or rental-return session.`);
           try {
-            if (!await handleDepositCompletion(pgClient, boothUid, slotIdentifier, slotId, telemetry)) {
-              logger.warn(`'deposit_accepted' ACK for ${slotIdentifier} received, but no 'opening' session was found to complete.`);
+            const depositCompleted = await handleDepositCompletion(pgClient, boothUid, slotIdentifier, slotId, telemetry);
+            if (!depositCompleted) {
+              const rentalReturned = await handleRentalReturnCompletion(
+                pgClient, slotId, slotIdentifier, getChargeSocFromTelemetry(telemetry)
+              );
+              if (!rentalReturned) {
+                logger.warn(`'deposit_accepted' ACK for ${slotIdentifier} received, but no 'opening' session was found to complete.`);
+              }
             }
             // Clear command and ACK
             await commandRef.update({ openForDeposit: false, ack: "" });
           } catch (dbError) {
-            logger.error(`Failed to finalize deposit session in DB for slot ${slotIdentifier} after 'deposit_accepted' ACK:`, dbError);
+            logger.error(`Failed to finalize deposit/rental-return session in DB for slot ${slotIdentifier} after 'deposit_accepted' ACK:`, dbError);
           }
           break;
         }
