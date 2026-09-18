@@ -673,7 +673,7 @@ router.post('/rentals', [verifyFirebaseToken, isAdmin], async (req, res) => {
     await client.query('BEGIN');
 
     const slotRes = await client.query(
-      `SELECT s.id AS "slotId", s.booth_id AS "boothId", s.charge_level_percent AS "slotChargeLevel"
+      `SELECT s.id AS "slotId", s.booth_id AS "boothId", s.status AS "slotStatus", s.charge_level_percent AS "slotChargeLevel"
        FROM booth_slots s
        JOIN booths b ON s.booth_id = b.id
        WHERE b.booth_uid = $1 AND s.slot_identifier = $2
@@ -684,7 +684,13 @@ router.post('/rentals', [verifyFirebaseToken, isAdmin], async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Booth or slot not found.' });
     }
-    const { slotId, slotChargeLevel } = slotRes.rows[0];
+    const { slotId, slotStatus, slotChargeLevel } = slotRes.rows[0];
+
+    // Rental batteries may only be placed into empty slots.
+    if (slotStatus !== 'available') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'Slot is not available. Only empty slots can receive a rental battery.' });
+    }
 
     // Resolve the battery's charge level. The battery is already sitting in
     // the slot, so prefer the live SOC from the booth hardware telemetry;

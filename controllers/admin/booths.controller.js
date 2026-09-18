@@ -276,9 +276,13 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
               userPhone: slotUserPhoneMap[slotIdentifier] || null,
               pendingManualUnlock: slotManualUnlockMap[slotIdentifier] || false,
               telemetry: telemetry,
-              // The battery object contains the most up-to-date info
+              // The battery object contains the most up-to-date info.
+              // `telemetry.batteryInserted` is the source of truth for a
+              // battery being physically in the slot (see SYSTEM_CRITERIA.md).
+              // `devicePresent` is NOT a reliable occupancy signal, so it is
+              // ignored here.
               battery: {
-                isOccupied: slotData.battery === true || slotData.devicePresent === true,
+                isOccupied: telemetry.batteryInserted === true || slotData.battery === true,
                 chargeLevel: telemetry.soc || slotData.soc || 0,
                 voltage: telemetry.voltage,
                 temperature: telemetry.temperatureC,
