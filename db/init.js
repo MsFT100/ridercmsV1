@@ -324,6 +324,7 @@ const initializeDatabase = async () => {
           minimum_soc_percent: 50,
           max_rental_batteries_per_user: 1,
           rental_time_limit_minutes: 60,
+          rental_energy_rate_per_percent: 0.5,
           rental_energy_rate_per_kwh: 50,
           rental_time_rate_per_minute: 10,
           require_rental_scan_before_issue: true,

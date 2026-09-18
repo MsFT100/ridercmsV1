@@ -169,6 +169,7 @@ async function seed() {
             minimum_soc_percent: 0,
             max_rental_batteries_per_user: 1,
             rental_time_limit_minutes: 60,
+            rental_energy_rate_per_percent: 0.00,
             rental_energy_rate_per_kwh: 0.00,
             rental_time_rate_per_minute: 0.00,
             require_rental_scan_before_issue: false,

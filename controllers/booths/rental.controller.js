@@ -635,10 +635,15 @@ async function computeRentalBill(client, rental) {
     ? Number(rent.rental_time_rate_per_minute ?? 0)
     : Number(p.rental_time_fee_per_minute || 0);
 
-  // Energy rate: new key is per full battery (KES/kWh → per 100%-points = rate/100).
-  // Legacy key is already per %-point so no division needed.
+  // Energy rate: preferred key bills per 1% of SOC consumed.
+  // Legacy `rental_energy_rate_per_kwh` (KES per full battery) is still
+  // honoured by dividing by 100 when the per-% key is not set.
   const energyRatePerPoint = rent != null
-    ? Number(rent.rental_energy_rate_per_kwh ?? 0) / 100
+    ? Number(rent.rental_energy_rate_per_percent ?? (
+        rent.rental_energy_rate_per_kwh != null
+          ? Number(rent.rental_energy_rate_per_kwh) / 100
+          : 0
+      ))
     : Number(p.rental_energy_rate_per_percent || 0);
 
   const ownChargingCost = Math.max(baseSwapFee, ownGained * costPerChargePercent);
