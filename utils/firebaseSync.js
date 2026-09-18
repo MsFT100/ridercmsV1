@@ -9,7 +9,7 @@ const {
   completeAdminRentalPlacement,
   revertAdminRentalPlacement,
 } = require('./sessionUtils');
-const { reconcileSlotDeposit } = require('./depositReconcile');
+const { reconcileSlotDeposit, ensureSlotBatteryLinked } = require('./depositReconcile');
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -180,9 +180,16 @@ async function handleDepositCompletion(pgClient, boothUid, slotIdentifier, slotI
       initial_charge_level = $1,
       completed_at = NOW()
     WHERE
-      slot_id = $2
-      AND status IN ('opening', 'occupied') -- The session must have been in an 'opening' or 'occupied' state.
-      AND session_type = 'deposit'
+      id = (
+        SELECT d.id
+        FROM deposits d
+        WHERE d.slot_id = $2
+          AND d.status IN ('opening', 'occupied') -- The session must have been in an 'opening' or 'occupied' state.
+          AND d.session_type = 'deposit'
+        ORDER BY d.created_at DESC, d.id DESC
+        LIMIT 1
+        FOR UPDATE
+      )
     RETURNING id;
   `;
   const depositUpdateResult = await pgClient.query(findAndUpdateDepositQuery, [chargeLevel, slotId]);
@@ -392,12 +399,23 @@ async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
 
     // 5b. Self-healing reconcile: if the battery is physically present and the slot
     // is occupied, re-complete any deposit that was wrongly marked 'failed' (e.g. by
-    // a transient telemetry flicker that briefly reported the battery as absent).
+    // a transient telemetry flicker that briefly reported the battery as absent), and
+    // re-link a battery record if the flicker cleared current_battery_id.
     if (batteryInserted && newStatus === 'occupied') {
       try {
         await reconcileSlotDeposit(pgClient, slotId, slotIdentifier);
       } catch (reconcileError) {
         logger.error(`Failed to reconcile deposit for slot ${slotIdentifier}:`, reconcileError);
+      }
+
+      // Independent of the failed-deposit reconcile above: an occupied slot may hold a
+      // completed deposit whose battery link (current_battery_id) was cleared by an
+      // earlier telemetry flicker. Re-link it so renter names, withdrawal-info and
+      // manual withdrawals keep working (see depositReconcile.
+      try {
+        await ensureSlotBatteryLinked(pgClient, slotId, slotIdentifier, soc);
+      } catch (linkError) {
+        logger.error(`Failed to re-link battery for slot ${slotIdentifier}:`, linkError);
       }
     }
 

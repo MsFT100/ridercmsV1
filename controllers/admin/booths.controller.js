@@ -54,6 +54,7 @@ router.get('/booths', [verifyFirebaseToken, isAdmin],
   const limit = parseInt(String(req.query.limit ?? ''), 10) || 25;
   const offset = parseInt(String(req.query.offset ?? ''), 10) || 0;
 
+
   const pool = await poolPromise;
   const client = await pool.connect();
   try {
