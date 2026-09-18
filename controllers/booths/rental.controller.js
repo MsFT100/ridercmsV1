@@ -35,6 +35,39 @@ const noDepositOwnerExpr = (batteryAlias = 'batteries') => `
 `;
 
 /**
+ * Reads the `rental` app setting to decide whether the rental battery
+ * feature is currently enabled for riders. Defaults to enabled.
+ * @param {import('pg').PoolClient} client - A connected pg client.
+ * @returns {Promise<boolean>} Whether the rental feature is enabled.
+ */
+const isRentalEnabled = async (client) => {
+  const settingsRes = await client.query("SELECT value FROM app_settings WHERE key = 'rental'");
+  const rent = settingsRes.rows[0]?.value || {};
+  return rent.enabled !== false;
+};
+
+/**
+ * GET /api/booths/rentals/status
+ * @summary Rental feature availability
+ * @description Returns whether the rental battery feature is enabled for riders.
+ * @tags [Booths]
+ * @security - bearerAuth: []
+ */
+router.get('/rentals/status', verifyFirebaseToken, async (req, res) => {
+  const pool = await poolPromise;
+  const client = await pool.connect(req.schema);
+  try {
+    const enabled = await isRentalEnabled(client);
+    res.status(200).json({ enabled });
+  } catch (error) {
+    logger.error('Failed to check rental feature status:', error);
+    res.status(500).json({ error: 'Failed to check rental feature status.' });
+  } finally {
+    client.release();
+  }
+});
+
+/**
  * GET /api/booths/rentals/available
  * @summary List borrowable (unowned) batteries at a booth
  * @description Returns occupied slots whose battery has no completed deposit credit
@@ -53,6 +86,10 @@ router.get('/rentals/available', verifyFirebaseToken, async (req, res) => {
   const pool = await poolPromise;
   const client = await pool.connect(req.schema);
   try {
+    if (!(await isRentalEnabled(client))) {
+      return res.status(403).json({ error: 'Rental feature is currently disabled.' });
+    }
+
     // Fetch rental allocation settings (fall back to sensible defaults).
     const settingsRes = await client.query("SELECT value FROM app_settings WHERE key = 'rental'");
     const rent = settingsRes.rows[0]?.value || {};
@@ -130,6 +167,11 @@ router.post('/rentals/issue', verifyFirebaseToken, async (req, res) => {
   const client = await pool.connect(req.schema);
   try {
     await client.query('BEGIN');
+
+    if (!(await isRentalEnabled(client))) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Rental feature is currently disabled.' });
+    }
 
     await client.query(
       'SELECT id FROM users WHERE user_id = $1 FOR UPDATE',

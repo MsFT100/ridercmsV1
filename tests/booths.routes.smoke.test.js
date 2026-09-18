@@ -75,6 +75,7 @@ describe('Booths Routes Smoke Test', () => {
     { method: 'GET', path: '/history' },
     { method: 'POST', path: '/report-problem' },
     { method: 'POST', path: '/release-battery' },
+    { method: 'GET', path: '/rentals/status' },
     { method: 'GET', path: '/rentals/available' },
     { method: 'POST', path: '/rentals/issue' },
     { method: 'GET', path: '/rentals/active' },
