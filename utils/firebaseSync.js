@@ -336,7 +336,11 @@ async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
     // 4. Update the database.
     // When the battery is physically removed, also clear current_battery_id to prevent
     // stale deposit credits from being usable against a slot that will be reassigned.
-    const batteryCleared = !batteryInserted && dbStatus !== 'available' && dbStatus !== 'opening';
+    // Only consider the battery "cleared" if the door is not locked — if doorLocked is true
+    // the battery physically cannot have left the slot, so a transient telemetry flicker
+    // should not clear the link or fail deposits.
+    const doorLocked = !!telemetry.doorLocked;
+    const batteryCleared = !batteryInserted && !doorLocked && dbStatus !== 'available' && dbStatus !== 'opening';
     const result = await pgClient.query(
       `UPDATE booth_slots 
        SET 
@@ -376,7 +380,7 @@ async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
     // state (battery physically removed), fail any orphaned unredeemed completed deposits.
     // This is the critical safety net that prevents double-allocation: without this, a stale
     // deposit credit from a previous user would remain 'completed' when the slot is reassigned.
-    if (newStatus === 'available' && dbStatus !== 'available' && dbStatus !== 'opening') {
+    if (newStatus === 'available' && dbStatus !== 'available' && dbStatus !== 'opening' && batteryCleared) {
       const orphanResult = await pgClient.query(
         `UPDATE deposits
          SET status = 'failed',

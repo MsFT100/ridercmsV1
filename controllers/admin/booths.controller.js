@@ -1027,23 +1027,11 @@ router.post('/booths/:boothUid/slots/:slotIdentifier/command', [verifyFirebaseTo
         );
       }
 
-      // If no in_progress withdrawal was found, mark any orphaned completed deposit on this slot
-      // as 'failed' so it doesn't appear as an active session to the user.
-      // Also clear the notes on stale manual-withdrawal sessions so the pending_manual_unlock
-      // query stops flagging them.
+      // If no in_progress withdrawal was found, the slot is being cleared.
+      // Do NOT fail completed deposits — doing so destroys user credits.
+      // Only clear the notes on stale manual-withdrawal sessions so the
+      // pending_manual_unlock query stops flagging them.
       if (updateResult.rowCount === 0) {
-        await pgClient.query(`
-          UPDATE deposits
-          SET status = 'failed',
-              notes = COALESCE(notes, '') || '\n[' || NOW() || '] Slot force-unlocked with no active withdrawal.'
-          WHERE slot_id = (
-            SELECT s.id FROM booth_slots s
-            JOIN booths b ON s.booth_id = b.id
-            WHERE b.booth_uid = $1 AND s.slot_identifier = $2
-          )
-            AND session_type = 'deposit' AND status = 'completed'
-        `, [boothUid, slotIdentifier]);
-
         await pgClient.query(`
           UPDATE deposits
           SET notes = COALESCE(notes, '') || '\n[' || NOW() || '] Slot force-unlocked — already completed.'

@@ -25,11 +25,15 @@ function normalizeSoc(rawSoc) {
  * completed deposit exists. This helper re-creates the link so those flows work
  * again without loosening any query guards.
  *
- * Safe to call on any slot: it is a no-op when a battery is already linked.
+ * Safer than the historical behavior: an occupied slot WITHOUT an owner deposit
+ * never gets a synthetic battery (bat-<slotId>-<epoch>) fabricated — doing so is
+ * exactly what created the "ghost" batteries that surface as available rental
+ * stock. Only the current owner deposit (most recent non-consumed deposit in an
+ * active state) is used, and its existing battery is re-linked when known.
  * @param {object} pgClient - A connected pg client (schema already resolved).
  * @param {number} slotId - The primary key of `booth_slots`.
  * @param {string} slotIdentifier - The slot identifier, for logging.
- * @param {number|null} [chargeLevel] - SOC to stamp on the new battery record.
+ * @param {number|null} [chargeLevel] - SOC to stamp on a newly fabricated battery.
  * @returns {Promise<{relinked: boolean, batteryId: number|null, batteryUid: string|null, reason: string}>} The linking outcome.
  */
 async function ensureSlotBatteryLinked(pgClient, slotId, slotIdentifier, chargeLevel = null) {
@@ -50,6 +54,61 @@ async function ensureSlotBatteryLinked(pgClient, slotId, slotIdentifier, chargeL
     return { relinked: false, batteryId: currentBatteryId, batteryUid: null, reason: 'already_linked' };
   }
 
+  // ONLY fabricate/re-link a battery when a deposit actually owns this slot.
+  // An occupied slot with NO owner deposit — e.g. the deposit was consumed by a
+  // withdrawal, or the battery is unowned — must NOT get a synthetic
+  // "bat-<slotId>-<epoch>" battery fabricated: that is exactly how ghost
+  // rental-pool batteries were created. They then surface in the rentals fleet
+  // as "Available Rental Battery" (IN_SLOT) forever because they carry a fake
+  // UID that never maps to a real hardware serial.
+  const ownerRes = await pgClient.query(
+    `SELECT d.id, d.battery_id
+     FROM deposits d
+     WHERE d.slot_id = $1
+       AND d.session_type = 'deposit'
+       AND d.status IN ('opening', 'in_progress', 'completed')
+       AND NOT EXISTS (
+         SELECT 1 FROM deposits w
+         WHERE w.consumed_deposit_id = d.id
+           AND w.session_type IN ('withdrawal', 'rental')
+           AND w.status NOT IN ('cancelled', 'failed')
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM deposits newer
+         WHERE newer.slot_id = d.slot_id
+           AND newer.session_type = 'deposit'
+           AND newer.id > d.id
+           AND newer.status IN ('opening', 'in_progress', 'completed')
+           AND NOT EXISTS (
+             SELECT 1 FROM deposits w2
+             WHERE w2.consumed_deposit_id = newer.id
+               AND w2.session_type IN ('withdrawal', 'rental')
+               AND w2.status NOT IN ('cancelled', 'failed')
+           )
+       )
+     ORDER BY d.completed_at DESC, d.id DESC
+     LIMIT 1`,
+    [slotId]
+  );
+
+  const ownerDeposit = ownerRes.rows[0];
+  if (!ownerDeposit) {
+    return { relinked: false, batteryId: null, batteryUid: null, reason: 'no_owner_deposit' };
+  }
+
+  const existingBatteryId = ownerDeposit.battery_id;
+  if (existingBatteryId != null) {
+    // The owner deposit already links a real battery (a telemetry flicker cleared
+    // current_battery_id but the deposit still knows its battery): re-link that
+    // SAME battery instead of fabricating a new synthetic one.
+    await pgClient.query(
+      'UPDATE booth_slots SET current_battery_id = $1, updated_at = NOW() WHERE id = $2',
+      [existingBatteryId, slotId]
+    );
+    logger.info(`Re-linked existing battery id=${existingBatteryId} to slot ${slotIdentifier} (no fabrication).`);
+    return { relinked: true, batteryId: existingBatteryId, batteryUid: null, reason: 'relinked_existing' };
+  }
+
   const soc = normalizeSoc(chargeLevel) ?? normalizeSoc(slotCharge) ?? 100;
   const batteryUid = `bat-${slotId}-${Date.now()}`;
   const batteryRes = await pgClient.query(
@@ -66,43 +125,15 @@ async function ensureSlotBatteryLinked(pgClient, slotId, slotIdentifier, chargeL
     [batteryId, slotId]
   );
 
-  // Backfill only the current owner deposit (most recent non-consumed
-  // deposit in an active state) with the new battery uid/id. The previous
-  // query wrote battery_id onto EVERY deposit session on the slot, which
-  // stamped another user's battery onto stale deposits and defeated the
-  // strict battery-match guard in my-battery-status — causing old sessions
-  // to reappear as ghost batteries (e.g. geokagew seeing 7 entries not his).
+  // Backfill only the exact owner deposit found above, never every session on
+  // the slot (stamping another user's battery onto stale deposits is what
+  // produced ghost batteries in my-battery-status).
   await pgClient.query(
-    `UPDATE deposits d
-     SET battery_id = COALESCE(d.battery_id, s.current_battery_id)
-     FROM booth_slots s
-     WHERE d.slot_id = $1
-       AND s.id = $1
-       AND d.session_type = 'deposit'
-       AND d.status IN ('opening', 'in_progress', 'completed')
-       AND NOT EXISTS (
-         SELECT 1 FROM deposits w
-         WHERE w.consumed_deposit_id = d.id
-           AND w.session_type = 'withdrawal'
-           AND w.status NOT IN ('cancelled', 'failed')
-       )
-       AND NOT EXISTS (
-         SELECT 1 FROM deposits newer
-         WHERE newer.slot_id = d.slot_id
-           AND newer.session_type = 'deposit'
-           AND newer.id > d.id
-           AND newer.status IN ('opening', 'in_progress', 'completed')
-           AND NOT EXISTS (
-             SELECT 1 FROM deposits w2
-             WHERE w2.consumed_deposit_id = newer.id
-               AND w2.session_type = 'withdrawal'
-               AND w2.status NOT IN ('cancelled', 'failed')
-           )
-       )`,
-    [slotId]
+    'UPDATE deposits SET battery_id = $1 WHERE id = $2',
+    [batteryId, ownerDeposit.id]
   );
 
-  logger.info(`Relinked battery ${batteryUid} (id=${batteryId}) to slot ${slotIdentifier}.`);
+  logger.info(`Relinked synthetic battery ${batteryUid} (id=${batteryId}) to slot ${slotIdentifier}.`);
   return { relinked: true, batteryId, batteryUid, reason: 'relinked' };
 }
 

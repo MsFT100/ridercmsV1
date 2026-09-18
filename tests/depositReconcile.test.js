@@ -43,9 +43,10 @@ function selectResurrectCandidate(deposits, withdrawals, slotBatteryId) {
  * @param {object|null} opts.deposit - Row returned for the failed-deposit lookup (null -> empty).
  * @param {number} opts.updateRowCount - rowCount returned for the deposit-complete UPDATE.
  * @param {number|null} opts.linkedBatteryId - id returned by the batteries INSERT (null -> skip relink mock).
+ * @param {object|null} opts.ownerDeposit - Row returned for the current-owner deposit lookup ({id, battery_id} | null).
  * @returns {{query: (text: string, params?: Array) => Promise<{rowCount: number, rows: Array<object>}>}} A fake pg client.
  */
-function makeClient({ slot, deposit, updateRowCount, linkedBatteryId = 44 }) {
+function makeClient({ slot, deposit, updateRowCount, linkedBatteryId = 44, ownerDeposit = { id: 77, battery_id: null } }) {
   return {
     query: async (text) => {
       if (text.includes('SELECT current_battery_id, charge_level_percent')) {
@@ -57,6 +58,11 @@ function makeClient({ slot, deposit, updateRowCount, linkedBatteryId = 44 }) {
       if (text.includes("status = 'failed'") && text.includes('SELECT')) {
         return { rowCount: deposit ? 1 : 0, rows: deposit ? [deposit] : [] };
       }
+      // Current-owner deposit lookup inside ensureSlotBatteryLinked. Distinct from the
+      // failed-deposit lookup: it selects d.id, d.battery_id and filters on active states.
+      if (text.includes('d.id, d.battery_id') && text.includes("d.status IN ('opening', 'in_progress', 'completed')")) {
+        return { rowCount: ownerDeposit ? 1 : 0, rows: ownerDeposit ? [ownerDeposit] : [] };
+      }
       if (text.includes('SET status = \'completed\'')) {
         return { rowCount: updateRowCount, rows: updateRowCount ? [{ id: deposit.id }] : [] };
       }
@@ -66,7 +72,7 @@ function makeClient({ slot, deposit, updateRowCount, linkedBatteryId = 44 }) {
       if (text.includes('UPDATE booth_slots SET current_battery_id')) {
         return { rowCount: 1, rows: [] };
       }
-      if (text.includes('SET battery_id = COALESCE')) {
+      if (text.includes('SET battery_id = COALESCE') || (text.includes('UPDATE deposits') && text.includes('SET battery_id = $1'))) {
         return { rowCount: 1, rows: [] };
       }
       throw new Error(`Unexpected query: ${text}`);
@@ -79,6 +85,7 @@ describe('reconcileSlotDeposit', () => {
     const client = makeClient({
       slot: { status: 'occupied', current_battery_id: null, charge_level_percent: 71 },
       deposit: { id: 77, status: 'failed' },
+      ownerDeposit: { id: 77, battery_id: null },
       updateRowCount: 1,
     });
 
@@ -137,6 +144,7 @@ describe('reconcileSlotDeposit', () => {
     const client = makeClient({
       slot: { status: 'occupied', current_battery_id: null, charge_level_percent: 100 },
       deposit: null,
+      ownerDeposit: { id: 55, battery_id: null },
       updateRowCount: 0,
     });
 
@@ -173,9 +181,10 @@ describe('ensureSlotBatteryLinked', () => {
     assert.deepStrictEqual(result, { relinked: false, batteryId: 3, batteryUid: null, reason: 'already_linked' });
   });
 
-  it('creates and links a battery when current_battery_id is NULL', async () => {
+  it('creates and links a battery when current_battery_id is NULL and an owner deposit exists', async () => {
     const client = makeClient({
       slot: { status: 'occupied', current_battery_id: null, charge_level_percent: 60 },
+      ownerDeposit: { id: 60, battery_id: null },
     });
 
     const result = await ensureSlotBatteryLinked(client, 5, 'slot-001', 72);
@@ -183,6 +192,34 @@ describe('ensureSlotBatteryLinked', () => {
     assert.equal(result.relinked, true);
     assert.equal(result.batteryId, 44);
     assert.ok(result.batteryUid.startsWith('bat-5-'), 'battery UID must be derived from slot id + timestamp');
+  });
+
+  it('does NOT fabricate a battery when the slot has no owner deposit (ghost-battery guard)', async () => {
+    // A slot that is occupied but whose deposit was consumed (or never existed)
+    // must NOT get a synthetic bat-<slotId>-<epoch> battery. This is the root-cause
+    // fix for ghost "Rental Pool" batteries appearing in the fleet.
+    const client = makeClient({
+      slot: { status: 'occupied', current_battery_id: null, charge_level_percent: 60 },
+      ownerDeposit: null,
+    });
+
+    const result = await ensureSlotBatteryLinked(client, 5, 'slot-001', 72);
+
+    assert.deepStrictEqual(result, { relinked: false, batteryId: null, batteryUid: null, reason: 'no_owner_deposit' });
+  });
+
+  it('re-links the owner deposit existing battery instead of fabricating a new one', async () => {
+    // When the current owner deposit already carries a battery_id, a telemetry
+    // flicker that cleared current_battery_id should re-link THAT battery, not
+    // fabricate a synthetic placeholder.
+    const client = makeClient({
+      slot: { status: 'occupied', current_battery_id: null, charge_level_percent: 60 },
+      ownerDeposit: { id: 60, battery_id: 44 },
+    });
+
+    const result = await ensureSlotBatteryLinked(client, 5, 'slot-001', 72);
+
+    assert.deepStrictEqual(result, { relinked: true, batteryId: 44, batteryUid: null, reason: 'relinked_existing' });
   });
 });
 
@@ -295,6 +332,24 @@ describe('reconcileSlotDeposit: ghost-battery resurrection guard', () => {
     assert.match(
       src,
       /AND NOT EXISTS \([\s\S]*?newer\.slot_id = d\.slot_id[\s\S]*?newer\.status = 'completed'/
+    );
+  });
+
+  test('ensureSlotBatteryLinked never fabricates a battery without a current owner deposit', () => {
+    const src = fs.readFileSync(
+      path.join(__dirname, '../utils/depositReconcile.js'),
+      'utf8'
+    );
+    // The owner-deposit lookup guards the fabrication branch.
+    assert.match(
+      src,
+      /SELECT d\.id, d\.battery_id[\s\S]*?d\.status IN \('opening', 'in_progress', 'completed'\)/,
+      'owner deposit lookup must exist'
+    );
+    assert.match(
+      src,
+      /no_owner_deposit/,
+      'must short-circuit with no_owner_deposit when the slot has no owner'
     );
   });
 });

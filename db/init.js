@@ -108,7 +108,7 @@ const initializeDatabase = async () => {
         initial_charge_level INT, -- Stored on deposit
         amount DECIMAL(10, 2) NOT NULL DEFAULT 0.00, -- Amount charged for the session
         mpesa_checkout_id VARCHAR(255) UNIQUE, -- For tracking payment status
-        status VARCHAR(50) NOT NULL CHECK (status IN ('pending', 'opening', 'in_progress', 'completed', 'failed', 'cancelled', 'redeemed')),
+        status VARCHAR(50) NOT NULL CHECK (status IN ('pending', 'opening', 'in_progress', 'completed', 'failed', 'cancelled', 'redeemed', 'manual')),
         started_at TIMESTAMPTZ DEFAULT NOW(),
         completed_at TIMESTAMPTZ,
         notes TEXT, -- For logging reasons for state changes (e.g., auto-cancellation)
@@ -222,13 +222,12 @@ const initializeDatabase = async () => {
       "Added 'withdrawal_notes' column to 'batteries' table."
     );
 
-    // Add 'redeemed' to the status check constraint on 'deposits'
-    const checkConstraintRes = await client.query("SELECT 1 FROM pg_constraint WHERE conname = 'deposits_status_check' AND conrelid = 'deposits'::regclass AND pg_get_constraintdef(oid) LIKE '%redeemed%';");
-    if (checkConstraintRes.rowCount === 0) {
-      await client.query("ALTER TABLE deposits DROP CONSTRAINT deposits_status_check;");
-      await client.query("ALTER TABLE deposits ADD CONSTRAINT deposits_status_check CHECK (status IN ('pending', 'opening', 'in_progress', 'completed', 'failed', 'cancelled', 'redeemed'));");
-      logger.info("Updated 'deposits.status' CHECK constraint to include 'redeemed'.");
-    }
+    await runAlteration(
+      'deposits',
+      'status',
+      'ALTER TABLE deposits ADD CONSTRAINT deposits_status_check CHECK (status IN (''pending'', ''opening'', ''in_progress'', ''completed'', ''failed'', ''cancelled'', ''redeemed'', ''manual''));',
+      "Added 'manual' to the 'deposits.status' CHECK constraint."
+    );
 
     // Add 'rental' to the session_type check constraint on 'deposits'
     const sessionTypeConstraintRes = await client.query("SELECT 1 FROM pg_constraint WHERE conname = 'deposits_session_type_check' AND pg_get_constraintdef(oid) LIKE '%rental%';");

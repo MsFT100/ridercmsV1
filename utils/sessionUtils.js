@@ -21,7 +21,7 @@ async function finalizeWithdrawalSession(client, slotId, slotIdentifier = null, 
         AND session_type = 'withdrawal'
         AND (
           ($2::int IS NULL AND status = 'in_progress')
-          OR ($2::int IS NOT NULL AND id = $2 AND status IN ('in_progress', 'completed'))
+          OR ($2::int IS NOT NULL AND id = $2 AND status IN ('in_progress', 'completed', 'manual'))
         )
       ORDER BY completed_at DESC, created_at DESC
       LIMIT 1
