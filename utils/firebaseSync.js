@@ -329,7 +329,7 @@ async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
     // 4. Update the database.
     // When the battery is physically removed, also clear current_battery_id to prevent
     // stale deposit credits from being usable against a slot that will be reassigned.
-    const batteryCleared = !batteryInserted && dbStatus !== 'available';
+    const batteryCleared = !batteryInserted && dbStatus !== 'available' && dbStatus !== 'opening';
     const result = await pgClient.query(
       `UPDATE booth_slots 
        SET 

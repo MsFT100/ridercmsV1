@@ -157,7 +157,8 @@ async function finalizeRentalCollection(pgClient, slotId, slotIdentifier = null)
      UPDATE booth_slots
      SET status = 'available', current_battery_id = NULL,
          charge_level_percent = NULL, is_charging = false, updated_at = NOW()
-     WHERE id = $1
+     FROM updated_rental
+     WHERE booth_slots.id = $1
      RETURNING (SELECT id FROM updated_rental) AS rental_id`,
     [slotId]
   );
