@@ -86,6 +86,7 @@ const WITHDRAWAL_BATTERY_QUERY = `
     AND d.session_type = 'deposit'
     AND d.status = 'completed'
     AND s.current_battery_id IS NOT NULL
+    AND d.battery_id = s.current_battery_id
     AND NOT EXISTS (
       SELECT 1 FROM deposits w
       WHERE w.consumed_deposit_id = d.id
@@ -114,6 +115,7 @@ const WITHDRAWAL_BATTERY_BY_ID_QUERY = `
     AND d.session_type = 'deposit'
     AND d.status = 'completed'
     AND s.current_battery_id IS NOT NULL
+    AND d.battery_id = s.current_battery_id
     AND NOT EXISTS (
       SELECT 1 FROM deposits w
       WHERE w.consumed_deposit_id = d.id

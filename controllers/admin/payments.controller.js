@@ -216,6 +216,10 @@ router.get('/payments', [verifyFirebaseToken, isAdmin], async (req, res) => {
  * POST /api/admin/payments/manual-withdraw
  * @summary Admin manually triggers an M-Pesa STK push withdrawal for a user
  * @description Creates a manual withdrawal session for the specified user and sends an STK push to their phone number.
+ * Guards: the target user must be the current owner of the battery physically present
+ * in the slot (ownership + battery-identity checks), no active withdrawal may already
+ * exist on the slot, and the deposit credit must not have been consumed. This prevents
+ * a withdrawal against another user's deposit.
  * @tags [Admin]
  * @security
  *   - bearerAuth: []
@@ -225,22 +229,32 @@ router.get('/payments', [verifyFirebaseToken, isAdmin], async (req, res) => {
  *     application/json:
  *       schema:
  *         type: object
- *         required: [userId, phoneNumber, amount]
+ *         required: [userId, phoneNumber, amount, boothUid, slotIdentifier]
  *         properties:
  *           userId:
  *             type: string
- *             description: Firebase UID of the target user.
+ *             description: Firebase UID of the target user (must own the battery in the slot).
  *           phoneNumber:
  *             type: string
  *             description: Phone number to send the STK push to (E.164 or local format).
  *           amount:
  *             type: number
  *             description: Amount in KES to charge.
+ *           boothUid:
+ *             type: string
+ *             description: The UID of the booth holding the battery.
+ *           slotIdentifier:
+ *             type: string
+ *             description: The slot identifier (e.g., slot001).
  * @responses
  *   200:
  *     description: STK push sent successfully.
  *   400:
  *     description: Missing required fields.
+ *   404:
+ *     description: User or slot not found.
+ *   409:
+ *     description: Slot empty, active withdrawal in progress, or target user is not the slot's current battery owner.
  *   500:
  *     description: Internal server error.
  */
@@ -255,52 +269,108 @@ router.post('/payments/manual-withdraw', [verifyFirebaseToken, isAdmin], async (
     return res.status(400).json({ error: 'Amount must be a number greater than or equal to 1.' });
   }
 
+  // A withdrawal session must be tied to a specific booth slot.
+  // (deposits.booth_id and deposits.slot_id are NOT NULL.)
+  if (!boothUid || !slotIdentifier) {
+    return res.status(400).json({ error: 'boothUid and slotIdentifier are required for a manual withdrawal.' });
+  }
+
   const pool = await poolPromise;
   const client = await pool.connect();
   try {
+    await client.query('BEGIN');
+
     // 1. Verify the user exists in our database
     const userRes = await client.query('SELECT user_id, name, email, phone FROM users WHERE user_id = $1', [userId]);
     if (userRes.rows.length === 0) {
+      await client.query('ROLLBACK');
       return res.status(404).json({ error: `User with ID ${userId} not found.` });
     }
 
-    // 2. Resolve booth and slot if provided
-    let boothId = null;
-    let slotId = null;
-    if (boothUid && slotIdentifier) {
-      const slotRes = await client.query(`
-        SELECT s.id AS "slotId", b.id AS "boothId"
-        FROM booth_slots s
-        JOIN booths b ON s.booth_id = b.id
-        WHERE b.booth_uid = $1 AND s.slot_identifier = $2
-      `, [boothUid, slotIdentifier]);
-      if (slotRes.rows.length > 0) {
-        boothId = slotRes.rows[0].boothId;
-        slotId = slotRes.rows[0].slotId;
-      }
+    // 2. Resolve booth and slot, locking the slot row to serialize concurrent manual withdrawals.
+    const slotRes = await client.query(`
+      SELECT s.id AS "slotId", s.current_battery_id, b.id AS "boothId"
+      FROM booth_slots s
+      JOIN booths b ON s.booth_id = b.id
+      WHERE b.booth_uid = $1 AND s.slot_identifier = $2
+      FOR UPDATE OF s
+    `, [boothUid, slotIdentifier]);
+
+    if (slotRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: `Slot '${slotIdentifier}' in booth '${boothUid}' not found.` });
     }
 
-    // 3. Resolve the original deposit credit to link as consumed_deposit_id
-    let consumedDepositId = null;
-    if (slotId) {
-      const depositCreditRes = await client.query(`
-        SELECT d.id FROM deposits d
-        WHERE d.slot_id = $1 AND d.session_type = 'deposit' AND d.status = 'completed'
-        ORDER BY d.completed_at DESC
-        LIMIT 1
-      `, [slotId]);
-      if (depositCreditRes.rows.length > 0) {
-        consumedDepositId = depositCreditRes.rows[0].id;
-      }
+    const { slotId, currentBatteryId, boothId } = slotRes.rows[0];
+
+    // 3. Guard: the withdrawal must target a battery physically present in the slot.
+    //    An empty slot must never be withdrawn from against a stale deposit.
+    if (!currentBatteryId) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'This slot is empty (no battery physically present). Cannot withdraw from it.' });
     }
 
-    // 4. A withdrawal session must be tied to a specific booth slot.
-    //    (deposits.booth_id and deposits.slot_id are NOT NULL.)
-    if (!boothId || !slotId) {
-      return res.status(400).json({ error: 'boothUid and slotIdentifier are required for a manual withdrawal.' });
+    // 4. Guard: no active withdrawal may already be in progress on the slot.
+    const activeWithdrawalRes = await client.query(`
+      SELECT 1 FROM deposits
+      WHERE slot_id = $1 AND session_type = 'withdrawal' AND status IN ('pending', 'in_progress')
+      LIMIT 1
+    `, [slotId]);
+
+    if (activeWithdrawalRes.rows.length > 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'An active withdrawal session already exists on this slot. Resolve it first.' });
     }
 
-    // 5. Create a manual withdrawal session
+    // 5. Resolve the original deposit credit to link as consumed_deposit_id.
+    //    The credit must belong to the TARGET user: a user must never withdraw
+    //    against another user's battery deposit. It must also match the battery
+    //    physically in the slot (legacy NULL-battery deposits are only trusted on
+    //    an occupied slot when no NEWER unconsumed deposit by another user owns
+    //    the slot first), and it must not already be consumed by a withdrawal/rental.
+    const depositCreditRes = await client.query(`
+      SELECT d.id
+      FROM deposits d
+      JOIN booth_slots s ON d.slot_id = s.id
+      WHERE d.slot_id = $1
+        AND d.user_id = $2
+        AND d.session_type = 'deposit'
+        AND d.status = 'completed'
+        AND s.current_battery_id IS NOT NULL
+        AND (d.battery_id = s.current_battery_id OR d.battery_id IS NULL)
+        AND NOT EXISTS (
+          SELECT 1 FROM deposits w
+          WHERE w.consumed_deposit_id = d.id
+            AND w.session_type IN ('withdrawal', 'rental')
+            AND w.status NOT IN ('cancelled', 'failed')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM deposits newer
+          WHERE newer.slot_id = d.slot_id
+            AND newer.session_type = 'deposit'
+            AND newer.id > d.id
+            AND newer.user_id <> d.user_id
+            AND newer.status IN ('opening', 'in_progress', 'completed')
+            AND NOT EXISTS (
+              SELECT 1 FROM deposits w2
+              WHERE w2.consumed_deposit_id = newer.id
+                AND w2.session_type IN ('withdrawal', 'rental')
+                AND w2.status NOT IN ('cancelled', 'failed')
+            )
+        )
+      ORDER BY d.completed_at DESC, d.id DESC
+      LIMIT 1
+    `, [slotId, userId]);
+
+    if (depositCreditRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: `User ${userId} has no active battery credit in slot. The target user must be the current owner of the battery physically present in this slot.`,
+      });
+    }
+    const consumedDepositId = depositCreditRes.rows[0].id;
+
+    // 6. Create a manual withdrawal session
     const sessionRes = await client.query(
       `INSERT INTO deposits (user_id, booth_id, slot_id, session_type, status, amount, consumed_deposit_id, notes)
        VALUES ($1, $2, $3, 'withdrawal', 'pending', $4, $5, 'manual_withdrawal')
@@ -309,7 +379,7 @@ router.post('/payments/manual-withdraw', [verifyFirebaseToken, isAdmin], async (
     );
     const sessionId = sessionRes.rows[0].id;
 
-    // 6. Dev mode: skip M-Pesa, auto-approve
+    // 7. Dev mode: skip M-Pesa, auto-approve
     if (req.user.role === 'developer') {
       const devCheckoutId = `DEV_MANUAL_${sessionId}_${Date.now()}`;
       await client.query(
@@ -342,6 +412,7 @@ router.post('/payments/manual-withdraw', [verifyFirebaseToken, isAdmin], async (
           `Result: 0 - Success. Receipt: ${devCheckoutId}. Paid: KES ${amount}. Manual withdrawal (dev).`
         ]
       );
+      await client.query('COMMIT');
       logger.info(`[Admin Manual Withdraw] Dev mode: auto-approved session ${sessionId} for user ${userId}.`);
       return res.status(200).json({
         success: true,
@@ -351,7 +422,7 @@ router.post('/payments/manual-withdraw', [verifyFirebaseToken, isAdmin], async (
       });
     }
 
-    // 7. Production: trigger M-Pesa STK push
+    // 8. Production: trigger M-Pesa STK push
     const safePhone = phoneNumber.replace(/[^0-9]/g, '');
     const mpesaResponse = await initiateSTKPush({
       phone: safePhone,
@@ -366,6 +437,8 @@ router.post('/payments/manual-withdraw', [verifyFirebaseToken, isAdmin], async (
       [checkoutRequestId, sessionId]
     );
 
+    await client.query('COMMIT');
+
     logger.info(`[Admin Manual Withdraw] STK push sent for session ${sessionId} to ${safePhone}. CheckoutRequestID: ${checkoutRequestId}`);
 
     return res.status(200).json({
@@ -375,6 +448,7 @@ router.post('/payments/manual-withdraw', [verifyFirebaseToken, isAdmin], async (
       transactionId: checkoutRequestId,
     });
   } catch (error) {
+    await client.query('ROLLBACK');
     logger.error('[Admin Manual Withdraw] Failed:', error);
     return res.status(500).json({ error: 'Failed to initiate manual withdrawal.', details: error.message });
   } finally {
