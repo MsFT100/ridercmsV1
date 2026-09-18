@@ -1,4 +1,5 @@
 const { Router } = require('express');
+const { getDatabase } = require('firebase-admin/database');
 const logger = require('../../utils/logger.js');
 const poolPromise = require('../../db');
 const { verifyFirebaseToken, isAdmin } = require('../../middleware/auth');
@@ -632,13 +633,13 @@ router.get('/rentals/fleet', [verifyFirebaseToken, isAdmin], async (req, res) =>
  *     application/json:
  *       schema:
  *         type: object
- *         required: [batteryUid, chargeLevel, boothUid, slotIdentifier]
+ *         required: [batteryUid, boothUid, slotIdentifier]
  *         properties:
  *           batteryUid:
  *             type: string
  *           chargeLevel:
  *             type: integer
- *             description: Current charge level 0-100.
+ *             description: Optional override. When omitted, the slot's current live SOC (hardware telemetry) is used.
  *           boothUid:
  *             type: string
  *           slotIdentifier:
@@ -665,10 +666,6 @@ router.post('/rentals', [verifyFirebaseToken, isAdmin], async (req, res) => {
   if (!boothUid || !slotIdentifier) {
     return res.status(400).json({ error: 'boothUid and slotIdentifier are required.' });
   }
-  const level = Number(chargeLevel);
-  if (Number.isNaN(level) || level < 0 || level > 100) {
-    return res.status(400).json({ error: 'chargeLevel must be between 0 and 100.' });
-  }
 
   const pool = await poolPromise;
   const client = await pool.connect();
@@ -676,7 +673,7 @@ router.post('/rentals', [verifyFirebaseToken, isAdmin], async (req, res) => {
     await client.query('BEGIN');
 
     const slotRes = await client.query(
-      `SELECT s.id AS "slotId", s.booth_id AS "boothId"
+      `SELECT s.id AS "slotId", s.booth_id AS "boothId", s.charge_level_percent AS "slotChargeLevel"
        FROM booth_slots s
        JOIN booths b ON s.booth_id = b.id
        WHERE b.booth_uid = $1 AND s.slot_identifier = $2
@@ -687,7 +684,36 @@ router.post('/rentals', [verifyFirebaseToken, isAdmin], async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Booth or slot not found.' });
     }
-    const { slotId } = slotRes.rows[0];
+    const { slotId, slotChargeLevel } = slotRes.rows[0];
+
+    // Resolve the battery's charge level. The battery is already sitting in
+    // the slot, so prefer the live SOC from the booth hardware telemetry;
+    // fall back to the slot value stored in the database.
+    let level;
+    if (chargeLevel === undefined || chargeLevel === null || chargeLevel === '') {
+      try {
+        const db = getDatabase();
+        const snapshot = await db.ref(`booths/${boothUid}/slots/${slotIdentifier}`).get();
+        if (snapshot.exists()) {
+          const slotData = snapshot.val();
+          const telemetry = slotData.telemetry || {};
+          level = telemetry.soc ?? slotData.soc ?? slotData.final_soc ?? null;
+        }
+      } catch (fbErr) {
+        logger.warn(`Failed to read slot telemetry for ${boothUid}/${slotIdentifier}:`, fbErr.message);
+      }
+      if (level === null || level === undefined) {
+        level = slotChargeLevel;
+      }
+    } else {
+      level = chargeLevel;
+    }
+
+    level = Number(level);
+    if (Number.isNaN(level) || level < 0 || level > 100) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'chargeLevel must be between 0 and 100.' });
+    }
 
     // 1. Find or create the battery.
     const batteryRes = await client.query(
