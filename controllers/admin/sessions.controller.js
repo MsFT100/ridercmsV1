@@ -4,6 +4,11 @@ const logger = require('../../utils/logger.js');
 const poolPromise = require('../../db');
 const { verifyFirebaseToken, isAdmin } = require('../../middleware/auth');
 const { initiateSTKPush } = require('../../utils/mpesa');
+const {
+  completeAdminRentalPlacement,
+  revertAdminRentalPlacement,
+} = require('../../utils/sessionUtils');
+const { isDevBooth } = require('../booths/shared');
 
 const router = Router();
 
@@ -692,38 +697,9 @@ router.post('/rentals', [verifyFirebaseToken, isAdmin], async (req, res) => {
       return res.status(409).json({ error: 'Slot is not available. Only empty slots can receive a rental battery.' });
     }
 
-    // Resolve the battery's charge level. The battery is already sitting in
-    // the slot, so prefer the live SOC from the booth hardware telemetry;
-    // fall back to the slot value stored in the database.
-    let level;
-    if (chargeLevel === undefined || chargeLevel === null || chargeLevel === '') {
-      try {
-        const db = getDatabase();
-        const snapshot = await db.ref(`booths/${boothUid}/slots/${slotIdentifier}`).get();
-        if (snapshot.exists()) {
-          const slotData = snapshot.val();
-          const telemetry = slotData.telemetry || {};
-          level = telemetry.soc ?? slotData.soc ?? slotData.final_soc ?? null;
-        }
-      } catch (fbErr) {
-        logger.warn(`Failed to read slot telemetry for ${boothUid}/${slotIdentifier}:`, fbErr.message);
-      }
-      if (level === null || level === undefined) {
-        level = slotChargeLevel;
-      }
-    } else {
-      level = chargeLevel;
-    }
-
-    level = Number(level);
-    if (Number.isNaN(level) || level < 0 || level > 100) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'chargeLevel must be between 0 and 100.' });
-    }
-
     // 1. Find or create the battery.
     const batteryRes = await client.query(
-      `SELECT id, battery_uid AS "batteryUid", withdrawn_at AS "withdrawnAt"
+      `SELECT id, charge_level_percent AS "chargeLevel", withdrawn_at AS "withdrawnAt"
        FROM batteries WHERE battery_uid = $1 LIMIT 1`,
       [batteryUid.trim()]
     );
@@ -743,45 +719,278 @@ router.post('/rentals', [verifyFirebaseToken, isAdmin], async (req, res) => {
         await client.query('ROLLBACK');
         return res.status(409).json({ error: 'Battery is currently rented out.' });
       }
+    }
 
-      await client.query(
-        `UPDATE batteries
-         SET charge_level_percent = $1, withdrawn_at = NULL, withdrawal_reason = NULL, withdrawal_notes = NULL, updated_at = NOW()
-         WHERE id = $2`,
-        [level, batteryId]
-      );
-    } else {
+    // 2. Resolve the target charge level. The battery is NOT physically in the
+    //    slot yet (it is opened for placement below), so prefer the chargeLevel
+    //    supplied in the form, then the battery's stored level, then the empty
+    //    slot's stored level. Live telemetry is only a last resort; the real SOC
+    //    is captured when the placement completes and the battery is inserted.
+    let level = slotChargeLevel;
+    if (chargeLevel !== undefined && chargeLevel !== null && chargeLevel !== '') {
+      level = chargeLevel;
+    } else if (batteryRes.rowCount > 0) {
+      level = batteryRes.rows[0].chargeLevel ?? slotChargeLevel;
+    }
+    if (level === null || level === undefined) {
+      try {
+        const db = getDatabase();
+        const snapshot = await db.ref(`booths/${boothUid}/slots/${slotIdentifier}`).get();
+        if (snapshot.exists()) {
+          const slotData = snapshot.val();
+          const telemetry = slotData.telemetry || {};
+          level = telemetry.soc ?? slotData.soc ?? slotData.final_soc ?? 0;
+        }
+      } catch (fbErr) {
+        logger.warn(`Failed to read slot telemetry for ${boothUid}/${slotIdentifier}:`, fbErr.message);
+      }
+    }
+    if (level === null || level === undefined) {
+      level = 0;
+    }
+
+    level = Number(level);
+    if (Number.isNaN(level) || level < 0 || level > 100) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'chargeLevel must be between 0 and 100.' });
+    }
+
+    if (batteryRes.rowCount === 0) {
       const insertRes = await client.query(
         `INSERT INTO batteries (battery_uid, charge_level_percent, health_status)
          VALUES ($1, $2, 'good') RETURNING id`,
         [batteryUid.trim(), level]
       );
       batteryId = insertRes.rows[0].id;
+    } else {
+      await client.query(
+        `UPDATE batteries
+         SET charge_level_percent = $1, withdrawn_at = NULL, withdrawal_reason = NULL, withdrawal_notes = NULL, updated_at = NOW()
+         WHERE id = $2`,
+        [level, batteryId]
+      );
     }
 
-    // 2. Place the battery into the requested booth slot as unowned pool stock.
+    // 3. Reserve the slot for physical placement: mark it 'opening' and pre-assign
+    //    the battery. Riders can only be allocated 'available' slots, so no other
+    //    user can claim this slot while the battery is being placed. It only
+    //    becomes 'occupied' once telemetry confirms the battery was inserted.
     await client.query(
       `UPDATE booth_slots
-       SET status = 'occupied', current_battery_id = $1, charge_level_percent = $2,
-           is_charging = FALSE, door_status = 'closed', updated_at = NOW()
+       SET status = 'opening', current_battery_id = $1, charge_level_percent = $2,
+           is_charging = FALSE, door_status = 'open', updated_at = NOW()
        WHERE id = $3`,
       [batteryId, level, slotId]
     );
 
+    if (isDevBooth(boothUid)) {
+      // No real hardware in dev: simulate the battery being physically inserted.
+      await completeAdminRentalPlacement(client, slotId, slotIdentifier, level);
+    } else {
+      // Real booth: open the slot so the admin can place the battery inside.
+      await getDatabase()
+        .ref(`booths/${boothUid}/slots/${slotIdentifier}/command`)
+        .update({
+          openForDeposit: true,
+          openForCollection: false,
+        });
+    }
+
     await client.query('COMMIT');
 
-    logger.info(`Admin (UID: ${req.user.uid}) added rental battery ${batteryUid.trim()} to ${boothUid}/${slotIdentifier} at SOC ${level}%.`);
+    const placementStatus = isDevBooth(boothUid) ? 'placed' : 'opening';
+    logger.info(`Admin (UID: ${req.user.uid}) started rental-stock placement of battery ${batteryUid.trim()} at ${boothUid}/${slotIdentifier} (${placementStatus}).`);
     return res.status(201).json({
       batteryUid: batteryUid.trim(),
       chargeLevel: level,
       boothUid,
       slotIdentifier,
       notes: notes || null,
+      placement: {
+        placementId: String(slotId),
+        status: placementStatus,
+        boothUid,
+        slotIdentifier,
+      },
     });
   } catch (error) {
     await client.query('ROLLBACK');
     logger.error('Failed to add rental battery:', error);
     return res.status(500).json({ error: 'Failed to add rental battery.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /api/admin/rentals/placement/:placementId/status
+ * @summary Poll an admin rental-stock placement
+ * @description Tracks whether the battery has been physically inserted into the
+ * reserved 'opening' slot. Returns 'waiting' until the hardware telemetry reports
+ * a battery present, then completes the placement (slot -> 'occupied') and returns
+ * 'placed'. Stale placements older than the timeout (default 120s) are reverted to
+ * 'available' and reported as 'timeout'. Read-only except for completing/reverting
+ * the placement itself.
+ * @tags [Admin]
+ * @security - bearerAuth: []
+ */
+const PLACEMENT_TIMEOUT_SECONDS = parseInt(process.env.RENTAL_PLACEMENT_TIMEOUT_SECONDS, 10) || 120;
+
+router.get('/rentals/placement/:placementId/status', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const { placementId } = req.params;
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    const slotRes = await client.query(
+      `SELECT s.id AS "slotId", s.status AS "slotStatus", s.current_battery_id AS "batteryId",
+              s.updated_at AS "updatedAt",
+              b.booth_uid AS "boothUid", s.slot_identifier AS "slotIdentifier"
+       FROM booth_slots s
+       JOIN booths b ON s.booth_id = b.id
+       WHERE s.id = $1`,
+      [Number(placementId)]
+    );
+    if (slotRes.rowCount === 0) {
+      return res.status(404).json({ error: 'Placement not found.' });
+    }
+    const slot = slotRes.rows[0];
+
+    // No pending placement anymore — report its terminal/current state.
+    if (slot.slotStatus !== 'opening' || !slot.batteryId) {
+      const status = slot.slotStatus === 'occupied'
+        ? 'placed'
+        : slot.slotStatus === 'available' ? 'reverted' : slot.slotStatus;
+      return res.status(200).json({ placementId: String(slot.slotId), status });
+    }
+
+    const staleSeconds = (new Date() - new Date(slot.updatedAt).getTime()) / 1000;
+    let batteryInserted = false;
+    if (!isDevBooth(slot.boothUid)) {
+      try {
+        const snapshot = await getDatabase()
+          .ref(`booths/${slot.boothUid}/slots/${slot.slotIdentifier}`)
+          .get();
+        if (snapshot.exists()) {
+          batteryInserted = snapshot.val()?.telemetry?.batteryInserted === true;
+        }
+      } catch (fbErr) {
+        logger.warn(`Failed to read slot telemetry for placement ${placementId}:`, fbErr.message);
+      }
+    } else {
+      // Dev booths complete synchronously in the POST handler, so a live
+      // placement here means the battery is treated as present.
+      batteryInserted = true;
+    }
+
+    await client.query('BEGIN');
+    try {
+      if (batteryInserted) {
+        await completeAdminRentalPlacement(client, slot.slotId, slot.slotIdentifier);
+        await client.query('COMMIT');
+        logger.info(`Placement ${placementId} confirmed (battery detected) on ${slot.boothUid}/${slot.slotIdentifier}.`);
+        return res.status(200).json({ placementId: String(slot.slotId), status: 'placed' });
+      }
+      if (staleSeconds >= PLACEMENT_TIMEOUT_SECONDS) {
+        await revertAdminRentalPlacement(client, slot.slotId, slot.slotIdentifier);
+        try {
+          await getDatabase()
+            .ref(`booths/${slot.boothUid}/slots/${slot.slotIdentifier}/command`)
+            .update({ openForDeposit: false });
+        } catch (cmdErr) {
+          logger.warn(`Failed to clear openForDeposit on timeout for placement ${placementId}:`, cmdErr.message);
+        }
+        await client.query('COMMIT');
+        logger.warn(`Placement ${placementId} timed out; slot ${slot.boothUid}/${slot.slotIdentifier} reverted.`);
+        return res.status(200).json({ placementId: String(slot.slotId), status: 'timeout' });
+      }
+      await client.query('COMMIT');
+      return res.status(200).json({ placementId: String(slot.slotId), status: 'waiting' });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    }
+  } catch (error) {
+    logger.error(`Failed to get placement status for ${placementId}:`, error);
+    return res.status(500).json({ error: 'Failed to get placement status.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * POST /api/admin/rentals/placement/:placementId/cancel
+ * @summary Cancel an admin rental-stock placement
+ * @description Aborts a placement that is still 'opening': the slot returns to
+ * 'available' and the 'openForDeposit' command is cleared. If the battery has
+ * already been physically inserted, the placement is completed instead so the
+ * slot is never left 'available' with a battery inside.
+ * @tags [Admin]
+ * @security - bearerAuth: []
+ */
+router.post('/rentals/placement/:placementId/cancel', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const { placementId } = req.params;
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    const slotRes = await client.query(
+      `SELECT s.id AS "slotId", s.status AS "slotStatus", s.current_battery_id AS "batteryId",
+              b.booth_uid AS "boothUid", s.slot_identifier AS "slotIdentifier"
+       FROM booth_slots s
+       JOIN booths b ON s.booth_id = b.id
+       WHERE s.id = $1`,
+      [Number(placementId)]
+    );
+    if (slotRes.rowCount === 0) {
+      return res.status(404).json({ error: 'Placement not found.' });
+    }
+    const slot = slotRes.rows[0];
+
+    if (slot.slotStatus !== 'opening' || !slot.batteryId) {
+      const status = slot.slotStatus === 'occupied'
+        ? 'placed'
+        : slot.slotStatus === 'available' ? 'reverted' : slot.slotStatus;
+      return res.status(200).json({ placementId: String(slot.slotId), status });
+    }
+
+    // If the battery is already physically inside, cancelling would leave the
+    // slot 'available' with a battery present — complete the placement instead.
+    let batteryInserted = false;
+    if (!isDevBooth(slot.boothUid)) {
+      try {
+        const snapshot = await getDatabase()
+          .ref(`booths/${slot.boothUid}/slots/${slot.slotIdentifier}`)
+          .get();
+        if (snapshot.exists()) {
+          batteryInserted = snapshot.val()?.telemetry?.batteryInserted === true;
+        }
+      } catch (fbErr) {
+        logger.warn(`Failed to read slot telemetry while cancelling placement ${placementId}:`, fbErr.message);
+      }
+    }
+
+    await client.query('BEGIN');
+    try {
+      let status;
+      if (batteryInserted) {
+        await completeAdminRentalPlacement(client, slot.slotId, slot.slotIdentifier);
+        status = 'placed';
+      } else {
+        await revertAdminRentalPlacement(client, slot.slotId, slot.slotIdentifier);
+        status = 'cancelled';
+        await getDatabase()
+          .ref(`booths/${slot.boothUid}/slots/${slot.slotIdentifier}/command`)
+          .update({ openForDeposit: false });
+      }
+      await client.query('COMMIT');
+      logger.info(`Admin (UID: ${req.user.uid}) cancelled rental-stock placement ${placementId} (-> ${status}).`);
+      return res.status(200).json({ placementId: String(slot.slotId), status });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    }
+  } catch (error) {
+    logger.error(`Failed to cancel placement ${placementId}:`, error);
+    return res.status(500).json({ error: 'Failed to cancel placement.', details: error.message });
   } finally {
     client.release();
   }

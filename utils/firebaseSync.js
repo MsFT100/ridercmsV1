@@ -6,6 +6,8 @@ const {
   finalizeRentalCollection,
   finalizeRentalOwnCollection,
   handleRentalReturnCompletion,
+  completeAdminRentalPlacement,
+  revertAdminRentalPlacement,
 } = require('./sessionUtils');
 const { reconcileSlotDeposit } = require('./depositReconcile');
 
@@ -410,6 +412,14 @@ async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
       const rentalReturned = await handleRentalReturnCompletion(pgClient, slotId, slotIdentifier, soc);
       if (rentalReturned) {
         logger.info(`Telemetry confirmed rental battery returned to ${slotIdentifier}.`);
+      } else {
+        // No rental return matched — the slot may be an admin rental-stock placement
+        // that was reserved with a pre-assigned battery and is now waiting for the
+        // admin to drop the battery in.
+        const placementCompleted = await completeAdminRentalPlacement(pgClient, slotId, slotIdentifier, soc);
+        if (placementCompleted) {
+          logger.info(`Telemetry confirmed admin rental-stock placement on ${slotIdentifier}.`);
+        }
       }
     }
 
@@ -471,7 +481,12 @@ async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
                 pgClient, slotId, slotIdentifier, getChargeSocFromTelemetry(telemetry)
               );
               if (!rentalReturned) {
-                logger.warn(`'deposit_accepted' ACK for ${slotIdentifier} received, but no 'opening' session was found to complete.`);
+                const placementCompleted = await completeAdminRentalPlacement(
+                  pgClient, slotId, slotIdentifier, getChargeSocFromTelemetry(telemetry)
+                );
+                if (!placementCompleted) {
+                  logger.warn(`'deposit_accepted' ACK for ${slotIdentifier} received, but no 'opening' session was found to complete.`);
+                }
               }
             }
             // Clear command and ACK
@@ -556,6 +571,13 @@ async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
           );
           if (cancelQueryResult.rowCount > 0) {
             logger.info(`Session ${cancelQueryResult.rows[0].id} marked as 'cancelled' due to deposit failure.`);
+          }
+          // Revert an admin rental-stock placement if one is pending on this slot
+          // (must run before the generic available reset, which would otherwise
+          // leave the pre-assigned battery linked to an 'available' slot).
+          const placementReverted = await revertAdminRentalPlacement(pgClient, slotId, slotIdentifier);
+          if (placementReverted) {
+            logger.warn(`Admin rental-stock placement on ${slotIdentifier} reverted after deposit failure ('${ackMessage}').`);
           }
           // Explicitly ensure the slot is marked available if the deposit failed
           await pgClient.query("UPDATE booth_slots SET status = 'available' WHERE id = $1", [slotId]);

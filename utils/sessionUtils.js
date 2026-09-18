@@ -248,6 +248,75 @@ async function finalizeRentalOwnCollection(pgClient, ownSlotId, slotIdentifier =
 }
 
 /**
+ * Completes an admin rental-stock placement once the battery is physically
+ * inserted. A placement is identified by a slot that is still 'opening' with a
+ * pre-assigned `current_battery_id` (this never happens for rider deposits or
+ * rental returns, which leave `current_battery_id` NULL until completion, so it
+ * is a safe discriminator for the admin flow).
+ * @param {object} pgClient - The PostgreSQL client, assumed to be within an active transaction.
+ * @param {number} slotId - The booth slot id being stocked.
+ * @param {string} [slotIdentifier] - Optional slot identifier for logging.
+ * @param {number|null} [insertionSoc] - The battery's live SOC read from telemetry at insertion.
+ * @returns {Promise<boolean>} True if an admin rental-stock placement was completed.
+ */
+async function completeAdminRentalPlacement(pgClient, slotId, slotIdentifier = null, insertionSoc = null) {
+  const result = await pgClient.query(
+    `UPDATE booth_slots
+     SET status = 'occupied',
+         charge_level_percent = COALESCE($2, charge_level_percent),
+         is_charging = false,
+         door_status = 'closed',
+         updated_at = NOW()
+     WHERE id = $1
+       AND status = 'opening'
+       AND current_battery_id IS NOT NULL
+     RETURNING id`,
+    [slotId, insertionSoc]
+  );
+
+  if (result.rowCount === 0) {
+    return false;
+  }
+
+  logger.info(`Admin rental-stock placement completed${slotIdentifier ? ` for slot ${slotIdentifier}` : ''}.`);
+  return true;
+}
+
+/**
+ * Reverts a placement that never got its battery inserted (timeout, hardware
+ * rejection, or manual cancellation): the slot returns to 'available' and the
+ * pre-assigned battery is unpaired. Only acts on the admin placement signature
+ * ('opening' + pre-assigned current_battery_id).
+ * @param {object} pgClient - The PostgreSQL client, assumed to be within an active transaction.
+ * @param {number} slotId - The booth slot id being reverted.
+ * @param {string} [slotIdentifier] - Optional slot identifier for logging.
+ * @returns {Promise<boolean>} True if an admin rental-stock placement was reverted.
+ */
+async function revertAdminRentalPlacement(pgClient, slotId, slotIdentifier = null) {
+  const result = await pgClient.query(
+    `UPDATE booth_slots
+     SET status = 'available',
+         current_battery_id = NULL,
+         charge_level_percent = NULL,
+         is_charging = false,
+         door_status = 'closed',
+         updated_at = NOW()
+     WHERE id = $1
+       AND status = 'opening'
+       AND current_battery_id IS NOT NULL
+     RETURNING id`,
+    [slotId]
+  );
+
+  if (result.rowCount === 0) {
+    return false;
+  }
+
+  logger.info(`Admin rental-stock placement reverted${slotIdentifier ? ` for slot ${slotIdentifier}` : ''}.`);
+  return true;
+}
+
+/**
  * A reusable function to complete a paid rental session.
  * Moves a returned (unpaid) rental from 'in_progress' to 'completed' once the
  * consolidated bill payment is confirmed, and notifies the user to collect their
@@ -421,4 +490,6 @@ module.exports = {
   finalizeRentalCollection,
   handleRentalReturnCompletion,
   finalizeRentalOwnCollection,
+  completeAdminRentalPlacement,
+  revertAdminRentalPlacement,
 };

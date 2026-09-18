@@ -218,6 +218,59 @@ async function resolveStuckWithdrawals() {
 }
 
 /**
+ * Resolves admin rental-stock placements stuck in 'opening' longer than the
+ * placement timeout (default 2 minutes): the battery was never inserted, so the
+ * slot is reverted to 'available', the pre-assigned battery is unpaired, and the
+ * 'openForDeposit' hardware command is cleared.
+ */
+async function resolveStuckRentalPlacements() {
+  let client;
+  try {
+    const pool = await poolPromise;
+    client = await pool.connect();
+
+    const stuckQuery = `
+      SELECT s.id AS "slotId", s.slot_identifier AS "slotIdentifier", b.booth_uid AS "boothUid"
+      FROM booth_slots s
+      JOIN booths b ON s.booth_id = b.id
+      WHERE s.status = 'opening'
+        AND s.current_battery_id IS NOT NULL
+        AND s.updated_at < NOW() - INTERVAL '2 minutes'
+      ORDER BY s.updated_at ASC
+    `;
+    const stuckRes = await client.query(stuckQuery);
+
+    if (stuckRes.rowCount > 0) {
+      const { revertAdminRentalPlacement } = require('../sessionUtils');
+      const db = getDatabase();
+      for (const slot of stuckRes.rows) {
+        await client.query('BEGIN');
+        try {
+          const reverted = await revertAdminRentalPlacement(client, slot.slotId, slot.slotIdentifier);
+          if (reverted) {
+            // Best-effort: clear the pending open command so the hardware stops
+            // waiting for a deposit.
+            await db.ref(`booths/${slot.boothUid}/slots/${slot.slotIdentifier}/command`).update({
+              openForDeposit: false,
+            });
+            logger.info(`[PlacementCron] Reverted stale admin rental-stock placement on ${slot.boothUid}/${slot.slotIdentifier}.`);
+          }
+          await client.query('COMMIT');
+        } catch (err) {
+          await client.query('ROLLBACK');
+          logger.error(`[PlacementCron] Failed to revert stale placement on ${slot.boothUid}/${slot.slotIdentifier}:`, err);
+        }
+      }
+      logger.info(`[PlacementCron] Reverted ${stuckRes.rowCount} stale admin rental-stock placement(s).`);
+    }
+  } catch (error) {
+    logger.error('[PlacementCron] Error resolving stuck admin rental-stock placements:', error);
+  } finally {
+    if (client) client.release();
+  }
+}
+
+/**
  * Weekly maintenance: purges cancelled sessions older than 30 days.
  */
 async function runWeeklyMaintenance() {
@@ -260,6 +313,11 @@ function startCronJob() {
     logger.error('[CleanupCron] Initial stuck resolution failed:', err);
   });
 
+  // Revert stale admin rental-stock placements immediately on startup
+  resolveStuckRentalPlacements().catch((err) => {
+    logger.error('[PlacementCron] Initial stale placement resolution failed:', err);
+  });
+
   // Check for pending payments that may have missed callbacks
   resolvePendingPayments().catch((err) => {
     logger.error('[MpesaCron] Initial pending payment check failed:', err);
@@ -298,6 +356,14 @@ function startCronJob() {
     });
   }, 90 * 1000);
 
+  // Revert stale admin rental-stock placements every 60 seconds
+  // (2 min threshold + 60s check window -> ~3 minutes max)
+  setInterval(() => {
+    resolveStuckRentalPlacements().catch((err) => {
+      logger.error('[PlacementCron] Scheduled stale placement resolution failed:', err);
+    });
+  }, 60 * 1000);
+
   // Check M-Pesa for stuck pending payments every 30 seconds
   // This recovers from missed callbacks within ~75 seconds of the STK push
   // (45s threshold + 30s check window)
@@ -313,5 +379,6 @@ module.exports = {
   checkChargingConditions,
   resolvePendingPayments,
   resolveStuckWithdrawals,
+  resolveStuckRentalPlacements,
   runWeeklyMaintenance,
 };

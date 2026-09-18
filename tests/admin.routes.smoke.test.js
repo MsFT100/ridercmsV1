@@ -110,6 +110,8 @@ describe('Admin Routes Smoke Test', () => {
     { method: 'GET', path: '/rentals/fleet' },
     { method: 'GET', path: '/rentals/sessions' },
     { method: 'POST', path: '/rentals' },
+    { method: 'GET', path: '/rentals/placement/:placementId/status' },
+    { method: 'POST', path: '/rentals/placement/:placementId/cancel' },
     { method: 'POST', path: '/rentals/:batteryUid/withdraw' },
     { method: 'GET', path: '/sessions' },
     { method: 'POST', path: '/sessions/:sessionId/charge' },
