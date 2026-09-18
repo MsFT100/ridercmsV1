@@ -218,6 +218,64 @@ async function resolveStuckWithdrawals() {
 }
 
 /**
+ * Resolves withdrawal sessions stuck in 'pending' that were never confirmed by
+ * M-Pesa (missed/lost callbacks, abandoned initiate-withdrawal flows, admin
+ * retries where the rider never paid, etc.). Without this sweep such rows stay
+ * 'pending' forever: the slot's "rented by" name is hidden (the deposit credit
+ * stays consumed), the user is blocked from starting a new withdrawal/rental,
+ * and the admin manual-withdraw guard keeps rejecting the slot.
+ *
+ * Rules (time is measured from `started_at`, falling back to `created_at`):
+ *  - payment NEVER initiated (no `mpesa_checkout_id`) -> fail after 10 min
+ *  - payment pushed but never confirmed (has checkout id) -> fail after 30 min
+ *
+ * Dev checkout ids (`DEV_%`) are skipped: they are auto-approved and should not
+ * linger, but we never want the sweep racing the synthetic approval path.
+ */
+async function resolveStuckPendingWithdrawals() {
+  let client;
+  try {
+    const pool = await poolPromise;
+    client = await pool.connect();
+    await client.query('BEGIN');
+
+    const stuckQuery = `
+      SELECT id, slot_id, user_id
+      FROM deposits
+      WHERE session_type = 'withdrawal'
+        AND status = 'pending'
+        AND (mpesa_checkout_id IS NULL OR mpesa_checkout_id NOT LIKE 'DEV_%')
+        AND EXTRACT(EPOCH FROM (NOW() - COALESCE(started_at, created_at))) >
+          CASE WHEN mpesa_checkout_id IS NULL THEN 600 ELSE 1800 END
+      FOR UPDATE
+    `;
+    const stuckRes = await client.query(stuckQuery);
+
+    if (stuckRes.rowCount > 0) {
+      const ids = stuckRes.rows.map((r) => r.id);
+      const updateRes = await client.query(
+        `UPDATE deposits
+         SET status = 'failed',
+             updated_at = NOW(),
+             notes = COALESCE(notes, '') || '\n[' || NOW() || '] Auto-failed by cleanup sweep: payment was never confirmed.'
+         WHERE id = ANY($1::int[]) AND status = 'pending'
+         RETURNING id`,
+        [ids]
+      );
+      await client.query('COMMIT');
+      logger.info(`[CleanupCron] Auto-failed ${updateRes.rowCount} stale pending withdrawal session(s).`);
+    } else {
+      await client.query('COMMIT');
+    }
+  } catch (error) {
+    if (client) await client.query('ROLLBACK');
+    logger.error('[CleanupCron] Error resolving stuck pending withdrawals:', error);
+  } finally {
+    if (client) client.release();
+  }
+}
+
+/**
  * Resolves admin rental-stock placements stuck in 'opening' longer than the
  * placement timeout (default 2 minutes): the battery was never inserted, so the
  * slot is reverted to 'available', the pre-assigned battery is unpaired, and the
@@ -313,6 +371,11 @@ function startCronJob() {
     logger.error('[CleanupCron] Initial stuck resolution failed:', err);
   });
 
+  // Fail stale pending withdrawals immediately on startup
+  resolveStuckPendingWithdrawals().catch((err) => {
+    logger.error('[CleanupCron] Initial stale pending withdrawal resolution failed:', err);
+  });
+
   // Revert stale admin rental-stock placements immediately on startup
   resolveStuckRentalPlacements().catch((err) => {
     logger.error('[PlacementCron] Initial stale placement resolution failed:', err);
@@ -364,6 +427,14 @@ function startCronJob() {
     });
   }, 60 * 1000);
 
+  // Fail stale pending withdrawals every 60 seconds
+  // (10/30 min thresholds caught within ~1 minute)
+  setInterval(() => {
+    resolveStuckPendingWithdrawals().catch((err) => {
+      logger.error('[CleanupCron] Scheduled stale pending withdrawal resolution failed:', err);
+    });
+  }, 60 * 1000);
+
   // Check M-Pesa for stuck pending payments every 30 seconds
   // This recovers from missed callbacks within ~75 seconds of the STK push
   // (45s threshold + 30s check window)
@@ -379,6 +450,7 @@ module.exports = {
   checkChargingConditions,
   resolvePendingPayments,
   resolveStuckWithdrawals,
+  resolveStuckPendingWithdrawals,
   resolveStuckRentalPlacements,
   runWeeklyMaintenance,
 };

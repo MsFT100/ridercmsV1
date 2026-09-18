@@ -3,6 +3,7 @@ const logger = require('../utils/logger');
 const {
   checkChargingConditions,
   resolveStuckWithdrawals,
+  resolveStuckPendingWithdrawals,
   resolvePendingPayments,
   runWeeklyMaintenance,
 } = require('../utils/cron-functions/hardware-cron');
@@ -74,6 +75,22 @@ router.post('/resolve-pending-payments', async (req, res) => {
   } catch (error) {
     logger.error('[Cron] resolvePendingPayments failed:', error);
     res.status(500).json({ error: 'resolvePendingPayments failed' });
+  }
+});
+
+/**
+ * POST /api/cron/resolve-stuck-pending-withdrawals
+ * Fails withdrawal sessions stuck in 'pending' longer than the configured
+ * windows (payment never initiated, or never confirmed by M-Pesa).
+ */
+router.post('/resolve-stuck-pending-withdrawals', async (req, res) => {
+  try {
+    logger.info('[Cron] Cloud Scheduler triggered: resolveStuckPendingWithdrawals');
+    await resolveStuckPendingWithdrawals();
+    res.status(200).json({ ok: true });
+  } catch (error) {
+    logger.error('[Cron] resolveStuckPendingWithdrawals failed:', error);
+    res.status(500).json({ error: 'resolveStuckPendingWithdrawals failed' });
   }
 });
 

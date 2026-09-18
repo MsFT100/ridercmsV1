@@ -49,8 +49,11 @@ const logger = winston.createLogger({
   exitOnError: false, // Do not exit on handled exceptions
 });
 
-// Create a stream object with a 'write' function that will be used by `morgan`
-Object.defineProperty(logger, 'stream', {
+// Create a stream object with a 'write' function that will be used by `morgan`.
+// The cast avoids a name clash with winston's typed `stream()` method.
+/** @type {any} */
+const loggerWithStream = logger;
+Object.defineProperty(loggerWithStream, 'stream', {
   configurable: true,
   value: {
     write: (message) => logger.info(message.trim()),

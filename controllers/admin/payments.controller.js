@@ -418,16 +418,19 @@ router.get('/payments/status/:sessionId', [verifyFirebaseToken, isAdmin], async 
 
     // Dev checkout IDs are always complete
     if (session.mpesa_checkout_id && session.mpesa_checkout_id.startsWith('DEV_')) {
+      res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
       return res.status(200).json({ success: true, status: session.status, sessionId: session.id });
     }
 
     // If already completed or in_progress, payment was received
     if (session.status === 'in_progress' || session.status === 'completed') {
+      res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
       return res.status(200).json({ success: true, status: session.status, sessionId: session.id });
     }
 
     // If failed
     if (session.status === 'failed' || session.status === 'cancelled') {
+      res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
       return res.status(200).json({ success: false, status: session.status, sessionId: session.id });
     }
 
@@ -442,6 +445,7 @@ router.get('/payments/status/:sessionId', [verifyFirebaseToken, isAdmin], async 
           // also treats it as such. Use a numeric compare to be safe.
           if (Number(ResultCode) === 0) {
             await completePaidWithdrawal(client, session.mpesa_checkout_id);
+            res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
             return res.status(200).json({ success: true, status: 'in_progress', sessionId: session.id });
           }
         } catch (e) {
@@ -450,6 +454,7 @@ router.get('/payments/status/:sessionId', [verifyFirebaseToken, isAdmin], async 
       }
     }
 
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
     return res.status(200).json({ success: false, status: session.status, sessionId: session.id });
   } catch (error) {
     logger.error('[Admin Payment Status] Failed:', error);

@@ -411,6 +411,7 @@ router.get('/sessions/:sessionId/payment-status', [verifyFirebaseToken, isAdmin]
       paymentStatus = 'pending';
     }
 
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
     res.status(200).json({ paymentStatus, rawStatus: status });
   } catch (error) {
     logger.error(`Failed to get payment status for session ${sessionId}:`, error);

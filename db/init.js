@@ -12,7 +12,6 @@ const initializeDatabase = async () => {
     // and check for existence to prevent errors on subsequent runs.
     await client.query('BEGIN');
 
-
     const createUsersTableQuery = `
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
