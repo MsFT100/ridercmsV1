@@ -222,12 +222,13 @@ const initializeDatabase = async () => {
       "Added 'withdrawal_notes' column to 'batteries' table."
     );
 
-    await runAlteration(
-      'deposits',
-      'status',
-      'ALTER TABLE deposits ADD CONSTRAINT deposits_status_check CHECK (status IN (''pending'', ''opening'', ''in_progress'', ''completed'', ''failed'', ''cancelled'', ''redeemed'', ''manual''));',
-      "Added 'manual' to the 'deposits.status' CHECK constraint."
-    );
+    // Add 'redeemed' to the status check constraint on 'deposits'
+    const checkConstraintRes = await client.query("SELECT 1 FROM pg_constraint WHERE conname = 'deposits_status_check' AND conrelid = 'deposits'::regclass AND pg_get_constraintdef(oid) LIKE '%redeemed%';");
+    if (checkConstraintRes.rowCount === 0) {
+      await client.query("ALTER TABLE deposits DROP CONSTRAINT deposits_status_check;");
+      await client.query("ALTER TABLE deposits ADD CONSTRAINT deposits_status_check CHECK (status IN ('pending', 'opening', 'in_progress', 'completed', 'failed', 'cancelled', 'redeemed', 'manual'));");
+      logger.info("Updated 'deposits.status' CHECK constraint to include 'manual' and 'redeemed'.");
+    }
 
     // Add 'rental' to the session_type check constraint on 'deposits'
     const sessionTypeConstraintRes = await client.query("SELECT 1 FROM pg_constraint WHERE conname = 'deposits_session_type_check' AND pg_get_constraintdef(oid) LIKE '%rental%';");
