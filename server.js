@@ -121,10 +121,15 @@ app.use(express.static(path.join(__dirname, 'public')));
 // Schema routing for developer isolation (must be before routes)
 app.use(schemaRouter);
 
-// Use morgan for HTTP request logging, piped through our winston logger
-// We cast morgan to 'any' to bypass a known mismatch between Morgan's base HTTP types 
+// Use morgan for HTTP request logging, piped through our winston logger.
+// Keep the format compact and skip the health check (it can fire every few
+// seconds from load balancers / monitors, which would flood the logs).
+// We cast morgan to 'any' to bypass a known mismatch between Morgan's base HTTP types
 // and the specific Express 5 Request/Response types used in app.use.
-app.use(/** @type {any} */ (morgan)('combined', { stream: logger.stream }));
+app.use(/** @type {any} */ (morgan)(':method :url :status :response-time ms', {
+  stream: logger.stream,
+  skip: (req) => req.path === '/api/health',
+}));
 
 // --- API Documentation (Swagger) ---
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));

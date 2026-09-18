@@ -41,7 +41,10 @@ if (isProduction) {
 }
 
 const logger = winston.createLogger({
-  level: isProduction ? 'info' : 'debug', // Be more verbose in development
+  // 'info' in both environments. Debug logs are extremely chatty under
+  // live telemetry (one sync + log per heartbeat), so they are kept off
+  // by default to avoid flooding logs and memory pressure.
+  level: 'info',
   transports,
   exitOnError: false, // Do not exit on handled exceptions
 });

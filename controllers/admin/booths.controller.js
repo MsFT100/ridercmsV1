@@ -66,6 +66,10 @@ router.get('/booths', [verifyFirebaseToken, isAdmin],
         bat.battery_uid,
         u.name AS user_name,
         u.phone AS user_phone,
+        -- True when the slot holds an unowned battery (rental-pool stock):
+        -- occupied, physically has a battery, and no user "owns" it via an
+        -- unconsumed completed deposit.
+        (s.status = 'occupied' AND s.current_battery_id IS NOT NULL AND last_deposit.user_id IS NULL) AS is_rental_pool,
         COUNT(*) OVER() as total_booths
       FROM (
         SELECT * FROM booths ORDER BY created_at DESC LIMIT $1 OFFSET $2
@@ -128,7 +132,8 @@ router.get('/booths', [verifyFirebaseToken, isAdmin],
           chargeLevel: row.slot_charge_level,
           batteryUid: row.battery_uid,
           userName: row.user_name,
-          userPhone: row.user_phone
+          userPhone: row.user_phone,
+          isRentalPool: row.is_rental_pool
         });
         booth.slotCount++;
       }
@@ -172,7 +177,9 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
         s.slot_identifier,
         u.name AS user_name,
         u.phone AS user_phone,
-        manual_wd.manual_withdrawal_id IS NOT NULL AS pending_manual_unlock
+        manual_wd.manual_withdrawal_id IS NOT NULL AS pending_manual_unlock,
+        -- True when the slot holds an unowned battery (rental-pool stock).
+        (s.status = 'occupied' AND s.current_battery_id IS NOT NULL AND last_deposit.user_id IS NULL) AS is_rental_pool
       FROM booths b
       LEFT JOIN booth_slots s ON b.id = s.booth_id
       -- Use a lateral join to find the user from the most recent completed deposit that has NOT been consumed by a withdrawal.
@@ -230,19 +237,21 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
           },
           slotUserMap: {},
           slotUserPhoneMap: {},
-          slotManualUnlockMap: {}
+          slotManualUnlockMap: {},
+          slotPoolMap: {}
         };
       }
       if (row.slot_identifier) {
         acc[row.booth_uid].slotUserMap[row.slot_identifier] = row.user_name;
         acc[row.booth_uid].slotUserPhoneMap[row.slot_identifier] = row.user_phone;
         acc[row.booth_uid].slotManualUnlockMap[row.slot_identifier] = row.pending_manual_unlock;
+        acc[row.booth_uid].slotPoolMap[row.slot_identifier] = row.is_rental_pool;
       }
       return acc;
     }, {});
 
     // 2. Fetch real-time data from Firebase for each unique booth.
-    const boothStatusPromises = Object.values(groupedBooths).map(async ({ details: booth, slotUserMap, slotUserPhoneMap, slotManualUnlockMap }) => {
+    const boothStatusPromises = Object.values(groupedBooths).map(async ({ details: booth, slotUserMap, slotUserPhoneMap, slotManualUnlockMap, slotPoolMap }) => {
       const boothRef = db.ref(`booths/${booth.booth_uid}`);
       const snapshot = await boothRef.get();
 
@@ -275,6 +284,7 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
               userName: slotUserMap[slotIdentifier] || null, // Add user's name here
               userPhone: slotUserPhoneMap[slotIdentifier] || null,
               pendingManualUnlock: slotManualUnlockMap[slotIdentifier] || false,
+              isRentalPool: slotPoolMap[slotIdentifier] || false,
               telemetry: telemetry,
               // The battery object contains the most up-to-date info.
               // `telemetry.batteryInserted` is the source of truth for a

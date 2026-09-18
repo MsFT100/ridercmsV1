@@ -201,6 +201,33 @@ Request → schemaRouter (ALS: 'public')
 | `controllers/booths/deposit.controller.js` | Simulates deposit for `dev-` booths |
 | `controllers/booths/withdrawal.controller.js` | Simulates stop-charging and release for `dev-` booths, skips M-Pesa |
 
+## Logging & Memory
+
+### Logging setup
+
+- **Level**: `info` in **all** environments (`utils/logger.js`). `debug` is off by default.
+- **Transports**: console always; a rotating JSON file (`logs/application-%DATE%.log`, 20 MB max / 14 days) in non-production.
+- **HTTP access logs**: morgan in `server.js` uses a compact `:method :url :status :response-time ms` format. `/api/health` polls are skipped.
+
+### Why debug is off (critical)
+
+`firebaseSync.js` listens to Firebase `child_changed` on every booth and runs **once per telemetry heartbeat**. Each sync does a `JSON.stringify` diff, a PostgreSQL write, and logs. In dev this used to run at `debug` level, producing a flood of `[FirebaseSync] Successfully synced slot ...` / `Hardware signal: ...` lines.
+
+Under sustained telemetry + heavy request polling this can push Node's default V8 heap toward its ~2 GB limit, causing an out-of-memory crash like:
+
+```
+<--- Last few GCs --->
+Mark-Compact (reduce) 2047.0 (2084.3) -> 2046.4 (2084.5) MB ... allocation failure
+```
+
+**Do not** set the logger back to `debug` in a shared/environment with live hardware. If more verbosity is needed, temporarily raise the level via `LOGGER_LEVEL` and revert, or add targeted `logger.debug` calls rather than re-enabling the global level.
+
+### If the OOM recurs
+
+1. Confirm the crash is a V8 heap-limit failure (same GC signature) vs. the container being OOM-killed.
+2. Check `/logs` for a runaway rotating-file buffer; confirm the file transport is keeping up.
+3. The next hot path to throttle is `syncSlotState()` in `firebaseSync.js` — it writes to PostgreSQL on every heartbeat. Consider debouncing co-located telemetry bursts per slot before DB-write + logging.
+
 ## Deploy
 
 ```bash
