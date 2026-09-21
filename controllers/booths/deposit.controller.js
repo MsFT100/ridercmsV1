@@ -398,4 +398,54 @@ router.get('/my-battery-status', verifyFirebaseToken, async (/** @type {any} */ 
   }
 });
 
+/**
+ * GET /api/booths/deposit-sessions/:sessionId/status
+ * Lets the depositing rider poll the lifecycle status of their own deposit
+ * session — including the terminal states (`cancelled`, `failed`) that
+ * `my-battery-status` intentionally hides because it only surfaces COMPLETED
+ * deposits. Without this, a booth that auto-cancels a deposit (e.g. a
+ * `deposit_timeout` hardware ACK, or an operator cancelling it) leaves the app
+ * stuck forever on "Waiting for Confirmation".
+ *
+ * Scoped to the authenticated user; returns 404 when the session does not exist
+ * or belongs to someone else.
+ */
+router.get('/deposit-sessions/:sessionId/status', verifyFirebaseToken, async (/** @type {any} */ req, res) => {
+  const { uid: firebaseUid } = req.user;
+  const sessionId = Number(req.params.sessionId);
+
+  if (!Number.isInteger(sessionId)) {
+    return res.status(400).json({ error: 'Invalid session id.' });
+  }
+
+  const pool = await poolPromise;
+  const client = await pool.connect(req.schema);
+  try {
+    const result = await client.query(
+      `SELECT
+         d.id AS "sessionId",
+         d.session_type AS "sessionType",
+         d.status AS "sessionStatus",
+         s.slot_identifier AS "slotIdentifier",
+         bo.booth_uid AS "boothUid"
+       FROM deposits d
+       LEFT JOIN booth_slots s ON d.slot_id = s.id
+       LEFT JOIN booths bo ON d.booth_id = bo.id
+       WHERE d.id = $1 AND d.user_id = $2`,
+      [sessionId, firebaseUid]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Session not found.' });
+    }
+
+    return res.status(200).json(result.rows[0]);
+  } catch (error) {
+    logger.error(`Failed to get deposit session ${sessionId} for user ${firebaseUid}:`, error);
+    return res.status(500).json({ error: 'Failed to retrieve session status.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 module.exports = router;

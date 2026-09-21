@@ -66,6 +66,7 @@ describe('Booths Routes Smoke Test', () => {
     { method: 'GET', path: '/:boothUid/slots/:slotIdentifier' },
     { method: 'POST', path: '/initiate-deposit' },
     { method: 'GET', path: '/my-battery-status' },
+    { method: 'GET', path: '/deposit-sessions/:sessionId/status' },
     { method: 'POST', path: '/stop-charging' },
     { method: 'POST', path: '/initiate-withdrawal' },
     { method: 'POST', path: '/sessions/:sessionId/pay' },

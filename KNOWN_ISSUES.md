@@ -123,3 +123,39 @@ The owner-rule queries gate physical presence on `booth_slots.status =
 - `tests/depositCompletion.test.js` — asserts `handleDepositCompletion` marks
   the slot occupied (guarded to `'opening'`), and source-guards the telemetry
   fallback + failure-reset guard.
+- `tests/depositSessionStatus.test.js` — guards the session-status endpoint
+  below (user-scoped, terminal states visible).
+
+## 3. Rider stuck on "Waiting for Confirmation" when a deposit is auto-cancelled
+
+**Status:** Fixed 2026-09-21. Same flow as issue #2 — the *failure* half.
+
+### Symptom
+
+The booth auto-cancels a deposit (e.g. `deposit_timeout`, operator cancel,
+rejected insert) or is unreachable. The rider stays on "Waiting for
+Confirmation…" forever because nothing ever tells them it was cancelled.
+
+### Root cause
+
+`GET /api/booths/my-battery-status` intentionally returns only COMPLETED
+deposits, so a `cancelled`/`failed` session yields `null` — indistinguishable
+from "still opening". The frontend poll (`UserDashboard.tsx`) only acted on a
+non-empty result and silently swallowed fetch errors (`catch {}`), so neither a
+server-side cancellation nor a dropped connection ever surfaced.
+
+### Guarantees to restore if this regresses
+
+- `GET /api/booths/deposit-sessions/:sessionId/status` MUST return the caller's
+  own session lifecycle (`pending`/`opening`/`completed`/`cancelled`/`failed`/…),
+  scoped by `d.id = $1 AND d.user_id = $2` (404 otherwise). It must NOT filter
+  on completion — exposing terminal states is the entire point.
+- The deposit poll MUST stop and inform the rider on `cancelled`/`failed`
+  (return to `home`, or `multi_status` if other batteries remain).
+- Repeated poll failures MUST surface a "connection lost" notice (once) while
+  continuing to retry; a recovered poll MUST reset the failure/notice state.
+
+### Guardrails / tests
+
+- `tests/depositSessionStatus.test.js` — user scoping + terminal-state visibility.
+- `tests/booths.routes.smoke.test.js` — route registration.
