@@ -75,3 +75,51 @@ Admin renter/withdrawal queries, `my-battery-status`, `activeBatterySession`
   `ensureSlotBatteryLinked` never fabricate batteries for rider deposits.
 - Keep these guards whenever touching deposit reconciliation, battery backfill,
   deposit completion, or any withdrawal/renter query.
+
+## 2. Rider stuck on "Waiting for Confirmation" after depositing own battery
+
+**Status:** Fixed 2026-09-21. Regression introduced by the same owner-rule
+re-model as issue #1 — treat with care.
+
+### Symptom
+
+A rider inserts/secures/locks their own battery (hardware done in ~10s), but the
+app spins on "Waiting for Confirmation…" indefinitely. `GET
+/api/booths/my-battery-status` returns `null`, so the frontend poll (600ms,
+`UserDashboard.tsx`) never advances. Own-battery withdrawal was silently broken
+too (same gate).
+
+### Root cause
+
+The owner-rule queries gate physical presence on `booth_slots.status =
+'occupied'`, but nothing transitioned a rider-deposit slot out of `'opening'`:
+
+- `initiate-deposit` sets the slot to `'opening'` (`deposit.controller.js`).
+- `mapSlotStatus` deliberately keeps `'opening'` while `currentDbStatus ===
+  'opening' && batteryInserted` (`firebaseSync.js`), so telemetry alone never
+  reaches `'occupied'`.
+- `handleDepositCompletion` marked the deposit `completed` but never updated the
+  slot. (Before the re-model, queries matched on the fabricated
+  `current_battery_id`, which `handleDepositCompletion` did set.)
+
+### Guarantees to restore if this regresses
+
+- `handleDepositCompletion` MUST set the slot to `'occupied'` (guarded
+  `WHERE id = $1 AND status = 'opening'`) when it completes a rider deposit —
+  never fabricate a battery for it.
+- Deposit confirmation must not depend solely on the `deposit_accepted` ACK: a
+  telemetry-only fallback finalizes an `'opening'` rider deposit when
+  `batteryInserted && doorClosed && doorLocked && plugConnected` (so a missed /
+  delayed ACK cannot strand the rider). It must skip rental returns / admin
+  placements (they have no `deposit` session to match).
+- A late deposit-failure ACK must not downgrade an already-occupied slot: the
+  reset is `UPDATE booth_slots SET status = 'available' WHERE id = $1 AND status
+  = 'opening'`.
+- `POST /initiate-deposit` returns `sessionId` so the client can track the
+  exact session while polling.
+
+### Guardrails / tests
+
+- `tests/depositCompletion.test.js` — asserts `handleDepositCompletion` marks
+  the slot occupied (guarded to `'opening'`), and source-guards the telemetry
+  fallback + failure-reset guard.

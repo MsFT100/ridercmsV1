@@ -242,6 +242,9 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (/** @type {any} */ 
         identifier: slotIdentifier,
         status: isDevBooth(boothUid) ? 'completed' : 'opening',
       },
+      // Return the session id so the client can track this exact deposit while
+      // polling (the client matches on sessionId, falling back to slot).
+      sessionId: depositId,
     });
   } catch (error) {
     await client.query('ROLLBACK');

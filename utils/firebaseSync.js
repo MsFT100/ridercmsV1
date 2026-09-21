@@ -216,6 +216,25 @@ async function handleDepositCompletion(pgClient, boothUid, slotIdentifier, slotI
       logger.error(`Failed to backfill battery_id for deposit ${depositId} on slot ${slotIdentifier}:`, backfillError);
     }
 
+    // Mark the slot as physically occupied now that the deposit is confirmed.
+    // Owner-rule queries (my-battery-status, withdrawal-info, activeBatterySession)
+    // identify a rider's own battery by `booth_slots.status = 'occupied'` because
+    // rider deposits have NO battery identity. `mapSlotStatus` intentionally keeps
+    // a slot in 'opening' while it waits for a battery, so without this transition
+    // an accepted deposit leaves the slot stuck in 'opening' forever and the rider
+    // waits indefinitely for confirmation. Guarded to 'opening' so a slot that is
+    // already occupied (e.g. rental return) is never downgraded.
+    try {
+      await pgClient.query(
+        `UPDATE booth_slots
+         SET status = 'occupied', updated_at = NOW()
+         WHERE id = $1 AND status = 'opening'`,
+        [slotId]
+      );
+    } catch (slotUpdateError) {
+      logger.error(`Failed to mark slot ${slotIdentifier} occupied after deposit ${depositId}:`, slotUpdateError);
+    }
+
     // Automatically send command to start charging the newly deposited battery.
     const db = getDatabase();
     const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
@@ -397,6 +416,31 @@ async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
     // --- Event-driven logic based on hardware ACK messages ---
     const ackMessage = slotData.command?.ack;
 
+    // Telemetry-only fallback for rider deposits: if a battery is physically
+    // present and fully secured (door closed & locked, plug connected) while the
+    // slot is still 'opening', the 'deposit_accepted' ACK may have been missed or
+    // delayed. Finalize the newest 'opening' rider deposit straight from telemetry
+    // so the rider is never stuck on "Waiting for Confirmation". handleDepositCompletion
+    // returns false when no rider deposit matches, so rental returns/placements
+    // (handled below) are unaffected. Requiring plugConnected avoids finalizing on
+    // a 'rejected_no_plug' state.
+    if (
+      batteryInserted &&
+      newStatus === 'opening' &&
+      telemetry.doorClosed === true &&
+      telemetry.doorLocked === true &&
+      telemetry.plugConnected === true
+    ) {
+      try {
+        const depositCompleted = await handleDepositCompletion(pgClient, boothUid, slotIdentifier, slotId, telemetry);
+        if (depositCompleted) {
+          logger.info(`Telemetry confirmed own-battery deposit on ${slotIdentifier} (ACK fallback).`);
+        }
+      } catch (depositError) {
+        logger.error(`Failed telemetry deposit completion for slot ${slotIdentifier}:`, depositError);
+      }
+    }
+
     // Telemetry-only fallback for rental returns: if a battery becomes physically
     // present, it may be a rented battery dropped into its reserved return slot.
     // Normal deposits are unaffected (handleRentalReturnCompletion matches only
@@ -572,8 +616,10 @@ async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
           if (placementReverted) {
             logger.warn(`Admin rental-stock placement on ${slotIdentifier} reverted after deposit failure ('${ackMessage}').`);
           }
-          // Explicitly ensure the slot is marked available if the deposit failed
-          await pgClient.query("UPDATE booth_slots SET status = 'available' WHERE id = $1", [slotId]);
+          // Ensure the slot is released if it is still waiting for the deposit.
+          // Guarded to 'opening' so a slot that already became 'occupied' (e.g. a
+          // telemetry-confirmed deposit) is not clobbered by a late failure ACK.
+          await pgClient.query("UPDATE booth_slots SET status = 'available' WHERE id = $1 AND status = 'opening'", [slotId]);
           // Reset command state
           await commandRef.update({ openForDeposit: false, ack: "" });
           break;
