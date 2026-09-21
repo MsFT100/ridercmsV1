@@ -538,6 +538,7 @@ router.get('/rentals/fleet', [verifyFirebaseToken, isAdmin], async (req, res) =>
          r.return_slot_id,
          b.battery_uid AS "batteryUid",
          br.booth_uid AS "sourceBoothUid",
+         br.name AS "sourceBoothName",
          bl.slot_identifier AS "sourceSlotIdentifier",
          u.name AS "userName",
          u.phone AS "userPhone",
@@ -559,6 +560,7 @@ router.get('/rentals/fleet', [verifyFirebaseToken, isAdmin], async (req, res) =>
       `SELECT
          s.slot_identifier AS "slotIdentifier",
          bo.booth_uid AS "boothUid",
+         bo.name AS "boothName",
          b.battery_uid AS "batteryUid",
          s.charge_level_percent AS "chargeLevel",
          s.status AS "slotStatus"
@@ -595,6 +597,7 @@ router.get('/rentals/fleet', [verifyFirebaseToken, isAdmin], async (req, res) =>
       sessionId: row.sessionId,
       rentedAt: row.rentedAt,
       sourceBoothUid: row.sourceBoothUid,
+      sourceBoothName: row.sourceBoothName,
       sourceSlotIdentifier: row.sourceSlotIdentifier,
       user: {
         name: row.userName,
@@ -607,6 +610,7 @@ router.get('/rentals/fleet', [verifyFirebaseToken, isAdmin], async (req, res) =>
       batteryUid: row.batteryUid,
       state: 'IN_SLOT',
       boothUid: row.boothUid,
+      boothName: row.boothName,
       slotIdentifier: row.slotIdentifier,
       chargeLevel: row.chargeLevel !== null ? Number(row.chargeLevel) : null,
       slotStatus: row.slotStatus,

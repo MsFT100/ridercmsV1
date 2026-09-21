@@ -11,6 +11,11 @@ declare global {
         role?: string;
         [key: string]: any;
       };
+      /**
+       * Postgres search_path schema (set by schemaRouter via AsyncLocalStorage)
+       * or the boilerplate 'public' if not overridden.
+       */
+      schema?: any;
     }
   }
 }
