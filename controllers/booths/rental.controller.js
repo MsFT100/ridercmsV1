@@ -48,17 +48,31 @@ const isRentalEnabled = async (client) => {
 
 /**
  * GET /api/booths/rentals/status
- * @summary Rental feature availability
- * @description Returns whether the rental battery feature is enabled for riders.
+ * @summary Rental feature availability and rider-facing rules
+ * @description Returns whether the rental battery feature is enabled for riders,
+ * plus the verification/allocation rules the app must honour so the client and
+ * server stay in sync (scan gates, rental limit, minimum SOC).
  * @tags [Booths]
  * @security - bearerAuth: []
  */
 router.get('/rentals/status', verifyFirebaseToken, async (req, res) => {
   const pool = await poolPromise;
-  const client = await pool.connect(req.schema);
+  const client = await pool.connect((/** @type {{ schema?: string }} */ (req)).schema);
   try {
-    const enabled = await isRentalEnabled(client);
-    res.status(200).json({ enabled });
+    const settingsRes = await client.query("SELECT value FROM app_settings WHERE key = 'rental'");
+    const rent = settingsRes.rows[0]?.value || {};
+
+    res.status(200).json({
+      enabled: rent.enabled !== false,
+      // `require_rental_scan_before_issue` is repurposed: the assigned battery is
+      // locked inside its slot and cannot be scanned, so this now means "require
+      // a scan of the BOOTH QR code before issuing a rental".
+      requireBoothScanBeforeIssue: rent.require_rental_scan_before_issue === true,
+      requireReturnScan: rent.require_return_scan === true,
+      allowRentalWhileOwnBatteryCharging: rent.allow_rental_while_own_battery_charging !== false,
+      maxRentalBatteriesPerUser: Number(rent.max_rental_batteries_per_user ?? 1),
+      minimumSocPercent: Number(rent.minimum_soc_percent ?? 50),
+    });
   } catch (error) {
     logger.error('Failed to check rental feature status:', error);
     res.status(500).json({ error: 'Failed to check rental feature status.' });
@@ -215,7 +229,7 @@ router.post('/rentals/issue', verifyFirebaseToken, async (req, res) => {
        WHERE d.user_id = $1
          AND d.session_type = 'deposit'
          AND d.status = 'completed'
-         AND s.current_battery_id IS NOT NULL
+         AND s.status = 'occupied'
          AND NOT EXISTS (
            SELECT 1 FROM deposits w
            WHERE w.consumed_deposit_id = d.id
@@ -224,7 +238,7 @@ router.post('/rentals/issue', verifyFirebaseToken, async (req, res) => {
          )
        ORDER BY d.completed_at DESC
        LIMIT 1`,
-      [firebaseUid]
+      [firebaseUid] 
     );
     if (creditRes.rows.length === 0) {
       throw new Error('NO_DEPOSITED_BATTERY');
@@ -373,6 +387,8 @@ router.get('/rentals/active', verifyFirebaseToken, async (req, res) => {
          bat.battery_uid AS "batteryUid",
          retB.booth_uid AS "returnBoothUid",
          retS.slot_identifier AS "returnSlotIdentifier",
+         retS.status AS "returnSlotStatus",
+         retS.charge_level_percent AS "returnSoc",
          dep.id AS "ownDepositId",
          dep.initial_charge_level AS "ownInitialSoc",
          ownB.booth_uid AS "ownBoothUid",
@@ -413,7 +429,13 @@ router.get('/rentals/active', verifyFirebaseToken, async (req, res) => {
         boothUid: row.sourceBoothUid,
         slotIdentifier: row.sourceSlotIdentifier,
       },
+      // `returned` is true as soon as a return slot is RESERVED; `returnCompleted`
+      // only becomes true once the rented battery is physically inserted (the
+      // return slot flips to 'occupied'). The app must use `returnCompleted` to
+      // know when it can show the final bill.
       returned: !!row.return_slot_id,
+      returnCompleted: !!row.return_slot_id && row.returnSlotStatus === 'occupied',
+      returnSoc: row.returnSoc !== null && row.returnSoc !== undefined ? Number(row.returnSoc) : null,
       returnSlot: row.return_slot_id
         ? { boothUid: row.returnBoothUid, slotIdentifier: row.returnSlotIdentifier }
         : null,
@@ -617,7 +639,7 @@ async function computeRentalBill(client, rental) {
   const issueSoc = Number(rental.initial_charge_level ?? returnSoc);
   const energyGone = Math.max(0, issueSoc - returnSoc);
 
-  const durationMs = new Date() - new Date(rental.created_at);
+  const durationMs = Date.now() - new Date(rental.created_at).getTime();
   const durationMinutes = Math.max(0, Math.round(durationMs / 60000));
 
   // --- Pricing: prefer new `rental` settings; fall back to legacy `pricing` keys ---
@@ -810,7 +832,7 @@ router.post('/rentals/:sessionId/pay', verifyFirebaseToken, async (req, res) => 
  * @security - bearerAuth: []
  */
 router.get('/rentals/status/:checkoutRequestId', verifyFirebaseToken, async (req, res) => {
-  const { checkoutRequestId } = req.params;
+  const checkoutRequestId = String(req.params.checkoutRequestId ?? '');
   const { uid: firebaseUid } = req.user;
 
   const pool = await poolPromise;
@@ -838,7 +860,7 @@ router.get('/rentals/status/:checkoutRequestId', verifyFirebaseToken, async (req
     }
 
     const PENDING_TIMEOUT_SECONDS = parseInt(process.env.MPESA_PENDING_TIMEOUT_SECONDS, 10) || 60;
-    const secondsSinceStart = (new Date() - new Date(startedAt)) / 1000;
+    const secondsSinceStart = (Date.now() - new Date(startedAt).getTime()) / 1000;
     if (secondsSinceStart < PENDING_TIMEOUT_SECONDS) {
       return res.status(200).json({ paymentStatus: 'pending' });
     }
@@ -908,10 +930,14 @@ router.post('/rentals/:sessionId/unlock-own', verifyFirebaseToken, async (req, r
       throw new Error('OWN_BATTERY_NOT_FOUND');
     }
 
-    // The own slot must still physically contain the user's battery.
+    // The own slot must still physically contain the user's battery. A rider's
+    // own deposited battery intentionally has NO battery identity
+    // (current_battery_id stays NULL — battery IDs are reserved for the
+    // company's rental pool), so physical presence is tracked solely by the
+    // slot being 'occupied'.
     const ownSlotState = await client.query(
       `SELECT status FROM booth_slots
-       WHERE id = $1 AND status = 'occupied' AND current_battery_id IS NOT NULL`,
+       WHERE id = $1 AND status = 'occupied'`,
       [ownSlot.slotId]
     );
     if (ownSlotState.rowCount === 0) {

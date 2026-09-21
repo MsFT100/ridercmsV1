@@ -326,7 +326,11 @@ const initializeDatabase = async () => {
           rental_energy_rate_per_percent: 0.5,
           rental_energy_rate_per_kwh: 50,
           rental_time_rate_per_minute: 10,
-          require_rental_scan_before_issue: true,
+          // Repurposed: the assigned rental battery is locked in its slot and
+          // cannot be scanned, so this now means "require scanning the BOOTH QR
+          // before issuing". Off by default because the booth/slot is already
+          // resolved by the availability check.
+          require_rental_scan_before_issue: false,
           require_return_scan: true,
           auto_charge_returned_battery: true,
           allow_rental_while_own_battery_charging: true
