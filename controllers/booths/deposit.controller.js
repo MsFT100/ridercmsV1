@@ -48,6 +48,16 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (/** @type {any} */ 
     const existingSessionRes = await client.query(existingSessionQuery, [firebaseUid]);
 
     for (const session of existingSessionRes.rows) {
+      // A rider who still has a rental battery out (issued or awaiting
+      // collection/return) cannot start another deposit. This holds across
+      // every browser or device because it is enforced server-side.
+      if (
+        session.session_type === 'rental' &&
+        (session.status === 'pending' || session.status === 'in_progress')
+      ) {
+        throw new Error('ACTIVE_RENTAL_EXISTS');
+      }
+
       // --- Robust Idempotency for Double-Clicks ---
       // If an 'opening' deposit session exists from a previous tap, we don't just re-use it.
       // We cancel it and proceed with the current request to find a fresh, verified slot.
@@ -255,6 +265,12 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (/** @type {any} */ 
         : 'This booth is currently offline or does not exist.';
       logger.warn(`Deposit initiation failed for user ${firebaseUid} at booth ${boothUid}: ${userMessage}`);
       return res.status(409).json({ error: 'Booth not available', message: userMessage });
+    }
+
+    if (error.message === 'ACTIVE_RENTAL_EXISTS') {
+      const userMessage = 'Return your rental battery before depositing another one.';
+      logger.warn(`Deposit initiation blocked for user ${firebaseUid} at booth ${boothUid}: active rental session.`);
+      return res.status(409).json({ error: 'ACTIVE_RENTAL_EXISTS', message: userMessage });
     }
 
     logger.error(
