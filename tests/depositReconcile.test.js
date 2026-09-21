@@ -49,6 +49,9 @@ function selectResurrectCandidate(deposits, withdrawals, slotBatteryId) {
 function makeClient({ slot, deposit, updateRowCount, linkedBatteryId = 44, ownerDeposit = { id: 77, battery_id: null } }) {
   return {
     query: async (text) => {
+      if (text.includes('SELECT current_battery_id\n') && text.includes('FROM booth_slots') && text.includes('WHERE id = $1')) {
+        return { rowCount: slot ? 1 : 0, rows: slot ? [slot] : [] };
+      }
       if (text.includes('SELECT current_battery_id, charge_level_percent')) {
         return { rowCount: slot ? 1 : 0, rows: slot ? [slot] : [] };
       }
@@ -81,7 +84,7 @@ function makeClient({ slot, deposit, updateRowCount, linkedBatteryId = 44, owner
 }
 
 describe('reconcileSlotDeposit', () => {
-  it('re-completes a failed deposit when the slot is occupied and relinks a missing battery', async () => {
+  it('re-completes a failed deposit on an occupied slot and does NOT fabricate a battery', async () => {
     const client = makeClient({
       slot: { status: 'occupied', current_battery_id: null, charge_level_percent: 71 },
       deposit: { id: 77, status: 'failed' },
@@ -97,8 +100,8 @@ describe('reconcileSlotDeposit', () => {
       previousStatus: 'failed',
       newStatus: 'completed',
       reason: 'battery_present',
-      relinked: true,
-      batteryId: 44,
+      relinked: false,
+      batteryId: null,
     });
   });
 
@@ -137,10 +140,10 @@ describe('reconcileSlotDeposit', () => {
     });
   });
 
-  it('relinks a missing battery and still reports applied when no failed deposit exists', async () => {
+  it('reports applied (with no battery fabrication) even when no failed deposit exists', async () => {
     // Covers self-healing of the "completed deposit + missing battery link" case:
-    // the deposit reconcile finds nothing to restore, but the occupied slot must
-    // still get its battery re-linked.
+    // the deposit reconcile finds nothing to restore, and a rider's own battery
+    // (battery_id = NULL) must NOT get a synthetic battery fabricated.
     const client = makeClient({
       slot: { status: 'occupied', current_battery_id: null, charge_level_percent: 100 },
       deposit: null,
@@ -152,8 +155,8 @@ describe('reconcileSlotDeposit', () => {
 
     assert.equal(result.reason, 'no_failed_deposit');
     assert.equal(result.reconciled, false);
-    assert.equal(result.relinked, true);
-    assert.equal(result.batteryId, 44);
+    assert.equal(result.relinked, false);
+    assert.equal(result.batteryId, null);
   });
 
   it('does not relink when the battery is already linked', async () => {
@@ -181,7 +184,10 @@ describe('ensureSlotBatteryLinked', () => {
     assert.deepStrictEqual(result, { relinked: false, batteryId: 3, batteryUid: null, reason: 'already_linked' });
   });
 
-  it('creates and links a battery when current_battery_id is NULL and an owner deposit exists', async () => {
+  it('does NOT fabricate a battery for a rider-owned deposit (battery_id = NULL)', async () => {
+    // A rider's own deposited battery has no battery identity — battery IDs are
+    // reserved for company rental batteries. Slot occupancy is tracked by
+    // `status = 'occupied'`, so we never create a synthetic battery here.
     const client = makeClient({
       slot: { status: 'occupied', current_battery_id: null, charge_level_percent: 60 },
       ownerDeposit: { id: 60, battery_id: null },
@@ -189,9 +195,7 @@ describe('ensureSlotBatteryLinked', () => {
 
     const result = await ensureSlotBatteryLinked(client, 5, 'slot-001', 72);
 
-    assert.equal(result.relinked, true);
-    assert.equal(result.batteryId, 44);
-    assert.ok(result.batteryUid.startsWith('bat-5-'), 'battery UID must be derived from slot id + timestamp');
+    assert.deepStrictEqual(result, { relinked: false, batteryId: null, batteryUid: null, reason: 'no_battery_for_personal_deposit' });
   });
 
   it('does NOT fabricate a battery when the slot has no owner deposit (ghost-battery guard)', async () => {
@@ -335,12 +339,12 @@ describe('reconcileSlotDeposit: ghost-battery resurrection guard', () => {
     );
   });
 
-  test('ensureSlotBatteryLinked never fabricates a battery without a current owner deposit', () => {
+  test('ensureSlotBatteryLinked never fabricates a battery', () => {
     const src = fs.readFileSync(
       path.join(__dirname, '../utils/depositReconcile.js'),
       'utf8'
     );
-    // The owner-deposit lookup guards the fabrication branch.
+    // The owner-deposit lookup still gates the re-link of an EXISTING real battery.
     assert.match(
       src,
       /SELECT d\.id, d\.battery_id[\s\S]*?d\.status IN \('opening', 'in_progress', 'completed'\)/,
@@ -350,6 +354,16 @@ describe('reconcileSlotDeposit: ghost-battery resurrection guard', () => {
       src,
       /no_owner_deposit/,
       'must short-circuit with no_owner_deposit when the slot has no owner'
+    );
+    // No synthetic battery may ever be fabricated for a rider-owned deposit.
+    assert.match(
+      src,
+      /no_battery_for_personal_deposit/,
+      'must report no_battery_for_personal_deposit for identity-less rider deposits'
+    );
+    assert.ok(
+      !src.includes('INSERT INTO batteries'),
+      'ensureSlotBatteryLinked must never fabricate a batteries row'
     );
   });
 });

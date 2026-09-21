@@ -198,41 +198,12 @@ async function handleDepositCompletion(pgClient, boothUid, slotIdentifier, slotI
     const depositId = depositUpdateResult.rows[0].id;
     logger.info(`Deposit session ${depositId} for slot ${slotIdentifier} completed with initial charge ${chargeLevel}%.`);
 
-    // Ensure the slot has a linked battery record. Dev booths and admin simulations
-    // already set current_battery_id, but the normal hardware flow does not.
-    // Without this, my-battery-status returns empty because it requires
-    // s.current_battery_id IS NOT NULL.
-    try {
-      const slotCheck = await pgClient.query(
-        'SELECT current_battery_id FROM booth_slots WHERE id = $1',
-        [slotId]
-      );
-      if (slotCheck.rows.length > 0 && slotCheck.rows[0].current_battery_id === null) {
-        const batteryUid = `bat-${slotId}-${Date.now()}`;
-        const batteryRes = await pgClient.query(
-          `INSERT INTO batteries (battery_uid, charge_level_percent, health_status)
-           VALUES ($1, $2, 'good')
-           ON CONFLICT (battery_uid) DO UPDATE SET charge_level_percent = $2
-           RETURNING id`,
-          [batteryUid, chargeLevel]
-        );
-        const batteryId = batteryRes.rows[0].id;
-        await pgClient.query(
-          'UPDATE booth_slots SET current_battery_id = $1 WHERE id = $2',
-          [batteryId, slotId]
-        );
-        logger.info(`Linked new battery ${batteryUid} (id=${batteryId}) to slot ${slotIdentifier} for deposit ${depositId}.`);
-      }
-    } catch (batteryError) {
-      logger.error(`Failed to create/link battery for slot ${slotIdentifier}:`, batteryError);
-    }
-
-    // Backfill the deposit's battery_id when the slot ALREADY had a linked battery
-    // (pre-seeded battery, admin simulation, or a previous linking run). The branch
-    // above only sets battery_id when it creates a brand-new battery record, which
-    // left recent hardware deposits with a NULL battery_id even though the battery
-    // is physically (and telemetrically) present in the slot. Keeping this column
-    // populated is what lets strict battery-matching queries work on new deposits.
+    // A user's own deposited battery is NOT assigned a battery identity: battery
+    // IDs are reserved for the company's rental batteries. The slot's physical
+    // presence is tracked by `status = 'occupied'` (telemetry-driven), so a
+    // rider-deposited battery legitimately keeps current_battery_id/battery_id
+    // NULL. Only backfill deposits.battery_id when the slot ALREADY holds a real
+    // battery (pre-seeded battery, admin simulation) — never fabricate one.
     try {
       await pgClient.query(
         `UPDATE deposits d

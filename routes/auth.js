@@ -522,12 +522,26 @@ router.get('/profile', verifyFirebaseToken, async (req, res) => {
             JOIN booths bo ON d.booth_id = bo.id
             LEFT JOIN batteries bat ON s.current_battery_id = bat.id
             WHERE d.user_id = $1 AND d.session_type = 'deposit' AND d.status = 'completed'
-              AND s.current_battery_id IS NOT NULL
+              AND s.status = 'occupied'
               AND NOT EXISTS (
                 SELECT 1 FROM deposits w
                 WHERE w.consumed_deposit_id = d.id
-                  AND w.session_type = 'withdrawal'
+                  AND w.session_type IN ('withdrawal', 'rental')
                   AND w.status NOT IN ('cancelled', 'failed')
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM deposits newer
+                WHERE newer.slot_id = d.slot_id
+                  AND newer.session_type = 'deposit'
+                  AND newer.id > d.id
+                  AND newer.user_id <> d.user_id
+                  AND newer.status IN ('opening', 'in_progress', 'completed')
+                  AND NOT EXISTS (
+                    SELECT 1 FROM deposits w2
+                    WHERE w2.consumed_deposit_id = newer.id
+                      AND w2.session_type IN ('withdrawal', 'rental')
+                      AND w2.status NOT IN ('cancelled', 'failed')
+                  )
               )`;
           const batteryRes = await fallbackClient.query(batteryQuery, [uid]);
           if (batteryRes.rows.length > 0) {
@@ -548,7 +562,9 @@ router.get('/profile', verifyFirebaseToken, async (req, res) => {
     // --- Check for an active battery session (consistent with login) ---
     const batteryQuery = `
       -- Find the user's "deposit credit" - a completed deposit session
-      -- that has not yet been redeemed by a withdrawal.
+      -- that has not yet been redeemed by a withdrawal/rental and that still
+      -- OWNS a physically occupied slot. Physical presence is 'occupied'
+      -- (a rider's own deposited battery has no battery identity).
       SELECT
         bat.battery_uid as "batteryUid",
         s.charge_level_percent as "chargeLevel",
@@ -559,12 +575,26 @@ router.get('/profile', verifyFirebaseToken, async (req, res) => {
       JOIN booths bo ON d.booth_id = bo.id
       LEFT JOIN batteries bat ON s.current_battery_id = bat.id
       WHERE d.user_id = $1 AND d.session_type = 'deposit' AND d.status = 'completed'
-        AND s.current_battery_id IS NOT NULL
+        AND s.status = 'occupied'
         AND NOT EXISTS (
           SELECT 1 FROM deposits w
           WHERE w.consumed_deposit_id = d.id
-            AND w.session_type = 'withdrawal'
+            AND w.session_type IN ('withdrawal', 'rental')
             AND w.status NOT IN ('cancelled', 'failed')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM deposits newer
+          WHERE newer.slot_id = d.slot_id
+            AND newer.session_type = 'deposit'
+            AND newer.id > d.id
+            AND newer.user_id <> d.user_id
+            AND newer.status IN ('opening', 'in_progress', 'completed')
+            AND NOT EXISTS (
+              SELECT 1 FROM deposits w2
+              WHERE w2.consumed_deposit_id = newer.id
+                AND w2.session_type IN ('withdrawal', 'rental')
+                AND w2.status NOT IN ('cancelled', 'failed')
+            )
         );
     `;
     const batteryRes = await pgClient.query(batteryQuery, [uid]);

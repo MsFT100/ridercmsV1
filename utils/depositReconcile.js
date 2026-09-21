@@ -14,31 +14,28 @@ function normalizeSoc(rawSoc) {
 }
 
 /**
- * Ensures an occupied slot has a linked battery row in PostgreSQL.
+ * Re-links a slot to its owner deposit's EXISTING battery row, when one exists.
  *
- * Background: `firebaseSync.syncSlotState` clears `booth_slots.current_battery_id`
- * whenever telemetry briefly reports `batteryInserted = false` for a non-available
- * slot (the battery is then re-detected moments later and the slot returns to
- * 'occupied'). Every renter-name, `withdrawal-info` and manual-withdrawal query
- * requires `s.current_battery_id IS NOT NULL`, so a NULL link means the UI shows
- * "Rented By: None" even though the battery is physically present and a valid
- * completed deposit exists. This helper re-creates the link so those flows work
- * again without loosening any query guards.
+ * Battery IDs are reserved for the company's rental batteries. A rider's own
+ * deposited battery never gets a synthetic `bat-<slotId>-<epoch>` battery
+ * fabricated (that is exactly how "ghost" rental-pool batteries were created).
+ * The slot's physical presence is tracked by `status = 'occupied'`, so a
+ * rider-deposited battery legitimately keeps `current_battery_id` NULL.
  *
- * Safer than the historical behavior: an occupied slot WITHOUT an owner deposit
- * never gets a synthetic battery (bat-<slotId>-<epoch>) fabricated — doing so is
- * exactly what created the "ghost" batteries that surface as available rental
- * stock. Only the current owner deposit (most recent non-consumed deposit in an
- * active state) is used, and its existing battery is re-linked when known.
+ * This helper only re-links a REAL battery the current owner deposit already
+ * references (e.g. `firebaseSync.syncSlotState` cleared `current_battery_id` on
+ * a telemetry flicker but the deposit still knows its battery) and only when a
+ * deposit actually owns the slot — an occupied slot with NO owner deposit gets
+ * nothing.
  * @param {object} pgClient - A connected pg client (schema already resolved).
  * @param {number} slotId - The primary key of `booth_slots`.
  * @param {string} slotIdentifier - The slot identifier, for logging.
- * @param {number|null} [chargeLevel] - SOC to stamp on a newly fabricated battery.
+ * @param {number|null} [chargeLevel] - Kept for call-site compatibility; unused.
  * @returns {Promise<{relinked: boolean, batteryId: number|null, batteryUid: string|null, reason: string}>} The linking outcome.
  */
 async function ensureSlotBatteryLinked(pgClient, slotId, slotIdentifier, chargeLevel = null) {
   const slotRes = await pgClient.query(
-    `SELECT current_battery_id, charge_level_percent
+    `SELECT current_battery_id
      FROM booth_slots
      WHERE id = $1`,
     [slotId]
@@ -48,19 +45,15 @@ async function ensureSlotBatteryLinked(pgClient, slotId, slotIdentifier, chargeL
     return { relinked: false, batteryId: null, batteryUid: null, reason: 'slot_not_found' };
   }
 
-  const { current_battery_id: currentBatteryId, charge_level_percent: slotCharge } = slotRes.rows[0];
+  const { current_battery_id: currentBatteryId } = slotRes.rows[0];
 
   if (currentBatteryId != null) {
     return { relinked: false, batteryId: currentBatteryId, batteryUid: null, reason: 'already_linked' };
   }
 
-  // ONLY fabricate/re-link a battery when a deposit actually owns this slot.
-  // An occupied slot with NO owner deposit — e.g. the deposit was consumed by a
-  // withdrawal, or the battery is unowned — must NOT get a synthetic
-  // "bat-<slotId>-<epoch>" battery fabricated: that is exactly how ghost
-  // rental-pool batteries were created. They then surface in the rentals fleet
-  // as "Available Rental Battery" (IN_SLOT) forever because they carry a fake
-  // UID that never maps to a real hardware serial.
+  // Only re-link a battery when a deposit actually owns this slot. An occupied
+  // slot with NO owner deposit — e.g. the deposit was consumed by a withdrawal,
+  // or the battery is unowned — must NOT get a battery fabricated.
   const ownerRes = await pgClient.query(
     `SELECT d.id, d.battery_id
      FROM deposits d
@@ -109,32 +102,13 @@ async function ensureSlotBatteryLinked(pgClient, slotId, slotIdentifier, chargeL
     return { relinked: true, batteryId: existingBatteryId, batteryUid: null, reason: 'relinked_existing' };
   }
 
-  const soc = normalizeSoc(chargeLevel) ?? normalizeSoc(slotCharge) ?? 100;
-  const batteryUid = `bat-${slotId}-${Date.now()}`;
-  const batteryRes = await pgClient.query(
-    `INSERT INTO batteries (battery_uid, charge_level_percent, health_status)
-     VALUES ($1, $2, 'good')
-     ON CONFLICT (battery_uid) DO UPDATE SET charge_level_percent = $2
-     RETURNING id`,
-    [batteryUid, soc]
-  );
-  const batteryId = batteryRes.rows[0].id;
-
-  await pgClient.query(
-    'UPDATE booth_slots SET current_battery_id = $1, updated_at = NOW() WHERE id = $2',
-    [batteryId, slotId]
-  );
-
-  // Backfill only the exact owner deposit found above, never every session on
-  // the slot (stamping another user's battery onto stale deposits is what
-  // produced ghost batteries in my-battery-status).
-  await pgClient.query(
-    'UPDATE deposits SET battery_id = $1 WHERE id = $2',
-    [batteryId, ownerDeposit.id]
-  );
-
-  logger.info(`Relinked synthetic battery ${batteryUid} (id=${batteryId}) to slot ${slotIdentifier}.`);
-  return { relinked: true, batteryId, batteryUid, reason: 'relinked' };
+  // A user's own deposited battery has no battery identity — battery IDs are
+  // reserved for the company's rental batteries. Previously we fabricated a
+  // synthetic `bat-<slotId>-<epoch>` battery here; that produced ghastly
+  // "ghost" rental-pool batteries and stamped fake IDs onto rider deposits.
+  // Slot occupancy is now tracked by `status = 'occupied'`, so a rider-deposited
+  // battery legitimately keeps current_battery_id/battery_id NULL.
+  return { relinked: false, batteryId: null, batteryUid: null, reason: 'no_battery_for_personal_deposit' };
 }
 
 /**

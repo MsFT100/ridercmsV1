@@ -289,7 +289,7 @@ router.post('/payments/manual-withdraw', [verifyFirebaseToken, isAdmin], async (
 
     // 2. Resolve booth and slot, locking the slot row to serialize concurrent manual withdrawals.
     const slotRes = await client.query(`
-      SELECT s.id AS "slotId", s.current_battery_id, b.id AS "boothId"
+      SELECT s.id AS "slotId", s.status, s.current_battery_id, b.id AS "boothId"
       FROM booth_slots s
       JOIN booths b ON s.booth_id = b.id
       WHERE b.booth_uid = $1 AND s.slot_identifier = $2
@@ -299,16 +299,22 @@ router.post('/payments/manual-withdraw', [verifyFirebaseToken, isAdmin], async (
     if (slotRes.rows.length === 0) {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: `Slot '${slotIdentifier}' in booth '${boothUid}' not found.` });
-    }
+    } 
 
-    const { slotId, currentBatteryId, boothId } = slotRes.rows[0];
+    const { slotId, status: slotStatus, boothId } = slotRes.rows[0];
 
     // 3. Guard: the withdrawal must target a battery physically present in the slot.
     //    An empty slot must never be withdrawn from against a stale deposit.
-    if (!currentBatteryId) {
+    //    Physical presence is `status = 'occupied'` (telemetry truth): a rider's
+    //    own deposited battery has NO battery identity (battery IDs are reserved
+    //    for company rental batteries), so current_battery_id may legitimately
+    //    be NULL while the slot is occupied.
+    if (slotStatus !== 'occupied') {
       await client.query('ROLLBACK');
+      logger.warn(`[Admin Manual Withdraw] Attempt to withdraw from empty slot ${slotIdentifier} in booth ${boothUid} by admin ${req.user.uid}.`);
       return res.status(409).json({ error: 'This slot is empty (no battery physically present). Cannot withdraw from it.' });
-    }
+      
+    } 
 
     // 4. Guard: no active withdrawal may already be in progress on the slot.
     const activeWithdrawalRes = await client.query(`
@@ -319,15 +325,17 @@ router.post('/payments/manual-withdraw', [verifyFirebaseToken, isAdmin], async (
 
     if (activeWithdrawalRes.rows.length > 0) {
       await client.query('ROLLBACK');
+      logger.warn(`[Admin Manual Withdraw] Attempt to create a new withdrawal on slot ${slotIdentifier} in booth ${boothUid} while an active withdrawal exists. Admin: ${req.user.uid}.`);
       return res.status(409).json({ error: 'An active withdrawal session already exists on this slot. Resolve it first.' });
     }
 
     // 5. Resolve the original deposit credit to link as consumed_deposit_id.
     //    The credit must belong to the TARGET user: a user must never withdraw
-    //    against another user's battery deposit. It must also match the battery
-    //    physically in the slot (legacy NULL-battery deposits are only trusted on
-    //    an occupied slot when no NEWER unconsumed deposit by another user owns
-    //    the slot first), and it must not already be consumed by a withdrawal/rental.
+    //    against another user's battery deposit. It must also be for a battery
+    //    physically present in the slot (`status = 'occupied'`) and it must not
+    //    already be consumed by a withdrawal/rental. The slot's owner is the
+    //    most recent completed deposit with no NEWER unconsumed deposit by
+    //    another user owning the slot first.
     const depositCreditRes = await client.query(`
       SELECT d.id
       FROM deposits d
@@ -336,8 +344,7 @@ router.post('/payments/manual-withdraw', [verifyFirebaseToken, isAdmin], async (
         AND d.user_id = $2
         AND d.session_type = 'deposit'
         AND d.status = 'completed'
-        AND s.current_battery_id IS NOT NULL
-        AND (d.battery_id = s.current_battery_id OR d.battery_id IS NULL)
+        AND s.status = 'occupied'
         AND NOT EXISTS (
           SELECT 1 FROM deposits w
           WHERE w.consumed_deposit_id = d.id
@@ -364,6 +371,7 @@ router.post('/payments/manual-withdraw', [verifyFirebaseToken, isAdmin], async (
 
     if (depositCreditRes.rows.length === 0) {
       await client.query('ROLLBACK');
+      logger.warn(`[Admin Manual Withdraw] User ${userId} has no active deposit credit in slot ${slotIdentifier} of booth ${boothUid}. Admin: ${req.user.uid}.`);
       return res.status(409).json({
         error: `User ${userId} has no active battery credit in slot. The target user must be the current owner of the battery physically present in this slot.`,
       });
@@ -510,7 +518,7 @@ router.get('/payments/status/:sessionId', [verifyFirebaseToken, isAdmin], async 
 
     // Still pending — optionally self-heal by querying M-Pesa
     if (session.mpesa_checkout_id && session.started_at) {
-      const secondsSinceStart = (Date.now() - new Date(session.started_at)) / 1000;
+      const secondsSinceStart = (Date.now() - new Date(session.started_at).getTime()) / 1000;
       if (secondsSinceStart > 60) {
         try {
           const mpesaResponse = await querySTKStatus(session.mpesa_checkout_id);

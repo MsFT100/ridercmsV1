@@ -274,7 +274,7 @@ describe('Anti-double-allocation fixes', () => {
            AND session_type = 'deposit'
            AND status = 'completed'
            AND NOT EXISTS (
-             SELECT 1 FROM booth_slots bs WHERE bs.id = deposits.slot_id AND bs.current_battery_id IS NOT NULL
+             SELECT 1 FROM booth_slots bs WHERE bs.id = deposits.slot_id AND bs.status = 'occupied'
            )
            AND NOT EXISTS (
              SELECT 1 FROM deposits w
@@ -348,7 +348,7 @@ describe('Anti-double-allocation fixes', () => {
       await client.query(
         `UPDATE deposits SET status = 'failed', notes = COALESCE(notes, '') || '\n[' || NOW() || '] Deposit failed: slot reassigned to new user.'
          WHERE slot_id = $1 AND session_type = 'deposit' AND status = 'completed'
-         AND NOT EXISTS (SELECT 1 FROM booth_slots bs WHERE bs.id = deposits.slot_id AND bs.current_battery_id IS NOT NULL)
+         AND NOT EXISTS (SELECT 1 FROM booth_slots bs WHERE bs.id = deposits.slot_id AND bs.status = 'occupied')
          AND NOT EXISTS (SELECT 1 FROM deposits w WHERE w.consumed_deposit_id = deposits.id AND w.session_type = 'withdrawal' AND w.status NOT IN ('cancelled', 'failed'))`,
         [slotId]
       );

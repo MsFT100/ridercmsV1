@@ -160,7 +160,7 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (/** @type {any} */ 
              AND session_type = 'deposit'
              AND status = 'completed'
              AND NOT EXISTS (
-               SELECT 1 FROM booth_slots bs WHERE bs.id = deposits.slot_id AND bs.current_battery_id IS NOT NULL
+               SELECT 1 FROM booth_slots bs WHERE bs.id = deposits.slot_id AND bs.status = 'occupied'
              )
              AND NOT EXISTS (
                SELECT 1 FROM deposits w
@@ -280,13 +280,13 @@ router.get('/my-battery-status', verifyFirebaseToken, async (/** @type {any} */ 
   const client = await pool.connect(req.schema);
   try {
     // 1. Find where the user's battery is located from our database.
-    // NOTE: this endpoint is intentionally STRICT — it must locate the physical
-    // battery the user deposited (real-time device truth), so the deposit's
-    // battery must match the slot's battery exactly. This differs from the admin
-    // renter/withdrawal queries (controllers/admin/booths.controller.js) which
-    // are intentionally NULL-tolerant on battery_id because hardware deposits
-    // historically completed without linking battery_id when the slot already
-    // had a battery. do NOT copy the tolerant pattern here.
+    // STRICT: a rider only sees a battery when their completed deposit still
+    // OWNS a physically occupied slot (real-time device truth via
+    // `status = 'occupied'`). A rider's own deposited battery has no battery
+    // identity — battery IDs are reserved for company rental batteries — so
+    // ownership is the "latest unconsumed deposit with no newer deposit by
+    // another user" rule. The newer-owner guard (and the battery-identity
+    // removal) is what keeps stale/ghost deposits from resurfacing.
     const locationQuery = `
       SELECT
         d.id AS "sessionId",
@@ -302,13 +302,26 @@ router.get('/my-battery-status', verifyFirebaseToken, async (/** @type {any} */ 
       WHERE d.user_id = $1
         AND d.session_type = 'deposit'
         AND d.status = 'completed'
-        AND d.battery_id = s.current_battery_id
-        AND s.current_battery_id IS NOT NULL
+        AND s.status = 'occupied'
         AND NOT EXISTS (
           SELECT 1 FROM deposits w
           WHERE w.consumed_deposit_id = d.id
-            AND w.session_type = 'withdrawal'
+            AND w.session_type IN ('withdrawal', 'rental')
             AND w.status NOT IN ('cancelled', 'failed')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM deposits newer
+          WHERE newer.slot_id = d.slot_id
+            AND newer.session_type = 'deposit'
+            AND newer.id > d.id
+            AND newer.user_id <> d.user_id
+            AND newer.status IN ('opening', 'in_progress', 'completed')
+            AND NOT EXISTS (
+              SELECT 1 FROM deposits w2
+              WHERE w2.consumed_deposit_id = newer.id
+                AND w2.session_type IN ('withdrawal', 'rental')
+                AND w2.status NOT IN ('cancelled', 'failed')
+            )
         );
     `;
     const locationResult = await client.query(locationQuery, [firebaseUid]);

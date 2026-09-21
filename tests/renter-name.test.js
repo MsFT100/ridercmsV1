@@ -7,7 +7,7 @@ const path = require('node:path');
 /**
  * Reads the admin booths controller source so we can assert on the actual SQL
  * embedded in the route handlers. This guards against the query silently
- * regressing to the battery_id match or losing the withdrawal-consumption guard.
+ * regressing to a battery_id match or losing the owner/withdrawal guards.
  * @returns {string} The full controller source.
  */
 function readControllerSource() {
@@ -20,16 +20,19 @@ function readControllerSource() {
 /**
  * Models the renter-selection semantics of the LATERAL join used by every
  * admin booth query. Mirrors the SQL exactly: pick the most recent completed
- * deposit that has NOT been consumed by a non-failed/non-cancelled withdrawal,
- * and only when the battery is physically in the slot. A deposit with a known
- * battery_id must match the slot's current battery; legacy NULL-battery
- * deposits (pre battery-tracking) are trusted on occupied slots.
- * @param {Array<{id:number, userId:number, completedAt:number, batteryId?:number|null}>} deposits - All deposits on the slot.
- * @param {Array<{consumedDepositId:number, status:string}>} withdrawals - All withdrawals on the slot.
- * @param {number|null} [slotBatteryId] - The slot's current_battery_id. Defaults to a battery so behaviour is unchanged for callers that don't model battery presence.
+ * deposit that is NOT consumed by a non-failed/non-cancelled withdrawal/rental,
+ * and only when the slot is PHYSICALLY occupied (`status = 'occupied'`).
+ *
+ * The "owner" rule replaces the old battery_uid/id identity match: a rider's
+ * own deposited battery has no battery identity (battery IDs are reserved for
+ * the company's rental batteries), so a deposit owns the slot when no NEWER
+ * deposit by a DIFFERENT user is itself still active and un-consumed.
+ * @param {Array<{id:number, userId:number, completedAt:number, status?:string}>} deposits - All deposits on the slot.
+ * @param {Array<{consumedDepositId:number, status:string}>} withdrawals - All withdrawals/rentals on the slot.
+ * @param {boolean} [slotOccupied] - Whether the slot is physically occupied. Defaults to true.
  * @returns {number|null} The userId of the current renter, or null if none.
  */
-function selectRenter(deposits, withdrawals, slotBatteryId = 1) {
+function selectRenter(deposits, withdrawals, slotOccupied = true) {
   const consumedIds = new Set(
     withdrawals
       .filter((w) => w.status !== 'failed' && w.status !== 'cancelled')
@@ -37,12 +40,17 @@ function selectRenter(deposits, withdrawals, slotBatteryId = 1) {
   );
 
   const eligible = deposits
+    .filter((d) => d.status === 'completed' || d.status === undefined)
     .filter((d) => !consumedIds.has(d.id))
-    // Empty slots never show a name.
-    .filter(() => slotBatteryId !== null)
-    // A known deposit battery must match the one physically in the slot;
-    // legacy deposits without battery tracking are trusted on occupied slots.
-    .filter((d) => d.batteryId == null || d.batteryId === slotBatteryId)
+    // Empty (non-occupied) slots never show a name.
+    .filter(() => slotOccupied)
+    // No NEWER deposit by another user may still own the slot first.
+    .filter((d) => !deposits.some((newer) =>
+      newer.id > d.id &&
+      newer.userId !== d.userId &&
+      (newer.status === 'completed' || newer.status === 'opening' || newer.status === 'in_progress') &&
+      !consumedIds.has(newer.id)
+    ))
     .sort((a, b) => b.completedAt - a.completedAt);
 
   return eligible.length > 0 ? eligible[0].userId : null;
@@ -51,34 +59,55 @@ function selectRenter(deposits, withdrawals, slotBatteryId = 1) {
 // ─── SQL surface tests ────────────────────────────────────────────────────────
 
 describe('Renter ("Rented By") name resolution', () => {
-  test('all booth queries keep the withdrawal guard AND require the battery physically in the slot', () => {
+  test('all booth queries keep the owner guards and require the slot physically occupied', () => {
     const src = readControllerSource();
 
-    // Each admin booth query must contain the NOT EXISTS withdrawal guard.
-    const guard = src.match(/NOT EXISTS \([\s\S]*?consumed_deposit_id = d\.id[\s\S]*?session_type = 'withdrawal'/g);
+    // Each admin booth query must contain the withdrawal/rental consumption guard.
+    const guard = src.match(/NOT EXISTS \([\s\S]*?consumed_deposit_id = d\.id[\s\S]*?session_type IN \('withdrawal', 'rental'\)/g);
     assert.ok(
-      guard && guard.length >= 3,
-      `Expected >=3 withdrawal-consumption guards in booth queries, found ${guard?.length ?? 0}`
+      guard && guard.length >= 5,
+      `Expected >=5 owner-consumption guards in booth queries, found ${guard?.length ?? 0}`
     );
 
-    // A name must only show when the slot actually holds a battery: this guard must be
+    // A name must only show when the slot is PHYSICALLY occupied: this guard must be
     // present in every renter LATERAL (3), the ownerQuery (1), the manual_unlock
     // lateral (1), the withdrawal-info query (1) and the manual-withdrawal creation
     // query (1) => exactly 7 with this assertion.
-    const batteryRequired = src.match(/AND s\.current_battery_id IS NOT NULL/g);
+    const occupiedRequired = src.match(/AND s\.status = 'occupied'/g);
     assert.ok(
-      batteryRequired && batteryRequired.length >= 7,
-      `Expected >=7 "slot must hold a battery" guards, found ${batteryRequired?.length ?? 0}`
+      occupiedRequired && occupiedRequired.length >= 7,
+      `Expected >=7 "slot must be occupied" guards, found ${occupiedRequired?.length ?? 0}`
     );
 
-    // Legacy NULL-battery deposits are trusted on occupied slots, but a deposit with a
-    // known battery must match the physical battery. Every renter/withdrawal join must
-    // carry this: 3 renter laterals + ownerQuery + withdrawal-info + manual-withdrawal = 6.
-    const nullTrusted = src.match(/d\.battery_id = s\.current_battery_id OR d\.battery_id IS NULL/g);
-    assert.equal(
-      nullTrusted?.length ?? 0,
-      6,
-      `Expected 6 physical-battery OR-guards, found ${nullTrusted?.length ?? 0}`
+    // No owner may be chosen if a NEWER deposit by another user owns the slot first
+    // (the owner rule that replaced battery-id matching).
+    const newerOwnerGuard = src.match(/newer\.user_id <> d\.user_id/g);
+    assert.ok(
+      newerOwnerGuard && newerOwnerGuard.length >= 6,
+      `Expected >=6 newer-owner guards, found ${newerOwnerGuard?.length ?? 0}`
+    );
+  });
+
+  test('no booth query matches the deposit to a battery identity anymore', () => {
+    // Battery IDs are reserved for company rental batteries; a rider's own battery
+    // has no identity. The renter/withdrawal queries must never require a
+    // battery_id match to pick an owner.
+    const src = readControllerSource();
+
+    assert.ok(
+      !src.includes('d.battery_id = s.current_battery_id'),
+      'booth queries must not match deposits to a battery identity'
+    );
+    // The only place battery-linkage may remain is the is_rental_pool flag,
+    // which must keep a battery identity to detect company rental stock. No
+    // renter/withdrawal/owner query may gate presence on a battery link.
+    const batteryLinkLines = src
+      .split('\n')
+      .map((l, i) => ({ n: i + 1, l }))
+      .filter(({ l }) => l.includes('s.current_battery_id IS NOT NULL'));
+    assert.ok(
+      batteryLinkLines.length > 0 && batteryLinkLines.every(({ l }) => l.includes('is_rental_pool')),
+      `battery-link occupancy signal must only remain for is_rental_pool, found at lines: ${batteryLinkLines.map((x) => x.n).join(', ')}`
     );
   });
 
@@ -129,67 +158,60 @@ describe('Renter ("Rented By") name resolution', () => {
   });
 
   test('an empty slot never shows a name even if an active deposit exists', () => {
-    // Regression for slot008: battery removed (current_battery_id = NULL) but the
+    // Regression for slot008: battery removed (status = 'available') but the
     // deposit was never consumed -> the stale rider name must NOT resurface.
     const renter = selectRenter(
-      [{ id: 1, userId: 10, completedAt: 100, batteryId: 5 }],
+      [{ id: 1, userId: 10, completedAt: 100 }],
       [],
-      null // no battery physically in the slot
+      false // slot not occupied
     );
 
     assert.equal(renter, null, 'Empty slot must show no renter');
   });
 
-  test('an occupied slot with a matching battery shows the renter', () => {
+  test('an occupied slot shows the renter (no battery identity needed)', () => {
+    // A rider's own deposited battery has NO battery_id: ownership is proven by
+    // the deposit being the slot's latest un-consumed deposit.
     const renter = selectRenter(
-      [{ id: 1, userId: 10, completedAt: 100, batteryId: 5 }],
+      [{ id: 1, userId: 10, completedAt: 100 }],
       [],
-      5
+      true
     );
 
-    assert.equal(renter, 10, 'Renter whose battery is physically present must show');
+    assert.equal(renter, 10, 'Renter whose deposit owns the occupied slot must show');
   });
 
-  test('a legacy NULL-battery deposit is still trusted on an occupied slot', () => {
-    // 81 completed deposits in prod have battery_id = NULL on slots that DO hold a
-    // battery; hiding those would wipe legitimate renter names.
+  test('a deposit is hidden once a newer deposit by another user owns the slot', () => {
+    // Old renter's deposit is still active/un-consumed, but User B deposited
+    // later into the same (now occupied) slot: the old rider must not claim the
+    // name via a stale credit.
     const renter = selectRenter(
-      [{ id: 1, userId: 10, completedAt: 100, batteryId: null }],
-      [],
-      5
+      [
+        { id: 1, userId: 10, completedAt: 100 }, // old renter, battery never removed
+        { id: 2, userId: 20, completedAt: 200 }, // newer deposit by another user
+      ],
+      []
     );
 
-    assert.equal(renter, 10, 'NULL-battery deposit on occupied slot must still show');
+    assert.equal(renter, 20, 'Newest deposit owner wins; old active deposit is not the renter');
   });
 
-  test('a deposit whose battery is NOT in the slot is hidden (known mismatch)', () => {
-    // Battery was swapped/removed and a different renter now occupies the slot:
-    // a deposit linked to a different battery must not claim the name.
+  test('a consumed deposit with an otherwise occupied slot still yields no name', () => {
+    // The withdrawal guard and the occupied guard compose: even if the slot is
+    // occupied, a consumed deposit must not win.
     const renter = selectRenter(
-      [{ id: 1, userId: 10, completedAt: 100, batteryId: 5 }],
-      [],
-      9 // slot now holds a different battery
+      [{ id: 1, userId: 10, completedAt: 100 }],
+      [{ consumedDepositId: 1, status: 'completed' }]
     );
 
-    assert.equal(renter, null, 'Mismatched battery deposit must not show');
+    assert.equal(renter, null, 'Consumed deposit must not show even if the slot is occupied');
   });
 
-  test('a consumed deposit with a matching battery still yields no name', () => {
-    // The withdrawal guard and the physical-battery guard compose: even if the
-    // battery is present, a consumed deposit must not win.
-    const renter = selectRenter(
-      [{ id: 1, userId: 10, completedAt: 100, batteryId: 5 }],
-      [{ consumedDepositId: 1, status: 'completed' }],
-      5
-    );
-
-    assert.equal(renter, null, 'Consumed deposit must not show even if battery matches');
-  });
-
-  test('withdrawal-info and manual-withdrawal queries require the battery physically present', () => {
+  test('withdrawal-info and manual-withdrawal queries require the slot occupied and the owner rule', () => {
     // The two money-operational endpoints (withdrawal-info and manual-withdrawal
-    // creation) must not resolve against a deposit whose battery is NOT in the slot.
-    // This is what stops stale/orphaned deposits from being withdrawn into.
+    // creation) must not resolve against a deposit on an EMPTY slot nor against a
+    // stale deposit overtaken by a newer user. This is what stops stale/orphaned
+    // deposits from being withdrawn into.
     const src = readControllerSource();
 
     const withdrawalInfoQuery = src.match(/SELECT d\.user_id, d\.initial_charge_level[\s\S]*?LIMIT 1/);
@@ -204,12 +226,12 @@ describe('Renter ("Rented By") name resolution', () => {
         `${label} query must join booth_slots`
       );
       assert.ok(
-        q.includes('AND s.current_battery_id IS NOT NULL'),
-        `${label} query must require a battery in the slot`
+        q.includes('AND s.status = \'occupied\''),
+        `${label} query must require the slot physically occupied`
       );
       assert.ok(
-        q.includes('d.battery_id = s.current_battery_id OR d.battery_id IS NULL'),
-        `${label} query must trust legacy NULL-battery deposits on occupied slots`
+        q.includes('newer.user_id <> d.user_id'),
+        `${label} query must use the owner rule (no newer deposit by another user)`
       );
     }
   });

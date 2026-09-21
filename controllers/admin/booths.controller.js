@@ -67,6 +67,15 @@ router.get('/booths', [verifyFirebaseToken, isAdmin],
         bat.battery_uid,
         u.name AS user_name,
         u.phone AS user_phone,
+        -- True while a withdrawal session is awaiting the STK payment or the
+        -- battery removal (status 'pending'/'in_progress'). Falls off once it is
+        -- finalized/failed, at which point the UI restores the normal display.
+        EXISTS (
+          SELECT 1 FROM deposits aw
+          WHERE aw.slot_id = s.id
+            AND aw.session_type = 'withdrawal'
+            AND aw.status IN ('pending', 'in_progress')
+        ) AS has_active_withdrawal,
         -- True when the slot holds an unowned battery (rental-pool stock):
         -- occupied, physically has a battery, and no user "owns" it via an
         -- unconsumed completed deposit.
@@ -77,20 +86,35 @@ router.get('/booths', [verifyFirebaseToken, isAdmin],
       ) b
       LEFT JOIN booth_slots s ON b.id = s.booth_id
       LEFT JOIN batteries bat ON s.current_battery_id = bat.id
-      -- Find the user from the most recent completed deposit that has NOT been consumed by a withdrawal.
-      -- The battery must physically be in the slot for a name to show; legacy NULL-battery deposits
-      -- (pre battery-tracking) are still trusted on occupied slots.
+      -- Find the user from the most recent completed deposit that owns the slot.
+      -- The slot must be physically occupied (telemetry truth); a rider's own
+      -- battery has NO battery identity (battery IDs are for company rentals),
+      -- so ownership is by "latest unconsumed deposit with no newer deposit by
+      -- another user", never by a battery_id match.
       LEFT JOIN LATERAL (
         SELECT d.user_id
         FROM deposits d
         WHERE d.slot_id = s.id AND d.session_type = 'deposit' AND d.status = 'completed'
-          AND s.current_battery_id IS NOT NULL
-          AND (d.battery_id = s.current_battery_id OR d.battery_id IS NULL)
+          AND s.status = 'occupied'
           AND NOT EXISTS (
             SELECT 1 FROM deposits w
             WHERE w.consumed_deposit_id = d.id
-              AND w.session_type = 'withdrawal'
+              AND w.session_type IN ('withdrawal', 'rental')
               AND w.status NOT IN ('cancelled', 'failed')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM deposits newer
+            WHERE newer.slot_id = d.slot_id
+              AND newer.session_type = 'deposit'
+              AND newer.id > d.id
+              AND newer.user_id <> d.user_id
+              AND newer.status IN ('opening', 'in_progress', 'completed')
+              AND NOT EXISTS (
+                SELECT 1 FROM deposits w2
+                WHERE w2.consumed_deposit_id = newer.id
+                  AND w2.session_type IN ('withdrawal', 'rental')
+                  AND w2.status NOT IN ('cancelled', 'failed')
+              )
           )
         ORDER BY d.completed_at DESC
         LIMIT 1
@@ -134,7 +158,8 @@ router.get('/booths', [verifyFirebaseToken, isAdmin],
           batteryUid: row.battery_uid,
           userName: row.user_name,
           userPhone: row.user_phone,
-          isRentalPool: row.is_rental_pool
+          isRentalPool: row.is_rental_pool,
+          awaitingWithdrawal: row.has_active_withdrawal
         });
         booth.slotCount++;
       }
@@ -179,32 +204,53 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
         u.name AS user_name,
         u.phone AS user_phone,
         manual_wd.manual_withdrawal_id IS NOT NULL AS pending_manual_unlock,
+        -- True while a withdrawal session is awaiting payment or battery removal.
+        EXISTS (
+          SELECT 1 FROM deposits aw
+          WHERE aw.slot_id = s.id
+            AND aw.session_type = 'withdrawal'
+            AND aw.status IN ('pending', 'in_progress')
+        ) AS has_active_withdrawal,
         -- True when the slot holds an unowned battery (rental-pool stock).
         (s.status = 'occupied' AND s.current_battery_id IS NOT NULL AND last_deposit.user_id IS NULL) AS is_rental_pool
       FROM booths b
       LEFT JOIN booth_slots s ON b.id = s.booth_id
-      -- Use a lateral join to find the user from the most recent completed deposit that has NOT been consumed by a withdrawal.
-      -- The battery must physically be in the slot for a name to show; legacy NULL-battery deposits
-      -- (pre battery-tracking) are still trusted on occupied slots.
+      -- Use a lateral join to find the user from the most recent completed deposit that
+      -- owns the slot. The slot must be physically occupied (telemetry truth); a rider's
+      -- own battery has NO battery identity, so ownership is by "latest unconsumed
+      -- deposit with no newer deposit by another user", never by a battery_id match.
       LEFT JOIN LATERAL (
         SELECT d.user_id
         FROM deposits d
         WHERE d.slot_id = s.id AND d.session_type = 'deposit' AND d.status = 'completed'
-          AND s.current_battery_id IS NOT NULL
-          AND (d.battery_id = s.current_battery_id OR d.battery_id IS NULL)
+          AND s.status = 'occupied'
           AND NOT EXISTS (
             SELECT 1 FROM deposits w
             WHERE w.consumed_deposit_id = d.id
-              AND w.session_type = 'withdrawal'
+              AND w.session_type IN ('withdrawal', 'rental')
               AND w.status NOT IN ('cancelled', 'failed')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM deposits newer
+            WHERE newer.slot_id = d.slot_id
+              AND newer.session_type = 'deposit'
+              AND newer.id > d.id
+              AND newer.user_id <> d.user_id
+              AND newer.status IN ('opening', 'in_progress', 'completed')
+              AND NOT EXISTS (
+                SELECT 1 FROM deposits w2
+                WHERE w2.consumed_deposit_id = newer.id
+                  AND w2.session_type IN ('withdrawal', 'rental')
+                  AND w2.status NOT IN ('cancelled', 'failed')
+              )
           )
         ORDER BY d.completed_at DESC
         LIMIT 1
       ) last_deposit ON true
       LEFT JOIN users u ON last_deposit.user_id = u.user_id
       -- Detect completed or in-progress manual withdrawals pending unlock (within last 24h).
-      -- Only flag if the slot still has a battery (current_battery_id IS NOT NULL), so
-      -- already-unlocked slots don't show the alert.
+      -- Only flag if the slot is still physically occupied (status = 'occupied'), so
+      -- already-unlocked slots (status 'available') don't show the alert.
       LEFT JOIN LATERAL (
         SELECT d.id AS manual_withdrawal_id
         FROM deposits d
@@ -213,7 +259,7 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
           AND d.status IN ('completed', 'in_progress')
           AND d.notes = 'manual_withdrawal'
           AND (d.completed_at > NOW() - INTERVAL '24 hours' OR d.started_at > NOW() - INTERVAL '24 hours')
-          AND s.current_battery_id IS NOT NULL
+          AND s.status = 'occupied'
         ORDER BY d.created_at DESC
         LIMIT 1
       ) manual_wd ON true
@@ -239,7 +285,8 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
           slotUserMap: {},
           slotUserPhoneMap: {},
           slotManualUnlockMap: {},
-          slotPoolMap: {}
+          slotPoolMap: {},
+          slotAwaitingWithdrawalMap: {}
         };
       }
       if (row.slot_identifier) {
@@ -247,12 +294,13 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
         acc[row.booth_uid].slotUserPhoneMap[row.slot_identifier] = row.user_phone;
         acc[row.booth_uid].slotManualUnlockMap[row.slot_identifier] = row.pending_manual_unlock;
         acc[row.booth_uid].slotPoolMap[row.slot_identifier] = row.is_rental_pool;
+        acc[row.booth_uid].slotAwaitingWithdrawalMap[row.slot_identifier] = row.has_active_withdrawal;
       }
       return acc;
     }, {});
 
     // 2. Fetch real-time data from Firebase for each unique booth.
-    const boothStatusPromises = Object.values(groupedBooths).map(async ({ details: booth, slotUserMap, slotUserPhoneMap, slotManualUnlockMap, slotPoolMap }) => {
+    const boothStatusPromises = Object.values(groupedBooths).map(async ({ details: booth, slotUserMap, slotUserPhoneMap, slotManualUnlockMap, slotPoolMap, slotAwaitingWithdrawalMap }) => {
       const boothRef = db.ref(`booths/${booth.booth_uid}`);
       const snapshot = await boothRef.get();
 
@@ -285,6 +333,7 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
               userName: slotUserMap[slotIdentifier] || null, // Add user's name here
               userPhone: slotUserPhoneMap[slotIdentifier] || null,
               pendingManualUnlock: slotManualUnlockMap[slotIdentifier] || false,
+              awaitingWithdrawal: slotAwaitingWithdrawalMap[slotIdentifier] || false,
               isRentalPool: slotPoolMap[slotIdentifier] || false,
               telemetry: telemetry,
               // The battery object contains the most up-to-date info.
@@ -1154,20 +1203,40 @@ router.get('/booths/:boothUid', [verifyFirebaseToken, isAdmin], async (req, res)
         s.charge_level_percent,
         bat.battery_uid,
         u.name AS user_name,
-        u.phone AS user_phone
+        u.phone AS user_phone,
+        -- True while a withdrawal session is awaiting payment or battery removal.
+        EXISTS (
+          SELECT 1 FROM deposits aw
+          WHERE aw.slot_id = s.id
+            AND aw.session_type = 'withdrawal'
+            AND aw.status IN ('pending', 'in_progress')
+        ) AS has_active_withdrawal
       FROM booth_slots s
       LEFT JOIN batteries bat ON s.current_battery_id = bat.id
       LEFT JOIN LATERAL (
         SELECT d.user_id
         FROM deposits d
         WHERE d.slot_id = s.id AND d.session_type = 'deposit' AND d.status = 'completed'
-          AND s.current_battery_id IS NOT NULL
-          AND (d.battery_id = s.current_battery_id OR d.battery_id IS NULL)
+          AND s.status = 'occupied'
           AND NOT EXISTS (
             SELECT 1 FROM deposits w
             WHERE w.consumed_deposit_id = d.id
-              AND w.session_type = 'withdrawal'
+              AND w.session_type IN ('withdrawal', 'rental')
               AND w.status NOT IN ('cancelled', 'failed')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM deposits newer
+            WHERE newer.slot_id = d.slot_id
+              AND newer.session_type = 'deposit'
+              AND newer.id > d.id
+              AND newer.user_id <> d.user_id
+              AND newer.status IN ('opening', 'in_progress', 'completed')
+              AND NOT EXISTS (
+                SELECT 1 FROM deposits w2
+                WHERE w2.consumed_deposit_id = newer.id
+                  AND w2.session_type IN ('withdrawal', 'rental')
+                  AND w2.status NOT IN ('cancelled', 'failed')
+              )
           )
         ORDER BY d.completed_at DESC
         LIMIT 1
@@ -1193,7 +1262,8 @@ router.get('/booths/:boothUid', [verifyFirebaseToken, isAdmin], async (req, res)
         chargeLevel: slot.charge_level_percent,
         batteryUid: slot.battery_uid,
         userName: slot.user_name,
-        userPhone: slot.user_phone
+        userPhone: slot.user_phone,
+        awaitingWithdrawal: slot.has_active_withdrawal
       }))
     });
   } catch (error) {
@@ -1283,8 +1353,10 @@ router.get('/booths/:boothUid/slots/:slotIdentifier', [verifyFirebaseToken, isAd
     const sessionRes = await client.query(activeSessionQuery, [slotInfo.slotId]);
     const activeSession = sessionRes.rows[0] || null;
 
-    // 3. Find the battery owner from the most recent completed deposit.
-    // The battery must physically be in the slot; legacy NULL-battery deposits are still trusted.
+    // 3. Find the battery owner from the most recent completed deposit that owns
+    // an occupied slot. No battery identity is required (a rider's own deposited
+    // battery has none); ownership is by the "latest unconsumed deposit with no
+    // newer deposit by another user" rule.
     const ownerQuery = `
       SELECT
         u.name AS "userName",
@@ -1296,8 +1368,27 @@ router.get('/booths/:boothUid/slots/:slotIdentifier', [verifyFirebaseToken, isAd
       WHERE d.slot_id = $1
         AND d.session_type = 'deposit'
         AND d.status = 'completed'
-        AND s.current_battery_id IS NOT NULL
-        AND (d.battery_id = s.current_battery_id OR d.battery_id IS NULL)
+        AND s.status = 'occupied'
+        AND NOT EXISTS (
+          SELECT 1 FROM deposits w
+          WHERE w.consumed_deposit_id = d.id
+            AND w.session_type IN ('withdrawal', 'rental')
+            AND w.status NOT IN ('cancelled', 'failed')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM deposits newer
+          WHERE newer.slot_id = d.slot_id
+            AND newer.session_type = 'deposit'
+            AND newer.id > d.id
+            AND newer.user_id <> d.user_id
+            AND newer.status IN ('opening', 'in_progress', 'completed')
+            AND NOT EXISTS (
+              SELECT 1 FROM deposits w2
+              WHERE w2.consumed_deposit_id = newer.id
+                AND w2.session_type IN ('withdrawal', 'rental')
+                AND w2.status NOT IN ('cancelled', 'failed')
+            )
+        )
       ORDER BY d.completed_at DESC
       LIMIT 1;
     `;
@@ -1508,13 +1599,31 @@ router.get('/booths/:boothUid/slots/:slotIdentifier/withdrawal-info', [verifyFir
       JOIN booth_slots s ON d.slot_id = s.id
       WHERE d.slot_id = $1 AND d.session_type = 'deposit' AND d.status = 'completed'
         -- Only surface deposit info when the battery is physically in the slot: an
-        -- empty slot must not report a stale rider's withdrawal info.
-        -- b.battery_id = s.current_battery_id would be ideal, but hardware deposits
-        -- historically complete without battery_id populated (see firebaseSync
-        -- handleDepositCompletion backfill), so NULL-battery deposits are trusted
-        -- on occupied slots to avoid breaking withdrawal reporting.
-        AND s.current_battery_id IS NOT NULL
-        AND (d.battery_id = s.current_battery_id OR d.battery_id IS NULL)
+        -- empty slot must not report a stale rider's withdrawal info. Physical
+        -- presence is 'occupied' (telemetry truth); a rider's own
+        -- battery has no battery identity, so ownership is the "latest unconsumed
+        -- deposit with no newer deposit by another user" rule.
+        AND s.status = 'occupied'
+        AND NOT EXISTS (
+          SELECT 1 FROM deposits w
+          WHERE w.consumed_deposit_id = d.id
+            AND w.session_type IN ('withdrawal', 'rental')
+            AND w.status NOT IN ('cancelled', 'failed')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM deposits newer
+          WHERE newer.slot_id = d.slot_id
+            AND newer.session_type = 'deposit'
+            AND newer.id > d.id
+            AND newer.user_id <> d.user_id
+            AND newer.status IN ('opening', 'in_progress', 'completed')
+            AND NOT EXISTS (
+              SELECT 1 FROM deposits w2
+              WHERE w2.consumed_deposit_id = newer.id
+                AND w2.session_type IN ('withdrawal', 'rental')
+                AND w2.status NOT IN ('cancelled', 'failed')
+            )
+        )
       ORDER BY d.completed_at DESC
       LIMIT 1
     `, [slotId]);
@@ -1598,14 +1707,12 @@ router.post('/booths/:boothUid/slots/:slotIdentifier/manual-withdraw', [verifyFi
     const { slotId, chargeLevel: dbChargeLevel, boothId } = slotRes.rows[0];
 
     // 2. Find the most recent completed deposit on this slot (the battery owner)
-    // The withdrawal must reference a deposit whose battery is physically in the
+    // The withdrawal must reference a deposit that owns a PHYSICALLY occupied
     // slot: this prevents creating withdrawals against stale/orphaned deposits on
-    // empty slots (a source of the 152 orphaned deposits). TOLERANT (NULL-battery
-    // deposits trusted): real hardware deposits legitimately arrive with
-    // battery_id = NULL when the slot already had a linked battery (see
-    // firebaseSync handleDepositCompletion), so requiring a strict match today
-    // would block withdrawals on valid occupied slots. handleDepositCompletion now
-    // backfills battery_id, so new deposits will allow strict matching later.
+    // empty slots (a source of the 152 orphaned deposits). Physical presence is
+    // `s.status = 'occupied'` (telemetry truth) — a rider's own battery has no
+    // battery identity, so ownership is the "latest unconsumed deposit with no
+    // newer deposit by another user" rule.
     const depositRes = await client.query(`
       SELECT d.id, d.user_id, d.initial_charge_level, d.completed_at,
              u.name AS "userName", u.phone AS "userPhone"
@@ -1613,8 +1720,27 @@ router.post('/booths/:boothUid/slots/:slotIdentifier/manual-withdraw', [verifyFi
       JOIN users u ON d.user_id = u.user_id
       JOIN booth_slots s ON d.slot_id = s.id
       WHERE d.slot_id = $1 AND d.session_type = 'deposit' AND d.status = 'completed'
-        AND s.current_battery_id IS NOT NULL
-        AND (d.battery_id = s.current_battery_id OR d.battery_id IS NULL)
+        AND s.status = 'occupied'
+        AND NOT EXISTS (
+          SELECT 1 FROM deposits w
+          WHERE w.consumed_deposit_id = d.id
+            AND w.session_type IN ('withdrawal', 'rental')
+            AND w.status NOT IN ('cancelled', 'failed')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM deposits newer
+          WHERE newer.slot_id = d.slot_id
+            AND newer.session_type = 'deposit'
+            AND newer.id > d.id
+            AND newer.user_id <> d.user_id
+            AND newer.status IN ('opening', 'in_progress', 'completed')
+            AND NOT EXISTS (
+              SELECT 1 FROM deposits w2
+              WHERE w2.consumed_deposit_id = newer.id
+                AND w2.session_type IN ('withdrawal', 'rental')
+                AND w2.status NOT IN ('cancelled', 'failed')
+            )
+        )
       ORDER BY d.completed_at DESC
       LIMIT 1
     `, [slotId]);

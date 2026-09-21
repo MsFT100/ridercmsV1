@@ -67,9 +67,12 @@ function isRelayOff(slotData) {
 }
 
 const WITHDRAWAL_BATTERY_QUERY = `
-  -- Find the user's "deposit credit" and the details of the battery they deposited.
-  -- This credit is a completed deposit session that hasn't been redeemed by a withdrawal
-  -- and whose slot still has a battery.
+  -- Find the user's "deposit credit" and the slot holding their battery.
+  -- This credit is a completed deposit session that hasn't been redeemed by a
+  -- withdrawal/rental and that still owns a PHYSICALLY occupied slot. Physical
+  -- presence is 'occupied' (telemetry truth): a rider's own battery
+  -- has no battery identity, so ownership is by the "latest unconsumed deposit
+  -- with no newer deposit by another user" rule, never by a battery_id match.
   SELECT
     d.id as "depositCreditId",
     d.completed_at AS "depositCompletedAt",
@@ -85,13 +88,26 @@ const WITHDRAWAL_BATTERY_QUERY = `
   WHERE d.user_id = $1
     AND d.session_type = 'deposit'
     AND d.status = 'completed'
-    AND s.current_battery_id IS NOT NULL
-    AND d.battery_id = s.current_battery_id
+    AND s.status = 'occupied'
     AND NOT EXISTS (
       SELECT 1 FROM deposits w
       WHERE w.consumed_deposit_id = d.id
         AND w.session_type IN ('withdrawal', 'rental')
         AND w.status NOT IN ('cancelled', 'failed')
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM deposits newer
+      WHERE newer.slot_id = d.slot_id
+        AND newer.session_type = 'deposit'
+        AND newer.id > d.id
+        AND newer.user_id <> d.user_id
+        AND newer.status IN ('opening', 'in_progress', 'completed')
+        AND NOT EXISTS (
+          SELECT 1 FROM deposits w2
+          WHERE w2.consumed_deposit_id = newer.id
+            AND w2.session_type IN ('withdrawal', 'rental')
+            AND w2.status NOT IN ('cancelled', 'failed')
+        )
     )
   ORDER BY d.completed_at DESC
   LIMIT 1;
@@ -114,13 +130,26 @@ const WITHDRAWAL_BATTERY_BY_ID_QUERY = `
     AND d.user_id = $2
     AND d.session_type = 'deposit'
     AND d.status = 'completed'
-    AND s.current_battery_id IS NOT NULL
-    AND d.battery_id = s.current_battery_id
+    AND s.status = 'occupied'
     AND NOT EXISTS (
       SELECT 1 FROM deposits w
       WHERE w.consumed_deposit_id = d.id
         AND w.session_type IN ('withdrawal', 'rental')
         AND w.status NOT IN ('cancelled', 'failed')
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM deposits newer
+      WHERE newer.slot_id = d.slot_id
+        AND newer.session_type = 'deposit'
+        AND newer.id > d.id
+        AND newer.user_id <> d.user_id
+        AND newer.status IN ('opening', 'in_progress', 'completed')
+        AND NOT EXISTS (
+          SELECT 1 FROM deposits w2
+          WHERE w2.consumed_deposit_id = newer.id
+            AND w2.session_type IN ('withdrawal', 'rental')
+            AND w2.status NOT IN ('cancelled', 'failed')
+        )
     );
 `;
 
