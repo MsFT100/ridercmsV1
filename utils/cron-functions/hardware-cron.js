@@ -355,6 +355,28 @@ async function runWeeklyMaintenance() {
   }
 }
 
+/** Purges sessions marked failed. Scheduled every 30 minutes. */
+async function purgeFailedSessions() {
+  let client;
+  try {
+    const pool = await poolPromise;
+    client = await pool.connect();
+    await client.query('BEGIN');
+
+    const result = await client.query("DELETE FROM deposits WHERE status = 'failed'");
+
+    await client.query('COMMIT');
+    if (result.rowCount > 0) {
+      logger.info(`[CleanupCron] Purged ${result.rowCount} failed session(s).`);
+    }
+  } catch (error) {
+    if (client) await client.query('ROLLBACK');
+    logger.error('[CleanupCron] Error purging failed sessions:', error);
+  } finally {
+    if (client) client.release();
+  }
+}
+
 /**
  * Starts the cron job interval.
  */
@@ -401,6 +423,12 @@ function startCronJob() {
   cron.schedule('0 3 * * 0', async () => {
     logger.info('[HardwareCron] Starting scheduled weekly data purge...');
     await runWeeklyMaintenance();
+  });
+
+  // Purge failed sessions every 30 minutes.
+  cron.schedule('*/30 * * * *', async () => {
+    logger.info('[HardwareCron] Starting scheduled failed-session purge...');
+    await purgeFailedSessions();
   });
 
   // Check charging conditions every 5 seconds
@@ -453,4 +481,5 @@ module.exports = {
   resolveStuckPendingWithdrawals,
   resolveStuckRentalPlacements,
   runWeeklyMaintenance,
+  purgeFailedSessions,
 };

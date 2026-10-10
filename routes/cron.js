@@ -6,6 +6,7 @@ const {
   resolveStuckPendingWithdrawals,
   resolvePendingPayments,
   runWeeklyMaintenance,
+  purgeFailedSessions,
 } = require('../utils/cron-functions/hardware-cron');
 const { runMpesaReconciliation } = require('../utils/reconciliationWorker');
 
@@ -106,6 +107,21 @@ router.post('/weekly-maintenance', async (req, res) => {
   } catch (error) {
     logger.error('[Cron] weeklyMaintenance failed:', error);
     res.status(500).json({ error: 'weeklyMaintenance failed' });
+  }
+});
+
+/**
+ * POST /api/cron/purge-failed-sessions
+ * Deletes sessions marked as failed.
+ */
+router.post('/purge-failed-sessions', async (req, res) => {
+  try {
+    logger.info('[Cron] Cloud Scheduler triggered: purgeFailedSessions');
+    await purgeFailedSessions();
+    res.status(200).json({ ok: true });
+  } catch (error) {
+    logger.error('[Cron] purgeFailedSessions failed:', error);
+    res.status(500).json({ error: 'purgeFailedSessions failed' });
   }
 });
 
