@@ -179,41 +179,88 @@ async function resolvePendingPayments() {
 /**
  * Resolves withdrawal sessions stuck in 'in_progress' for more than 5 minutes.
  * Runs frequently to prevent users from being blocked.
+ *
+ * A stuck withdrawal is only auto-completed when LIVE telemetry confirms the
+ * battery has physically left the slot (battery absent and door not locked).
+ * Auto-completing on elapsed time alone is unsafe: it redeems the user's deposit
+ * and frees the slot even though the battery may still be physically present
+ * (e.g. during a power outage where no telemetry arrives). When telemetry is
+ * absent, or still reports the battery present, the session is left untouched so
+ * an admin can resolve the physical state manually.
  */
 async function resolveStuckWithdrawals() {
-  let client;
+  let lookupClient;
+  let stuckRows = [];
   try {
     const pool = await poolPromise;
-    client = await pool.connect();
-    await client.query('BEGIN');
+    lookupClient = await pool.connect();
 
     const stuckWithdrawalsQuery = `
-      SELECT id, slot_id, user_id
-      FROM deposits
-      WHERE session_type = 'withdrawal'
-        AND status = 'in_progress'
-        AND updated_at < NOW() - INTERVAL '5 minutes'
+      SELECT d.id, d.slot_id, d.user_id, s.slot_identifier, b.booth_uid
+      FROM deposits d
+      JOIN booth_slots s ON d.slot_id = s.id
+      JOIN booths b ON s.booth_id = b.id
+      WHERE d.session_type = 'withdrawal'
+        AND d.status = 'in_progress'
+        AND d.updated_at < NOW() - INTERVAL '5 minutes'
     `;
-    const stuckRes = await client.query(stuckWithdrawalsQuery);
-
-    if (stuckRes.rowCount > 0) {
-      const { handleWithdrawalCompletion } = require('../firebaseSync');
-      for (const session of stuckRes.rows) {
-        logger.info(`[CleanupCron] Auto-completing stuck withdrawal ${session.id} for user ${session.user_id}`);
-        await handleWithdrawalCompletion(client, `slot_id_${session.slot_id}`, session.slot_id);
-      }
-    }
-
-    await client.query('COMMIT');
-
-    if (stuckRes.rowCount > 0) {
-      logger.info(`[CleanupCron] Resolved ${stuckRes.rowCount} stuck withdrawal sessions.`);
-    }
+    const stuckRes = await lookupClient.query(stuckWithdrawalsQuery);
+    stuckRows = stuckRes.rows;
   } catch (error) {
-    if (client) await client.query('ROLLBACK');
-    logger.error('[CleanupCron] Error resolving stuck withdrawals:', error);
+    logger.error('[CleanupCron] Error querying stuck withdrawals:', error);
+    return;
   } finally {
-    if (client) client.release();
+    if (lookupClient) lookupClient.release();
+  }
+
+  if (stuckRows.length === 0) return;
+
+  const pool = await poolPromise;
+  const { handleWithdrawalCompletion } = require('../firebaseSync');
+  const db = getDatabase();
+  let resolved = 0;
+
+  for (const session of stuckRows) {
+    let txClient;
+    try {
+      const snapshot = await db.ref(`booths/${session.booth_uid}/slots/${session.slot_identifier}`).get();
+      const slotData = snapshot.exists() ? snapshot.val() : null;
+      const telemetry = slotData?.telemetry || {};
+      const batteryInserted = telemetry.batteryInserted === true;
+      const doorLocked = telemetry.doorLocked === true;
+      const batteryLeft = snapshot.exists() && !batteryInserted && !doorLocked;
+
+      if (!batteryLeft) {
+        logger.info(
+          `[CleanupCron] Withdrawal ${session.id} on ${session.booth_uid}/${session.slot_identifier} is still 'in_progress' but telemetry does not confirm the battery has left (or no telemetry). Leaving for admin resolution.`
+        );
+        continue;
+      }
+
+      logger.info(`[CleanupCron] Auto-completing stuck withdrawal ${session.id} for user ${session.user_id} (telemetry confirms battery removed).`);
+
+      // Each session gets its own transaction so one failure cannot abort the batch.
+      txClient = await pool.connect();
+      await txClient.query('BEGIN');
+      await handleWithdrawalCompletion(txClient, session.slot_identifier, session.slot_id);
+      await txClient.query('COMMIT');
+      resolved += 1;
+    } catch (sessionError) {
+      if (txClient) {
+        try {
+          await txClient.query('ROLLBACK');
+        } catch (rollbackError) {
+          logger.error(`[CleanupCron] Rollback failed for withdrawal ${session.id}:`, rollbackError);
+        }
+      }
+      logger.error(`[CleanupCron] Failed to resolve stuck withdrawal ${session.id}:`, sessionError);
+    } finally {
+      if (txClient) txClient.release();
+    }
+  }
+
+  if (resolved > 0) {
+    logger.info(`[CleanupCron] Resolved ${resolved} stuck withdrawal session(s).`);
   }
 }
 
@@ -328,6 +375,77 @@ async function resolveStuckRentalPlacements() {
   }
 }
 
+// Minutes without telemetry after which a non-available slot is considered stale
+// and is force re-checked against live Firebase. Configurable via SLOT_STALE_MINUTES.
+const SLOT_STALE_MINUTES = Number(process.env.SLOT_STALE_MINUTES || 10);
+
+/**
+ * Safety-net reconciliation for slots whose last telemetry is stale. The Firebase
+ * listener only processes slots whose snapshot changed; after an outage a booth
+ * can come back reporting the same snapshot and never trigger a re-sync. This
+ * sweep re-reads live Firebase for non-available slots that have not reported in
+ * a while and routes them through syncSlotState (which releases a slot when the
+ * battery is confirmed gone, or re-confirms it when the battery is confirmed
+ * present).
+ *
+ * It ONLY acts when live Firebase data is available. When a slot is unreachable
+ * (no power, no telemetry), nothing is changed — the state is left for an admin
+ * to resolve, avoiding a release that could double-allocate a battery still in
+ * the slot.
+ */
+async function reconcileStaleSlots() {
+  let staleRows = [];
+  let client;
+  try {
+    const pool = await poolPromise;
+    client = await pool.connect();
+    const staleRes = await client.query(
+      `
+      SELECT s.slot_identifier, b.booth_uid
+      FROM booth_slots s
+      JOIN booths b ON s.booth_id = b.id
+      WHERE s.status IN ('occupied', 'opening')
+        AND (s.last_seen_at IS NULL OR s.last_seen_at < NOW() - make_interval(mins => $1::int))
+      LIMIT 200
+      `,
+      [SLOT_STALE_MINUTES]
+    );
+    staleRows = staleRes.rows;
+  } catch (error) {
+    logger.error('[StaleSlotCron] Error querying stale slots:', error);
+    return;
+  } finally {
+    if (client) client.release();
+  }
+
+  if (staleRows.length === 0) return;
+
+  const { syncSlotState } = require('../firebaseSync');
+  const db = getDatabase();
+  let rechecked = 0;
+
+  for (const slot of staleRows) {
+    try {
+      const snapshot = await db.ref(`booths/${slot.booth_uid}/slots/${slot.slot_identifier}`).get();
+      if (!snapshot.exists()) {
+        logger.info(`[StaleSlotCron] No live data for ${slot.booth_uid}/${slot.slot_identifier}; leaving slot unchanged for admin resolution.`);
+        continue;
+      }
+
+      // slotBefore = null forces syncSlotState to process the live snapshot even
+      // when the cached value is identical (see hasSlotChanged in firebaseSync).
+      await syncSlotState(slot.booth_uid, slot.slot_identifier, snapshot.val(), null);
+      rechecked += 1;
+    } catch (slotError) {
+      logger.error(`[StaleSlotCron] Failed to reconcile ${slot.booth_uid}/${slot.slot_identifier}:`, slotError);
+    }
+  }
+
+  if (rechecked > 0) {
+    logger.info(`[StaleSlotCron] Re-checked ${rechecked} stale slot(s) against live telemetry.`);
+  }
+}
+
 /**
  * Weekly maintenance: purges cancelled sessions older than 30 days.
  */
@@ -355,7 +473,17 @@ async function runWeeklyMaintenance() {
   }
 }
 
-/** Purges sessions marked failed. Scheduled every 30 minutes. */
+/**
+ * Purges failed sessions. Scheduled every 30 minutes.
+ *
+ * Guards (added after the unconditional delete was found to be unsafe):
+ *  - `mpesa_checkout_id IS NULL`: rows that went through M-Pesa are retained.
+ *    A withdrawal auto-failed by the stale-pending sweep can still be confirmed
+ *    by a late M-Pesa callback; deleting it would orphan the payment because
+ *    completePaidWithdrawal matches on mpesa_checkout_id.
+ *  - age guard: only rows whose last update is older than the retention window
+ *    are removed, preserving recent forensic history.
+ */
 async function purgeFailedSessions() {
   let client;
   try {
@@ -363,7 +491,12 @@ async function purgeFailedSessions() {
     client = await pool.connect();
     await client.query('BEGIN');
 
-    const result = await client.query("DELETE FROM deposits WHERE status = 'failed'");
+    const result = await client.query(
+      `DELETE FROM deposits
+       WHERE status = 'failed'
+         AND mpesa_checkout_id IS NULL
+         AND updated_at < NOW() - INTERVAL '48 hours'`
+    );
 
     await client.query('COMMIT');
     if (result.rowCount > 0) {
@@ -403,6 +536,11 @@ function startCronJob() {
     logger.error('[PlacementCron] Initial stale placement resolution failed:', err);
   });
 
+  // Re-check slots with stale telemetry immediately on startup
+  reconcileStaleSlots().catch((err) => {
+    logger.error('[StaleSlotCron] Initial stale slot reconciliation failed:', err);
+  });
+
   // Check for pending payments that may have missed callbacks
   resolvePendingPayments().catch((err) => {
     logger.error('[MpesaCron] Initial pending payment check failed:', err);
@@ -430,6 +568,13 @@ function startCronJob() {
     logger.info('[HardwareCron] Starting scheduled failed-session purge...');
     await purgeFailedSessions();
   });
+
+  // Re-check slots with stale telemetry every 5 minutes.
+  setInterval(() => {
+    reconcileStaleSlots().catch((err) => {
+      logger.error('[StaleSlotCron] Scheduled stale slot reconciliation failed:', err);
+    });
+  }, 5 * 60 * 1000);
 
   // Check charging conditions every 5 seconds
   setInterval(() => {
@@ -482,4 +627,5 @@ module.exports = {
   resolveStuckRentalPlacements,
   runWeeklyMaintenance,
   purgeFailedSessions,
+  reconcileStaleSlots,
 };

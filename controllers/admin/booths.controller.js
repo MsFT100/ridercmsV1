@@ -67,6 +67,7 @@ router.get('/booths', [verifyFirebaseToken, isAdmin],
         bat.battery_uid,
         u.name AS user_name,
         u.phone AS user_phone,
+        u.email AS user_email,
         -- True while a withdrawal session is awaiting the STK payment or the
         -- battery removal (status 'pending'/'in_progress'). Falls off once it is
         -- finalized/failed, at which point the UI restores the normal display.
@@ -158,6 +159,7 @@ router.get('/booths', [verifyFirebaseToken, isAdmin],
           batteryUid: row.battery_uid,
           userName: row.user_name,
           userPhone: row.user_phone,
+          userEmail: row.user_email,
           isRentalPool: row.is_rental_pool,
           awaitingWithdrawal: row.has_active_withdrawal
         });
@@ -203,6 +205,7 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
         s.slot_identifier,
         u.name AS user_name,
         u.phone AS user_phone,
+        u.email AS user_email,
         manual_wd.manual_withdrawal_id IS NOT NULL AS pending_manual_unlock,
         -- True while a withdrawal session is awaiting payment or battery removal.
         EXISTS (
@@ -284,6 +287,7 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
           },
           slotUserMap: {},
           slotUserPhoneMap: {},
+          slotUserEmailMap: {},
           slotManualUnlockMap: {},
           slotPoolMap: {},
           slotAwaitingWithdrawalMap: {}
@@ -292,6 +296,7 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
       if (row.slot_identifier) {
         acc[row.booth_uid].slotUserMap[row.slot_identifier] = row.user_name;
         acc[row.booth_uid].slotUserPhoneMap[row.slot_identifier] = row.user_phone;
+        acc[row.booth_uid].slotUserEmailMap[row.slot_identifier] = row.user_email;
         acc[row.booth_uid].slotManualUnlockMap[row.slot_identifier] = row.pending_manual_unlock;
         acc[row.booth_uid].slotPoolMap[row.slot_identifier] = row.is_rental_pool;
         acc[row.booth_uid].slotAwaitingWithdrawalMap[row.slot_identifier] = row.has_active_withdrawal;
@@ -300,7 +305,7 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
     }, {});
 
     // 2. Fetch real-time data from Firebase for each unique booth.
-    const boothStatusPromises = Object.values(groupedBooths).map(async ({ details: booth, slotUserMap, slotUserPhoneMap, slotManualUnlockMap, slotPoolMap, slotAwaitingWithdrawalMap }) => {
+    const boothStatusPromises = Object.values(groupedBooths).map(async ({ details: booth, slotUserMap, slotUserPhoneMap, slotUserEmailMap, slotManualUnlockMap, slotPoolMap, slotAwaitingWithdrawalMap }) => {
       const boothRef = db.ref(`booths/${booth.booth_uid}`);
       const snapshot = await boothRef.get();
 
@@ -330,9 +335,10 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
               doorStatus: telemetry.doorLocked ? 'locked' : (telemetry.doorClosed ? 'closed' : 'open'),
               relayState: telemetry.relayOn ? 'ON' : 'OFF',
               isCharging: isCharging,
-              userName: slotUserMap[slotIdentifier] || null, // Add user's name here
-              userPhone: slotUserPhoneMap[slotIdentifier] || null,
-              pendingManualUnlock: slotManualUnlockMap[slotIdentifier] || false,
+               userName: slotUserMap[slotIdentifier] || null, // Add user's name here
+               userPhone: slotUserPhoneMap[slotIdentifier] || null,
+               userEmail: slotUserEmailMap[slotIdentifier] || null,
+               pendingManualUnlock: slotManualUnlockMap[slotIdentifier] || false,
               awaitingWithdrawal: slotAwaitingWithdrawalMap[slotIdentifier] || false,
               isRentalPool: slotPoolMap[slotIdentifier] || false,
               telemetry: telemetry,
@@ -1038,9 +1044,11 @@ router.post('/booths/:boothUid/slots/:slotIdentifier/command', [verifyFirebaseTo
   if (updates.forceUnlock === true) {
     updates.forceLock = false;
 
-    // --- Auto-complete stuck withdrawal sessions on Force Unlock ---
+    // --- Resolve stuck withdrawal sessions on Force Unlock ---
     // If an admin is force-unlocking, it often implies a manual intervention for a withdrawal.
-    // We resolve the last 'in_progress' withdrawal session for this slot to keep the DB in sync.
+    // We resolve the newest 'in_progress' withdrawal (paid, awaiting collection) by
+    // completing it, or, if none exists, fail any lingering 'pending' withdrawal so it
+    // stops holding the slot and the rider's deposit credit (a pending withdrawal consumes it).
     const pool = await poolPromise;
     const pgClient = await pool.connect();
     try {
@@ -1076,11 +1084,34 @@ router.post('/booths/:boothUid/slots/:slotIdentifier/command', [verifyFirebaseTo
         );
       }
 
-      // If no in_progress withdrawal was found, the slot is being cleared.
-      // Do NOT fail completed deposits — doing so destroys user credits.
-      // Only clear the notes on stale manual-withdrawal sessions so the
-      // pending_manual_unlock query stops flagging them.
+      // No paid withdrawal to complete: fail any lingering 'pending' withdrawal on this
+      // slot. A pending withdrawal consumes the deposit credit (the owner rule only
+      // releases it for cancelled/failed), so leaving it would keep the rider blocked
+      // and the slot tied up even after a manual unlock.
+      let failedPending = 0;
       if (updateResult.rowCount === 0) {
+        const pendingResult = await pgClient.query(`
+          UPDATE deposits
+          SET status = 'failed',
+              updated_at = NOW(),
+              notes = COALESCE(notes, '') || '\n[' || NOW() || '] Pending withdrawal failed by admin manual unlock.'
+          WHERE id = (
+            SELECT d.id
+            FROM deposits d
+            JOIN booth_slots s ON d.slot_id = s.id
+            JOIN booths b ON s.booth_id = b.id
+            WHERE b.booth_uid = $1
+              AND s.slot_identifier = $2
+              AND d.session_type = 'withdrawal'
+              AND d.status = 'pending'
+            ORDER BY d.created_at DESC
+            LIMIT 1
+          )
+          RETURNING id;
+        `, [boothUid, slotIdentifier]);
+        failedPending = pendingResult.rowCount;
+
+        // Annotate stale manual-withdrawal sessions so pending_manual_unlock stops flagging them.
         await pgClient.query(`
           UPDATE deposits
           SET notes = COALESCE(notes, '') || '\n[' || NOW() || '] Slot force-unlocked — already completed.'
@@ -1096,12 +1127,15 @@ router.post('/booths/:boothUid/slots/:slotIdentifier/command', [verifyFirebaseTo
       }
 
       // Also reset the slot status to 'available' and remove the battery link.
-      // This ensures the slot is immediately ready for the next user.
+      // This ensures the slot is immediately ready for the next user. Stamping
+      // last_seen_at marks the admin action as a fresh observation so the stale-slot
+      // sweep does not immediately re-process this slot.
       await pgClient.query(`
         UPDATE booth_slots
         SET 
           status = 'available',
           current_battery_id = NULL,
+          last_seen_at = NOW(),
           updated_at = NOW()
         WHERE slot_identifier = $2 
           AND booth_id = (SELECT id FROM booths WHERE booth_uid = $1)
@@ -1111,10 +1145,12 @@ router.post('/booths/:boothUid/slots/:slotIdentifier/command', [verifyFirebaseTo
 
       if (updateResult.rowCount > 0) {
         logger.info(`Admin (UID: ${req.user.uid}) force-unlocked slot ${slotIdentifier}. Withdrawal session ${updateResult.rows[0].id} was auto-completed and slot reset to available.`);
+      } else if (failedPending > 0) {
+        logger.info(`Admin (UID: ${req.user.uid}) force-unlocked slot ${slotIdentifier}. A pending withdrawal was failed and the slot reset to available.`);
       }
     } catch (dbError) {
       await pgClient.query('ROLLBACK');
-      logger.error(`Failed to auto-complete session during forceUnlock for ${slotIdentifier}:`, dbError);
+      logger.error(`Failed to resolve session during forceUnlock for ${slotIdentifier}:`, dbError);
     } finally {
       pgClient.release();
     }

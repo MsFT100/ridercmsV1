@@ -828,6 +828,210 @@ router.post('/rentals', [verifyFirebaseToken, isAdmin], async (req, res) => {
 });
 
 /**
+ * POST /api/admin/rentals/convert
+ * @summary Convert an existing slotted battery into rental-pool stock
+ * @description Designates a battery that is ALREADY physically inside a booth slot
+ * as rental-pool stock, without opening the slot or running the placement flow.
+ * The battery identity is registered (or re-activated), paired to the slot, and
+ * the slot is left 'occupied'. It does NOT create or complete any session. The
+ * "rental pool" state is derived (occupied slot + current_battery_id + no rider
+ * deposit owner), so no extra column is written.
+ * @tags [Admin]
+ * @security - bearerAuth: []
+ * @requestBody
+ *   required: true
+ *   content:
+ *     application/json:
+ *       schema:
+ *         type: object
+ *         required: [batteryUid, boothUid, slotIdentifier]
+ *         properties:
+ *           batteryUid:
+ *             type: string
+ *           boothUid:
+ *             type: string
+ *           slotIdentifier:
+ *             type: string
+ *           notes:
+ *             type: string
+ * @responses
+ *   200:
+ *     description: Battery converted to rental stock.
+ *   404:
+ *     description: Booth or slot not found.
+ *   409:
+ *     description: Slot not occupied, still owned by a rider, has an active session, or battery already assigned elsewhere.
+ */
+router.post('/rentals/convert', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const { batteryUid, boothUid, slotIdentifier, notes } = req.body;
+
+  if (!batteryUid || !batteryUid.trim()) {
+    return res.status(400).json({ error: 'batteryUid is required.' });
+  }
+  if (!boothUid || !slotIdentifier) {
+    return res.status(400).json({ error: 'boothUid and slotIdentifier are required.' });
+  }
+
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const slotRes = await client.query(
+      `SELECT s.id AS "slotId", s.status AS "slotStatus", s.current_battery_id AS "batteryId",
+              s.charge_level_percent AS "slotChargeLevel",
+              b.booth_uid AS "boothUid", s.slot_identifier AS "slotIdentifier"
+       FROM booth_slots s
+       JOIN booths b ON s.booth_id = b.id
+       WHERE b.booth_uid = $1 AND s.slot_identifier = $2
+       LIMIT 1`,
+      [boothUid, slotIdentifier]
+    );
+    if (slotRes.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Booth or slot not found.' });
+    }
+    const slot = slotRes.rows[0];
+
+    // A rental battery can only be designated where a battery is physically present.
+    if (slot.slotStatus !== 'occupied') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'Only an occupied slot containing a battery can be converted to rental.' });
+    }
+
+    // Refuse while an active session (deposit/withdrawal/rental) is still in flight on the slot.
+    const activeSessionRes = await client.query(
+      `SELECT 1 FROM deposits
+       WHERE slot_id = $1 AND status IN ('pending', 'opening', 'in_progress')
+       LIMIT 1`,
+      [slot.slotId]
+    );
+    if (activeSessionRes.rowCount > 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'An active session is in progress on this slot.' });
+    }
+
+    // Refuse if a rider still owns the battery in this slot (latest unconsumed completed deposit).
+    const ownerRes = await client.query(
+      `SELECT d.user_id
+       FROM deposits d
+       WHERE d.slot_id = $1 AND d.session_type = 'deposit' AND d.status = 'completed'
+         AND NOT EXISTS (
+           SELECT 1 FROM deposits w
+           WHERE w.consumed_deposit_id = d.id
+             AND w.session_type IN ('withdrawal', 'rental')
+             AND w.status NOT IN ('cancelled', 'failed')
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM deposits newer
+           WHERE newer.slot_id = d.slot_id
+             AND newer.session_type = 'deposit'
+             AND newer.id > d.id
+             AND newer.user_id <> d.user_id
+             AND newer.status IN ('opening', 'in_progress', 'completed')
+             AND NOT EXISTS (
+               SELECT 1 FROM deposits w2
+               WHERE w2.consumed_deposit_id = newer.id
+                 AND w2.session_type IN ('withdrawal', 'rental')
+                 AND w2.status NOT IN ('cancelled', 'failed')
+             )
+         )
+       ORDER BY d.completed_at DESC
+       LIMIT 1`,
+      [slot.slotId]
+    );
+    if (ownerRes.rowCount > 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'This slot still belongs to a rider. Resolve the rider session before converting to rental.' });
+    }
+
+    // 1. Find or create the battery identity (company rentals require a batteries row).
+    const batteryRes = await client.query(
+      `SELECT id, withdrawn_at AS "withdrawnAt"
+       FROM batteries WHERE battery_uid = $1 LIMIT 1`,
+      [batteryUid.trim()]
+    );
+
+    let batteryId;
+    if (batteryRes.rowCount > 0) {
+      batteryId = batteryRes.rows[0].id;
+
+      // Don't clobber a differently registered battery already paired to this slot.
+      if (slot.batteryId && slot.batteryId !== batteryId) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'This slot is already paired to a different registered battery.' });
+      }
+
+      // A battery that is currently rented out cannot be re-designated.
+      const activeRentalRes = await client.query(
+        `SELECT 1 FROM deposits
+         WHERE battery_id = $1 AND session_type = 'rental' AND status IN ('pending', 'in_progress')
+         LIMIT 1`,
+        [batteryId]
+      );
+      if (activeRentalRes.rowCount > 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'Battery is currently rented out.' });
+      }
+
+      // Don't let one battery identity be paired to two physical slots at once.
+      const otherSlotRes = await client.query(
+        `SELECT 1 FROM booth_slots
+         WHERE current_battery_id = $1 AND id <> $2 AND status = 'occupied'
+         LIMIT 1`,
+        [batteryId, slot.slotId]
+      );
+      if (otherSlotRes.rowCount > 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'Battery is already registered to another slot.' });
+      }
+
+      await client.query(
+        `UPDATE batteries
+         SET charge_level_percent = COALESCE($1, charge_level_percent),
+             withdrawn_at = NULL, withdrawal_reason = NULL, withdrawal_notes = NULL, updated_at = NOW()
+         WHERE id = $2`,
+        [slot.slotChargeLevel, batteryId]
+      );
+    } else {
+      const insertRes = await client.query(
+        `INSERT INTO batteries (battery_uid, charge_level_percent, health_status)
+         VALUES ($1, $2, 'good') RETURNING id`,
+        [batteryUid.trim(), slot.slotChargeLevel ?? 0]
+      );
+      batteryId = insertRes.rows[0].id;
+    }
+
+    // 2. Pair the existing physical battery to the slot. The slot stays 'occupied';
+    //    because it now has a current_battery_id with no rider owner, it reads as
+    //    rental-pool stock.
+    await client.query(
+      `UPDATE booth_slots
+       SET status = 'occupied', current_battery_id = $1, is_charging = FALSE, updated_at = NOW()
+       WHERE id = $2`,
+      [batteryId, slot.slotId]
+    );
+
+    await client.query('COMMIT');
+
+    logger.info(`Admin (UID: ${req.user.uid}) converted existing battery ${batteryUid.trim()} at ${boothUid}/${slotIdentifier} to rental stock.`);
+    return res.status(200).json({
+      batteryUid: batteryUid.trim(),
+      boothUid,
+      slotIdentifier,
+      converted: true,
+      notes: notes || null,
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    logger.error('Failed to convert existing battery to rental:', error);
+    return res.status(500).json({ error: 'Failed to convert existing battery to rental.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
  * GET /api/admin/rentals/placement/:placementId/status
  * @summary Poll an admin rental-stock placement
  * @description Tracks whether the battery has been physically inserted into the

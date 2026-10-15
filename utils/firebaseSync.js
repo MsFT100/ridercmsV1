@@ -340,6 +340,7 @@ async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
          is_charging = $4,
          telemetry = $5,
          current_battery_id = CASE WHEN $7 THEN NULL ELSE current_battery_id END,
+         last_seen_at = NOW(),
          updated_at = NOW()
        WHERE id = $6`,
       [newStatus, doorStatus, soc, isCharging, telemetry, slotId, batteryCleared]
@@ -374,6 +375,7 @@ async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
       const orphanResult = await pgClient.query(
         `UPDATE deposits
          SET status = 'failed',
+             updated_at = NOW(),
              notes = COALESCE(notes, '') || '\n[' || NOW() || '] Deposit failed: battery removed from slot, slot returned to available.'
          WHERE slot_id = $1
            AND session_type = 'deposit'
@@ -541,7 +543,7 @@ async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
           // If the battery was actually removed, the next Firebase telemetry sync will
           // detect it and clean up via syncSlotState().
           const timeoutFailResult = await pgClient.query(
-            "UPDATE deposits SET status = 'failed' WHERE slot_id = $1 AND status = 'in_progress' AND session_type = 'withdrawal' RETURNING id",
+            "UPDATE deposits SET status = 'failed', updated_at = NOW() WHERE slot_id = $1 AND status = 'in_progress' AND session_type = 'withdrawal' RETURNING id",
             [slotId]
           );
           if (timeoutFailResult.rowCount > 0) {
@@ -557,7 +559,7 @@ async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
           // failed collection attempt. We must reset the slot AND fail any orphaned deposit
           // to prevent double-allocation when a new user is assigned to this slot.
           const noBatteryFailResult = await pgClient.query(
-            "UPDATE deposits SET status = 'failed' WHERE slot_id = $1 AND status = 'in_progress' AND session_type = 'withdrawal' RETURNING id",
+            "UPDATE deposits SET status = 'failed', updated_at = NOW() WHERE slot_id = $1 AND status = 'in_progress' AND session_type = 'withdrawal' RETURNING id",
             [slotId]
           );
           if (noBatteryFailResult.rowCount > 0) {
@@ -577,6 +579,7 @@ async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
           await pgClient.query(
             `UPDATE deposits
              SET status = 'failed',
+                 updated_at = NOW(),
                  notes = COALESCE(notes, '') || '\n[' || NOW() || '] Deposit failed: battery physically removed during unsuccessful withdrawal.'
              WHERE slot_id = $1
                AND session_type = 'deposit'
@@ -693,6 +696,7 @@ async function syncSlotState(boothUid, slotIdentifier, slotData, slotBefore) {
               await pgClient.query(
                 `UPDATE deposits
                  SET status = 'failed',
+                     updated_at = NOW(),
                      notes = COALESCE(notes, '') || '\n[' || NOW() || '] Slot freed via force-unlock.'
                  WHERE slot_id = $1
                    AND session_type = 'deposit' AND status = 'completed'`,
@@ -777,5 +781,6 @@ function initializeFirebaseSync() {
 module.exports = { 
   initializeFirebaseSync, 
   handleWithdrawalCompletion, 
-  handleDepositCompletion 
+  handleDepositCompletion,
+  syncSlotState,
 };

@@ -165,6 +165,7 @@ router.post('/initiate-deposit', verifyFirebaseToken, async (/** @type {any} */ 
         await client.query(
           `UPDATE deposits
            SET status = 'failed',
+               updated_at = NOW(),
                notes = COALESCE(notes, '') || '\n[' || NOW() || '] Deposit failed: slot reassigned to new user.'
            WHERE slot_id = $1
              AND session_type = 'deposit'
