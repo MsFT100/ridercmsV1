@@ -87,6 +87,7 @@ Comprehensive endpoint reference for this project.
 | POST | `/api/admin/simulate/confirm-payment` | - | - | `checkoutRequestId` |
 | GET | `/api/admin/dashboard-summary` | - | `startDate`, `endDate` | - |
 | GET | `/api/admin/sessions` | - | `limit`, `offset`, `searchTerm`, `status`, `sessionType`, `startDate`, `endDate`, `slotIdentifier`, `userId`, `sessionId` | - |
+| PATCH | `/api/admin/sessions/:sessionId` | `sessionId` | - | `status`, `amount`, `createdAt`, `userEmail`, `userPhoneNumber`, `boothUid`, `slotIdentifier`, `batteryUid`, `reason` (required; audit reason) |
 | DELETE | `/api/admin/sessions/:sessionId` | `sessionId` | - | - |
 | POST | `/api/admin/sessions/cleanup` | - | - | - |
 | GET | `/api/admin/payments` | - | `limit`, `offset`, `searchTerm`, `startDate`, `endDate`, `status`, `boothUid`, `sortBy`, `sortOrder` | - |

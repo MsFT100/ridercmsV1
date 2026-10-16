@@ -248,6 +248,232 @@ router.delete('/sessions/:sessionId', [verifyFirebaseToken, isAdmin], async (req
 });
 
 /**
+ * PATCH /api/admin/sessions/:sessionId
+ * @summary Edit an existing session and record the audit reason
+ * @description Corrects an existing session row (deposit or withdrawal). Only the fields
+ * supplied in the body are changed. A non-empty `reason` is required and is appended to
+ * the session's `notes` as an audit trail. Editing an identifier field (rider/booth/slot/
+ * battery) re-points the session to the matching existing record; unknown identifiers are
+ * rejected. This endpoint does NOT touch slot state or rider credits.
+ * @tags [Admin]
+ * @security
+ *   - bearerAuth: []
+ * @parameters
+ *   - in: path
+ *     name: sessionId
+ *     required: true
+ *     schema:
+ *       type: integer
+ *     description: The ID of the session (deposits table) to edit.
+ * @requestBody
+ *   required: true
+ *   content:
+ *     application/json:
+ *       schema:
+ *         type: object
+ *         required: [reason]
+ *         properties:
+ *           status:
+ *             type: string
+ *             enum: [pending, opening, in_progress, completed, failed, cancelled, redeemed, manual]
+ *           amount:
+ *             type: number
+ *             nullable: true
+ *           createdAt:
+ *             type: string
+ *             format: date-time
+ *           userEmail:
+ *             type: string
+ *             nullable: true
+ *           userPhoneNumber:
+ *             type: string
+ *             nullable: true
+ *           boothUid:
+ *             type: string
+ *             nullable: true
+ *           slotIdentifier:
+ *             type: string
+ *             nullable: true
+ *           batteryUid:
+ *             type: string
+ *             nullable: true
+ *           reason:
+ *             type: string
+ *             description: Required audit reason for the change.
+ * @responses
+ *   200:
+ *     description: Session updated.
+ *   400:
+ *     description: Missing reason or invalid/unresolvable field.
+ *   404:
+ *     description: Session not found.
+ *   500:
+ *     description: Internal server error.
+ */
+router.patch('/sessions/:sessionId', [verifyFirebaseToken, isAdmin], async (req, res) => {
+  const sessionId = parseInt(req.params.sessionId, 10);
+  if (isNaN(sessionId)) {
+    return res.status(400).json({ error: 'Invalid session id.' });
+  }
+
+  const {
+    status,
+    amount,
+    createdAt,
+    userEmail,
+    userPhoneNumber,
+    boothUid,
+    slotIdentifier,
+    batteryUid,
+    reason,
+  } = req.body;
+
+  if (typeof reason !== 'string' || !reason.trim()) {
+    return res.status(400).json({ error: 'A reason is required to change a session.' });
+  }
+
+  const allowedStatuses = ['pending', 'opening', 'in_progress', 'completed', 'failed', 'cancelled', 'redeemed', 'manual'];
+  if (status !== undefined && status !== null && !allowedStatuses.includes(status)) {
+    return res.status(400).json({ error: `Invalid status. Allowed values: ${allowedStatuses.join(', ')}.` });
+  }
+
+  let parsedAmount;
+  if (amount !== undefined && amount !== null && amount !== '') {
+    parsedAmount = Number(amount);
+    if (!Number.isFinite(parsedAmount) || parsedAmount < 0) {
+      return res.status(400).json({ error: 'Amount must be a valid non-negative number.' });
+    }
+  }
+
+  let parsedCreatedAt;
+  if (createdAt !== undefined && createdAt !== null && createdAt !== '') {
+    const parsedDate = new Date(createdAt);
+    if (isNaN(parsedDate.getTime())) {
+      return res.status(400).json({ error: 'createdAt must be a valid date.' });
+    }
+    parsedCreatedAt = parsedDate.toISOString();
+  }
+
+  const pool = await poolPromise;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const existingRes = await client.query(
+      'SELECT id, status, amount, created_at, user_id, booth_id, slot_id, battery_id FROM deposits WHERE id = $1 FOR UPDATE',
+      [sessionId]
+    );
+    if (existingRes.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Session not found.' });
+    }
+    const existing = existingRes.rows[0];
+
+    // Resolve booth (optional)
+    let boothId = existing.booth_id;
+    if (boothUid) {
+      const boothRes = await client.query('SELECT id FROM booths WHERE booth_uid = $1', [String(boothUid).trim()]);
+      if (boothRes.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: `Booth '${String(boothUid).trim()}' not found.` });
+      }
+      boothId = boothRes.rows[0].id;
+    }
+
+    // Resolve slot, scoped to the (possibly updated) booth (optional)
+    let slotId = existing.slot_id;
+    if (slotIdentifier) {
+      const slotRes = await client.query(
+        'SELECT id FROM booth_slots WHERE booth_id = $1 AND slot_identifier = $2',
+        [boothId, String(slotIdentifier).trim()]
+      );
+      if (slotRes.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: `Slot '${String(slotIdentifier).trim()}' not found in the booth.` });
+      }
+      slotId = slotRes.rows[0].id;
+    }
+
+    // Resolve battery (optional)
+    let batteryId = existing.battery_id;
+    if (batteryUid) {
+      const batteryRes = await client.query('SELECT id FROM batteries WHERE battery_uid = $1', [String(batteryUid).trim()]);
+      if (batteryRes.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: `Battery '${String(batteryUid).trim()}' not found.` });
+      }
+      batteryId = batteryRes.rows[0].id;
+    }
+
+    // Resolve rider by email first, then phone (optional)
+    let userId = existing.user_id;
+    const emailValue = typeof userEmail === 'string' ? userEmail.trim() : '';
+    const phoneValue = typeof userPhoneNumber === 'string' ? userPhoneNumber.trim() : '';
+    if (emailValue) {
+      const userRes = await client.query('SELECT user_id FROM users WHERE email = $1', [emailValue]);
+      if (userRes.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: `No rider found with email '${emailValue}'.` });
+      }
+      userId = userRes.rows[0].user_id;
+    } else if (phoneValue) {
+      const userRes = await client.query('SELECT user_id FROM users WHERE phone = $1', [phoneValue]);
+      if (userRes.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: `No rider found with phone '${phoneValue}'.` });
+      }
+      userId = userRes.rows[0].user_id;
+    }
+
+    const newStatus = status !== undefined && status !== null ? status : existing.status;
+    const newAmount = amount === undefined ? existing.amount : (amount === null || amount === '' ? 0 : parsedAmount);
+    const newCreatedAt = parsedCreatedAt || existing.created_at;
+
+    await client.query(
+      `UPDATE deposits
+       SET status = $1,
+           amount = $2,
+           created_at = $3,
+           user_id = $4,
+           booth_id = $5,
+           slot_id = $6,
+           battery_id = $7,
+           updated_at = NOW(),
+           notes = COALESCE(notes, '') || '\n[' || NOW() || '] Admin (' || $8 || ') edited session: ' || $9
+       WHERE id = $10`,
+      [newStatus, newAmount, newCreatedAt, userId, boothId, slotId, batteryId, req.user.uid || 'unknown', reason.trim(), sessionId]
+    );
+
+    const resultRes = await client.query(
+      `SELECT
+         d.id, d.session_type AS "sessionType", d.status, d.amount,
+         d.created_at AS "createdAt",
+         u.email AS "userEmail", u.phone AS "userPhoneNumber",
+         b.booth_uid AS "boothUid", s.slot_identifier AS "slotIdentifier",
+         bat.battery_uid AS "batteryUid"
+       FROM deposits d
+       LEFT JOIN users u ON d.user_id = u.user_id
+       LEFT JOIN booths b ON d.booth_id = b.id
+       LEFT JOIN booth_slots s ON d.slot_id = s.id
+       LEFT JOIN batteries bat ON d.battery_id = bat.id
+       WHERE d.id = $1`,
+      [sessionId]
+    );
+
+    await client.query('COMMIT');
+
+    logger.info(`Admin (UID: ${req.user.uid}) edited session ${sessionId}: ${reason.trim()}`);
+    res.status(200).json({ success: true, session: resultRes.rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    logger.error(`Failed to update session ${sessionId}:`, error);
+    res.status(500).json({ error: 'Failed to update session. The operation was rolled back.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
  * POST /api/admin/sessions/:sessionId/charge
  * @summary Trigger M-Pesa payment for a pending admin withdrawal session
  * @description Initiates an M-Pesa STK push for a pending withdrawal session created by the

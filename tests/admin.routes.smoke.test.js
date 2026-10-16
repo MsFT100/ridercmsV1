@@ -116,6 +116,7 @@ describe('Admin Routes Smoke Test', () => {
     { method: 'POST', path: '/rentals/:batteryUid/withdraw' },
     { method: 'GET', path: '/sessions' },
     { method: 'POST', path: '/sessions/:sessionId/charge' },
+    { method: 'PATCH', path: '/sessions/:sessionId' },
     { method: 'DELETE', path: '/sessions/:sessionId' },
     { method: 'POST', path: '/sessions/cleanup' },
     { method: 'GET', path: '/sessions/:sessionId/payment-status' },
