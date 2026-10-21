@@ -351,7 +351,7 @@ router.get('/booths/status', [verifyFirebaseToken, isAdmin], async (req, res) =>
                 isOccupied: telemetry.batteryInserted === true || slotData.battery === true,
                 chargeLevel: telemetry.soc || slotData.soc || 0,
                 voltage: telemetry.voltage,
-                temperature: telemetry.temperatureC,
+                temperature: telemetry.temperature ?? telemetry.temperatureC,
               }
             };
           });
