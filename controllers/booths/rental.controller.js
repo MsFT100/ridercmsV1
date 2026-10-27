@@ -771,7 +771,7 @@ router.post('/rentals/:sessionId/pay', verifyFirebaseToken, async (req, res) => 
     if (req.user.role === 'developer') {
       const devCheckoutId = `DEV_${sessionId}_${Date.now()}`;
       await client.query(
-        "UPDATE deposits SET mpesa_checkout_id = $1, started_at = NOW() WHERE id = $2",
+        "UPDATE deposits SET mpesa_checkout_id = $1, status = 'in_progress', started_at = NOW() WHERE id = $2",
         [devCheckoutId, sessionId]
       );
       await completePaidRental(client, devCheckoutId);
@@ -832,8 +832,10 @@ router.post('/rentals/:sessionId/pay', verifyFirebaseToken, async (req, res) => 
     });
     const checkoutRequestId = mpesaResponse.data.CheckoutRequestID;
 
+    // Back to 'in_progress' (the state the callback, the status endpoint and
+    // completePaidRental key on) in case this retries a payment that had failed.
     await client.query(
-      "UPDATE deposits SET mpesa_checkout_id = $1, started_at = NOW() WHERE id = $2",
+      "UPDATE deposits SET mpesa_checkout_id = $1, status = 'in_progress', started_at = NOW() WHERE id = $2",
       [checkoutRequestId, sessionId]
     );
 

@@ -21,6 +21,8 @@ Users can cancel their own active sessions via the `/api/booths/cancel-session` 
 * `POST /api/booths/sessions/:id/pay` and `POST /api/booths/rentals/:id/pay` lock the session row. If an STK push was sent within `MPESA_PENDING_TIMEOUT_SECONDS + 30` seconds they answer `409` with the existing `checkoutRequestId` instead of sending another prompt.
 * If the earlier push is older, M-Pesa is asked first; a push that was in fact paid is completed (`200`, `paymentStatus: 'paid'`) rather than charged again.
 * The payer number is the token's `phone_number`, falling back to `users.phone`; with neither, the endpoint answers `400`.
+* A failed or cancelled STK push (`/api/mpesa/callback` with a non-zero `ResultCode`) marks the session `failed`, matched on the exact `mpesa_checkout_id`: a withdrawal waiting as `pending`, or a rental waiting as `in_progress`. A failure for an older push therefore cannot affect a session that already has a newer one.
+* Sending a new rental prompt always sets the rental back to `in_progress`, because the callback, the status endpoint and `completePaidRental` all key on that state. Without it, a retry after a failure would show as failed and a successful payment would not complete the rental.
 
 ## 2. Administrative Command Rules
 

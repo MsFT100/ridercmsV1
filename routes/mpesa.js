@@ -106,11 +106,16 @@ router.post('/callback', async (req, res) => {
       }
     } else {
       // Failure or Cancellation: Update the session status so the user can attempt to pay again.
+      // A withdrawal waits for payment as 'pending'; a rental, whose bill is paid
+      // once it has been returned, waits as 'in_progress'. Matching on the exact
+      // checkout id means a late failure for an older push cannot touch a session
+      // that has since been given a newer one.
       const failUpdate = await client.query(
-        `UPDATE deposits 
-         SET status = 'failed', 
-             notes = COALESCE(notes, '') || '\n[' || NOW() || '] M-Pesa Error: ' || $1 
-         WHERE mpesa_checkout_id = $2 AND status = 'pending' 
+        `UPDATE deposits
+         SET status = 'failed',
+             notes = COALESCE(notes, '') || '\n[' || NOW() || '] M-Pesa Error: ' || $1
+         WHERE mpesa_checkout_id = $2
+           AND (status = 'pending' OR (session_type = 'rental' AND status = 'in_progress'))
          RETURNING id`,
         [`${ResultCode} - ${ResultDesc}`, CheckoutRequestID]
       );

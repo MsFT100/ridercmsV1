@@ -202,6 +202,82 @@ router.get('/history', verifyFirebaseToken, async (req, res) => {
 });
 
 /**
+ * GET /api/booths/payments
+ * Retrieves the M-Pesa payments (withdrawals/rentals with a checkout id) for the logged-in user.
+ */
+router.get('/payments', verifyFirebaseToken, async (req, res) => {
+  const { uid: firebaseUid } = req.user;
+
+  const pool = await poolPromise;
+  const client = await pool.connect(req.schema);
+  try {
+    const paymentsRes = await client.query(
+      `SELECT
+         d.id,
+         d.session_type AS "sessionType",
+         d.status,
+         d.amount,
+         d.mpesa_checkout_id AS "checkoutRequestId",
+         d.started_at AS "startedAt",
+         d.completed_at AS "completedAt",
+         bo.booth_uid AS "boothUid",
+         bo.name AS "boothName"
+       FROM deposits d
+       LEFT JOIN booths bo ON d.booth_id = bo.id
+       WHERE d.user_id = $1
+         AND d.mpesa_checkout_id IS NOT NULL
+       ORDER BY d.started_at DESC
+       LIMIT 100;`,
+      [firebaseUid]
+    );
+
+    // mpesa_callbacks has no index on the checkout id, so look the callbacks up
+    // in a single pass instead of once per payment. Receipt/result are read in JS
+    // so an unexpected callback shape can never fail the whole request.
+    const callbackByCheckoutId = new Map();
+    const checkoutIds = paymentsRes.rows.map((row) => row.checkoutRequestId);
+    if (checkoutIds.length > 0) {
+      const callbacksRes = await client.query(
+        `SELECT payload
+         FROM mpesa_callbacks
+         WHERE payload->'Body'->'stkCallback'->>'CheckoutRequestID' = ANY($1::text[])
+         ORDER BY created_at ASC;`,
+        [checkoutIds]
+      );
+      for (const { payload } of callbacksRes.rows) {
+        const stkCallback = payload?.Body?.stkCallback;
+        if (stkCallback?.CheckoutRequestID) {
+          callbackByCheckoutId.set(stkCallback.CheckoutRequestID, stkCallback);
+        }
+      }
+    }
+
+    const payments = paymentsRes.rows.map((row) => {
+      const stkCallback = callbackByCheckoutId.get(row.checkoutRequestId);
+      const items = stkCallback?.CallbackMetadata?.Item;
+      const receipt = Array.isArray(items)
+        ? items.find((item) => item?.Name === 'MpesaReceiptNumber')?.Value
+        : undefined;
+      const resultCode = Number(stkCallback?.ResultCode);
+
+      return {
+        ...row,
+        amount: row.amount === null ? null : parseFloat(row.amount),
+        resultCode: stkCallback && Number.isFinite(resultCode) ? resultCode : null,
+        receiptNumber: receipt !== undefined && receipt !== null ? String(receipt) : null,
+      };
+    });
+
+    res.status(200).json(payments);
+  } catch (error) {
+    logger.error(`Failed to get payments for user ${firebaseUid}:`, error);
+    res.status(500).json({ error: 'Failed to retrieve payments.', details: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
  * POST /api/booths/report-problem
  * Allows a logged-in user to report an issue with a battery or a booth slot.
  */
