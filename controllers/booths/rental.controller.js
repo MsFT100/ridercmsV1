@@ -12,6 +12,12 @@ const {
   handleRentalReturnCompletion,
 } = require('../../utils/sessionUtils');
 const {
+  classifyExistingPayment,
+  getStoredPhone,
+  pickPayerPhone,
+  wasPreviousPaymentPaid,
+} = require('../../utils/paymentGuards');
+const {
   isDevBooth,
 } = require('./shared');
 
@@ -734,7 +740,7 @@ router.get('/rentals/:sessionId/bill', verifyFirebaseToken, async (req, res) => 
  */
 router.post('/rentals/:sessionId/pay', verifyFirebaseToken, async (req, res) => {
   const { sessionId } = req.params;
-  const { uid: firebaseUid, phone_number: userPhone } = req.user;
+  const { uid: firebaseUid, phone_number: tokenPhone } = req.user;
 
   const pool = await poolPromise;
   const client = await pool.connect(req.schema);
@@ -743,7 +749,7 @@ router.post('/rentals/:sessionId/pay', verifyFirebaseToken, async (req, res) => 
 
     const rentalRes = await client.query(
       `SELECT r.id, r.status, r.initial_charge_level,
-              r.created_at, r.mpesa_checkout_id, r.amount
+              r.created_at, r.started_at, r.mpesa_checkout_id, r.amount
        FROM deposits r
        WHERE r.id = $1 AND r.user_id = $2
          AND r.session_type = 'rental'
@@ -779,9 +785,47 @@ router.post('/rentals/:sessionId/pay', verifyFirebaseToken, async (req, res) => 
       });
     }
 
-    // 5. Real M-Pesa STK push.
+    // 5. Never send a second prompt while an earlier one may still be paid.
+    const earlierState = classifyExistingPayment(rental, 'in_progress');
+    if (earlierState === 'in_flight') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: 'Payment already in progress',
+        message: 'An M-Pesa prompt was already sent to your phone. Complete it, or wait a minute and try again.',
+        amount: totalCost,
+        consolidation,
+        paymentStatus: 'pending',
+        checkoutRequestId: rental.mpesa_checkout_id,
+      });
+    }
+    if (earlierState === 'stale' &&
+        await wasPreviousPaymentPaid(querySTKStatus, rental.mpesa_checkout_id, logger)) {
+      logger.info(`Rental ${sessionId}: earlier push ${rental.mpesa_checkout_id} was already paid. Completing instead of re-charging.`);
+      await completePaidRental(client, rental.mpesa_checkout_id);
+      await client.query('COMMIT');
+      return res.status(200).json({
+        message: 'Your earlier payment was received.',
+        amount: totalCost,
+        consolidation,
+        paymentStatus: 'paid',
+        checkoutRequestId: rental.mpesa_checkout_id,
+      });
+    }
+
+    // 6. Resolve the number to charge: token claim first, then the stored
+    // profile phone (Google sign-in accounts have no phone claim).
+    const payerPhone = pickPayerPhone(tokenPhone, await getStoredPhone(client, firebaseUid));
+    if (!payerPhone) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: 'Phone number required',
+        message: 'Add a valid M-Pesa phone number to your profile, then try again.',
+      });
+    }
+
+    // 7. Real M-Pesa STK push.
     const mpesaResponse = await initiateSTKPush({
-      phone: userPhone,
+      phone: payerPhone,
       amount: totalCost,
       accountReference: `rental_${sessionId}`,
       transactionDesc: `Consolidated battery rental payment ${sessionId}`,

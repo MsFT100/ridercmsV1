@@ -12,7 +12,15 @@ Users can cancel their own active sessions via the `/api/booths/cancel-session` 
 
 * **Eligible States:** Only sessions with the status `pending`, `opening`, or `in_progress` can be cancelled.
 * **Withdrawal Lock:** A session of type `withdrawal` **cannot** be cancelled if its status is `in_progress`. In this context, `in_progress` indicates that payment has been confirmed via M-Pesa. Once paid, the user must complete the collection.
-* **Slot Recovery:** Upon successful cancellation, the associated booth slot is immediately returned to the `available` status, and any pending hardware commands (like `openForDeposit`) are cleared in Firebase.
+* **Targeting:** The body may carry `sessionId` to cancel exactly that session (unknown id → `404`; already cancelled → `200`; completed/redeemed/manual → `409`). Without it the endpoint cancels, in order: the newest `deposit` in `pending`/`opening`, then an unpaid `withdrawal`, then an uncollected `rental`. The choice is deterministic and the row is locked.
+* **Rental Lock:** A `rental` that is `in_progress` (out with the rider) can never be cancelled here; it is returned and billed instead (`409`).
+* **Slot Recovery:** Upon successful cancellation of a `deposit` or `rental`, the associated booth slot is immediately returned to the `available` status. A `withdrawal` never reserved a slot (the rider's battery is still inside), so its slot is left untouched. Pending hardware commands (like `openForDeposit`) are cleared in Firebase in every case.
+
+### Payment Safety
+
+* `POST /api/booths/sessions/:id/pay` and `POST /api/booths/rentals/:id/pay` lock the session row. If an STK push was sent within `MPESA_PENDING_TIMEOUT_SECONDS + 30` seconds they answer `409` with the existing `checkoutRequestId` instead of sending another prompt.
+* If the earlier push is older, M-Pesa is asked first; a push that was in fact paid is completed (`200`, `paymentStatus: 'paid'`) rather than charged again.
+* The payer number is the token's `phone_number`, falling back to `users.phone`; with neither, the endpoint answers `400`.
 
 ## 2. Administrative Command Rules
 

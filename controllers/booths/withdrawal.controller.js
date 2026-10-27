@@ -6,6 +6,12 @@ const { verifyFirebaseToken } = require('../../middleware/auth');
 const { initiateSTKPush, querySTKStatus } = require('../../utils/mpesa');
 const { completePaidWithdrawal, finalizeWithdrawalSession } = require('../../utils/sessionUtils');
 const {
+  classifyExistingPayment,
+  getStoredPhone,
+  pickPayerPhone,
+  wasPreviousPaymentPaid,
+} = require('../../utils/paymentGuards');
+const {
   getEnvInt,
   extractValidSoc,
   isRelayOff,
@@ -311,7 +317,7 @@ router.post('/initiate-withdrawal', verifyFirebaseToken, async (req, res) => {
  */
 router.post('/sessions/:sessionId/pay', verifyFirebaseToken, async (req, res) => {
   const { sessionId } = req.params;
-  const { uid: firebaseUid, phone_number: userPhone } = req.user;
+  const { uid: firebaseUid, phone_number: tokenPhone } = req.user;
 
   const pool = await poolPromise;
   const client = await pool.connect(req.schema);
@@ -319,13 +325,18 @@ router.post('/sessions/:sessionId/pay', verifyFirebaseToken, async (req, res) =>
     await client.query('BEGIN');
 
     // 1. Find the pending withdrawal session for this user.
-    // Allow retrying payment if the previous attempt failed.
+    // Allow retrying payment if the previous attempt failed. The row is locked
+    // so two concurrent taps cannot both send an STK push.
     const sessionRes = await client.query(
-      "SELECT amount FROM deposits WHERE id = $1 AND user_id = $2 AND session_type = 'withdrawal' AND status IN ('pending', 'failed')",
+      `SELECT amount, status, mpesa_checkout_id, started_at
+       FROM deposits
+       WHERE id = $1 AND user_id = $2 AND session_type = 'withdrawal' AND status IN ('pending', 'failed')
+       FOR UPDATE`,
       [sessionId, firebaseUid]
     );
 
     if (sessionRes.rows.length === 0) {
+      await client.query('ROLLBACK');
       return res.status(404).json({ error: 'No active withdrawal session found to pay for.' });
     }
     const amount = sessionRes.rows[0].amount;
@@ -345,9 +356,44 @@ router.post('/sessions/:sessionId/pay', verifyFirebaseToken, async (req, res) =>
       });
     }
 
-    // 2. Initiate the M-Pesa STK Push.
+    // 3. Never send a second prompt while an earlier one may still be paid.
+    const earlier = sessionRes.rows[0];
+    const earlierState = classifyExistingPayment(earlier, 'pending');
+    if (earlierState === 'in_flight') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: 'Payment already in progress',
+        message: 'An M-Pesa prompt was already sent to your phone. Complete it, or wait a minute and try again.',
+        paymentStatus: 'pending',
+        checkoutRequestId: earlier.mpesa_checkout_id,
+      });
+    }
+    if (earlierState === 'stale' &&
+        await wasPreviousPaymentPaid(querySTKStatus, earlier.mpesa_checkout_id, logger)) {
+      logger.info(`Withdrawal ${sessionId}: earlier push ${earlier.mpesa_checkout_id} was already paid. Completing instead of re-charging.`);
+      await completePaidWithdrawal(client, earlier.mpesa_checkout_id);
+      await client.query('COMMIT');
+      return res.status(200).json({
+        message: 'Your earlier payment was received.',
+        paymentStatus: 'paid',
+        checkoutRequestId: earlier.mpesa_checkout_id,
+      });
+    }
+
+    // 4. Resolve the number to charge: token claim first, then the stored profile
+    // phone (Google sign-in accounts have no phone claim).
+    const payerPhone = pickPayerPhone(tokenPhone, await getStoredPhone(client, firebaseUid));
+    if (!payerPhone) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: 'Phone number required',
+        message: 'Add a valid M-Pesa phone number to your profile, then try again.',
+      });
+    }
+
+    // 5. Initiate the M-Pesa STK Push.
     const mpesaResponse = await initiateSTKPush({
-      phone: userPhone,
+      phone: payerPhone,
       amount: amount,
       accountReference: `session_${sessionId}`,
       transactionDesc: `Payment for battery charging session ${sessionId}`

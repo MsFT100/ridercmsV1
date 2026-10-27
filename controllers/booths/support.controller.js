@@ -8,28 +8,55 @@ const router = Router();
 
 /**
  * POST /api/booths/cancel-session
- * @summary Cancel any active user session
- * @description Allows a user to cancel their own active session (e.g., 'pending', 'in_progress', 'opening'). This will free up the reserved slot and reset its state, making it available for another user.
+ * @summary Cancel an active user session
+ * @description Allows a user to cancel their own active session (e.g., 'pending', 'in_progress', 'opening'). A deposit's reserved slot is freed and made available for another user; an unpaid withdrawal leaves its slot untouched because the rider's battery is still inside.
+ * Pass `sessionId` in the body to cancel exactly that session. Without it the newest deposit awaiting the booth is cancelled, then an unpaid withdrawal, then an uncollected rental. A rental that is out with the rider is never cancelled here.
  * @tags [Booths]
  * @security
  *   - bearerAuth: []
+ * @requestBody
+ *   content:
+ *     application/json:
+ *       schema:
+ *         type: object
+ *         properties:
+ *           sessionId:
+ *             type: integer
+ *             description: Optional. The session to cancel.
  * @responses
  *   200:
- *     description: Session cancelled successfully.
+ *     description: Session cancelled (or nothing to cancel / already cancelled).
+ *   400:
+ *     description: Invalid sessionId.
  *   404:
- *     description: No active session found to cancel.
+ *     description: The given sessionId does not belong to the user.
+ *   409:
+ *     description: The session is paid, completed, or an active rental and cannot be cancelled.
  *   500:
  *     description: Internal server error.
  */
 router.post('/cancel-session', verifyFirebaseToken, async (req, res) => {
   const { uid: firebaseUid } = req.user;
 
+  // Optional: cancel exactly this session. Without it the endpoint falls back to
+  // the rider's most recent cancellable session (see the ordering below).
+  const rawSessionId = req.body?.sessionId;
+  const requestedId = rawSessionId === undefined || rawSessionId === null ? null : Number(rawSessionId);
+  if (requestedId !== null && (!Number.isInteger(requestedId) || requestedId <= 0)) {
+    return res.status(400).json({ error: 'Invalid sessionId.' });
+  }
+
   const pool = await poolPromise;
   const client = await pool.connect(req.schema);
   try {
     await client.query('BEGIN');
 
-    // 1. Find the user's active (non-terminal) session.
+    // 1. Find the session to cancel. Several can be active at once (a charging
+    // rider may also hold a rental or an unpaid withdrawal), so the choice must
+    // be deterministic: the newest deposit still waiting on the booth comes
+    // first, then an unpaid withdrawal, then a not-yet-collected rental. An
+    // in-use rental is never picked implicitly. The row is locked so a booth ACK
+    // cannot complete it mid-cancel.
     const sessionQuery = `
       SELECT
         d.id,
@@ -41,12 +68,46 @@ router.post('/cancel-session', verifyFirebaseToken, async (req, res) => {
       FROM deposits d
       JOIN booth_slots s ON d.slot_id = s.id
       JOIN booths b ON d.booth_id = b.id
-      WHERE d.user_id = $1 AND d.status IN ('pending', 'in_progress', 'opening')
-      LIMIT 1;
+      WHERE d.user_id = $1
+        AND d.status IN ('pending', 'in_progress', 'opening')
+        AND ($2::int IS NULL OR d.id = $2::int)
+        AND ($2::int IS NOT NULL OR NOT (d.session_type = 'rental' AND d.status = 'in_progress'))
+      ORDER BY
+        CASE
+          WHEN d.session_type = 'deposit' AND d.status IN ('pending', 'opening') THEN 0
+          WHEN d.session_type = 'withdrawal' AND d.status = 'pending' THEN 1
+          WHEN d.session_type = 'rental' AND d.status = 'pending' THEN 2
+          ELSE 3
+        END,
+        d.created_at DESC,
+        d.id DESC
+      LIMIT 1
+      FOR UPDATE OF d;
     `;
-    const sessionRes = await client.query(sessionQuery, [firebaseUid]);
+    const sessionRes = await client.query(sessionQuery, [firebaseUid, requestedId]);
 
     if (sessionRes.rows.length === 0) {
+      if (requestedId !== null) {
+        // Explain why that specific session could not be cancelled instead of
+        // reporting success for a session that may have completed.
+        const known = await client.query(
+          'SELECT status FROM deposits WHERE id = $1 AND user_id = $2',
+          [requestedId, firebaseUid]
+        );
+        await client.query('ROLLBACK');
+        if (known.rows.length === 0) {
+          return res.status(404).json({ error: 'Session not found.' });
+        }
+        const knownStatus = known.rows[0].status;
+        if (knownStatus === 'cancelled' || knownStatus === 'failed') {
+          return res.status(200).json({ message: 'This session was already cancelled.' });
+        }
+        return res.status(409).json({
+          error: 'Session cannot be cancelled.',
+          message: `This session is already ${knownStatus} and can no longer be cancelled.`,
+        });
+      }
+      await client.query('ROLLBACK');
       return res.status(200).json({ message: 'No active session to cancel. You are all clear.' });
     }
 
@@ -61,14 +122,26 @@ router.post('/cancel-session', verifyFirebaseToken, async (req, res) => {
       });
     }
 
+    // A rental that is out with the rider is billed, not cancelled.
+    if (sessionType === 'rental' && sessionStatus === 'in_progress') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: 'Cannot cancel an active rental.',
+        message: 'Return the rental battery and pay the bill to finish this rental.'
+      });
+    }
+
     // 3. Mark the session as 'cancelled' in the database.
     await client.query("UPDATE deposits SET status = 'cancelled' WHERE id = $1", [sessionId]);
 
-    // 3. The slot was reserved for the session. We need to free it and reset its state.
-    // This applies to both deposits and withdrawals that have reserved a slot.
-    await client.query("UPDATE booth_slots SET status = 'available' WHERE id = $1", [slotId]);
+    // 4. Free the slot that was reserved for the session. A withdrawal never
+    // reserves a slot: the rider's own battery is still inside it, so marking it
+    // 'available' would let the booth assign it to someone else.
+    if (sessionType !== 'withdrawal') {
+      await client.query("UPDATE booth_slots SET status = 'available' WHERE id = $1", [slotId]);
+    }
 
-    // 4. Send a command to Firebase to ensure any door opening commands are cancelled.
+    // 5. Send a command to Firebase to ensure any door opening commands are cancelled.
     // This resets the command state for the slot.
     const db = getDatabase();
     const commandRef = db.ref(`booths/${boothUid}/slots/${slotIdentifier}/command`);
