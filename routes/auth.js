@@ -5,7 +5,10 @@ const poolPromise = require('../db'); // Import the PostgreSQL connection pool
 const { verifyFirebaseToken } = require('../middleware/auth'); // We will create this new middleware
 const uploadToGcsMiddleware = require('../middleware/upload');
 const axios = require('axios'); // For making HTTP requests to Google's reCAPTCHA service
+const { normalizeKenyanPhone } = require('../utils/phone');
 const router = Router();
+
+const INVALID_PHONE_MESSAGE = 'Please enter a valid Kenyan phone number, e.g. 0712345678 or 254712345678.';
 
 /**
  * Extracts unique authentication provider IDs for a user from their token and record.
@@ -57,6 +60,10 @@ async function verifyRecaptcha(token) {
     return process.env.NODE_ENV !== 'production';
   }
 
+  if (!token || typeof token !== 'string') {
+    return false;
+  }
+
   const verificationUrl = 'https://www.google.com/recaptcha/api/siteverify';
 
   try {
@@ -66,9 +73,28 @@ async function verifyRecaptcha(token) {
     }));
 
     const { success, score } = response.data;
-    return success && score >= 0.5;
+    // v3 responses carry a score; v2 (checkbox/invisible) responses do not.
+    return Boolean(success) && (typeof score !== 'number' || score >= 0.5);
   } catch (error) {
     logger.error('Error verifying reCAPTCHA token:', error);
+    return false;
+  }
+}
+
+/**
+ * Verifies a Firebase App Check token, which the mobile app sends instead of a reCAPTCHA token.
+ * @param {string | undefined} token The value of the X-Firebase-AppCheck header.
+ * @returns {Promise<boolean>} True if the token is a valid App Check token for this project.
+ */
+async function verifyAppCheckToken(token) {
+  if (!token || typeof token !== 'string') {
+    return false;
+  }
+  try {
+    await admin.appCheck().verifyToken(token);
+    return true;
+  } catch (error) {
+    logger.warn(`App Check token verification failed: ${error.message}`);
     return false;
   }
 }
@@ -117,12 +143,27 @@ async function verifyRecaptcha(token) {
  *         description: Internal server error.
  */
 router.post('/register', async (req, res) => {
-  const { email, password, name, phoneNumber, recaptchaToken } = req.body;
+  const { email, password, name, recaptchaToken } = req.body;
   const defaultRole = 'user';
+
+  // Accept 07…, 254… or +254… and store/send E.164 so every client ends up with the same format.
+  let phoneNumber = req.body.phoneNumber;
+  if (phoneNumber !== undefined && phoneNumber !== null && phoneNumber !== '') {
+    phoneNumber = normalizeKenyanPhone(phoneNumber);
+    if (!phoneNumber) {
+      return res.status(400).json({ error: INVALID_PHONE_MESSAGE });
+    }
+  }
+
+  // Prove the caller is a real client before creating anything: the mobile app sends an
+  // App Check token, the website sends a reCAPTCHA token.
+  const appCheckOk = await verifyAppCheckToken(req.get('X-Firebase-AppCheck'));
+  if (!appCheckOk && !(await verifyRecaptcha(recaptchaToken))) {
+    return res.status(400).json({ error: 'reCAPTCHA verification failed. Please try again.' });
+  }
 
   let userRecord; // To hold the created Firebase Auth user for rollback purposes
   try {
-    // 0. Verify reCAPTCHA token before proceeding
     userRecord = await admin.auth().createUser({
       email,
       password,
@@ -131,11 +172,6 @@ router.post('/register', async (req, res) => {
       disabled: true, // User is disabled by default, requires admin approval.
     });
 
-    // Verify reCAPTCHA token after creating user but before DB insert
-    if (!await verifyRecaptcha(recaptchaToken)) {
-      throw new Error('reCAPTCHA verification failed.');
-    }
-    
     // 2. Set custom role claim for authorization
     await admin.auth().setCustomUserClaims(userRecord.uid, { role: defaultRole });
 
@@ -231,6 +267,9 @@ router.post('/user-by-phone', async (req, res) => {
     return res.status(400).json({ error: 'Phone number is required.' });
   }
 
+  // Match the stored E.164 form, but keep the raw value too so rows saved in another format still resolve.
+  const lookupNumbers = [...new Set([normalizeKenyanPhone(phoneNumber), String(phoneNumber)].filter(Boolean))];
+
   // This endpoint is public for the login flow, so no token verification is needed.
   // It simply acts as a lookup service.
   const pool = await poolPromise;
@@ -238,8 +277,8 @@ router.post('/user-by-phone', async (req, res) => {
   try {
     // Query the database for a user with the given phone number
     const userRes = await pgClient.query(
-      'SELECT email FROM users WHERE phone = $1',
-      [phoneNumber]
+      'SELECT email FROM users WHERE phone = ANY($1::text[]) LIMIT 1',
+      [lookupNumbers]
     );
 
     if (userRes.rows.length === 0) {
@@ -376,7 +415,8 @@ router.post('/google/sync', verifyFirebaseToken, async (req, res) => {
 router.post('/google/complete-profile', verifyFirebaseToken, async (req, res) => {
   const { uid } = req.user;
   const requestedUid = normalizeString(req.body.uid);
-  const phoneNumber = normalizeString(req.body.phoneNumber || req.body.phone);
+  const rawPhoneNumber = normalizeString(req.body.phoneNumber || req.body.phone);
+  const phoneNumber = normalizeKenyanPhone(rawPhoneNumber);
   const name = normalizeString(req.body.name);
 
   if (!requestedUid) {
@@ -385,8 +425,11 @@ router.post('/google/complete-profile', verifyFirebaseToken, async (req, res) =>
   if (requestedUid !== uid) {
     return res.status(403).json({ error: 'The supplied uid does not match the authenticated user.' });
   }
-  if (!phoneNumber) {
+  if (!rawPhoneNumber) {
     return res.status(400).json({ error: 'phoneNumber is required.' });
+  }
+  if (!phoneNumber) {
+    return res.status(400).json({ error: INVALID_PHONE_MESSAGE });
   }
 
   try {
